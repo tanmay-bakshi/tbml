@@ -105,9 +105,9 @@ docker-compose.override.yml
 
 # --- Data & experiment outputs ---
 .data/
-data/
-datasets/
-outputs/
+/data/
+/datasets/
+/outputs/
 tmp/
 tmp*/
 temp/
