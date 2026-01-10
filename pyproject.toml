@@ -10,6 +10,7 @@ dependencies = [
     "jaxtyping",
     "numpy",
     "optax",
+    "pillow",
     "pydantic",
     "tensorboardX",
     "tqdm",
