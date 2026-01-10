@@ -454,22 +454,30 @@ def main() -> None:
     model_key, base_key = jax.random.split(base_key)
     model = ConViT(model_config, dtype=dtype, param_dtype=dtype, key=model_key)
 
-    params = eqx.filter(model, eqx.is_array)
-    flat_names = _flatten_param_names(params)
+    model_params, model_static = eqx.partition(model, eqx.is_array)
+    flat_names = _flatten_param_names(model_params)
     muon_mask, qkv_mask = build_muon_masks(
-        params,
+        model_params,
         flat_names,
         ConViT.MUON_PARAM_EXCLUSION_PATTERNS,
     )
 
-    flat_params, _ = jax.tree_util.tree_flatten(params)
+    flat_params, _ = jax.tree_util.tree_flatten(model_params)
     flat_muon, _ = jax.tree_util.tree_flatten(muon_mask)
     if len(flat_params) != len(flat_muon):
         raise ValueError("muon_mask must align with params")
 
-    total_params = sum(int(param.size) for param in flat_params)
-    muon_names = [name for name, flag in zip(flat_names, flat_muon, strict=True) if flag]
-    adamw_names = [name for name, flag in zip(flat_names, flat_muon, strict=True) if flag is False]
+    muon_names = [
+        name
+        for name, param, flag in zip(flat_names, flat_params, flat_muon, strict=True)
+        if isinstance(param, jax.Array) and flag
+    ]
+    adamw_names = [
+        name
+        for name, param, flag in zip(flat_names, flat_params, flat_muon, strict=True)
+        if isinstance(param, jax.Array) and flag is False
+    ]
+    total_params = sum(int(param.size) for param in flat_params if isinstance(param, jax.Array))
 
     print(f"Total parameters: {total_params}")
     print("Muon parameters:")
@@ -492,7 +500,7 @@ def main() -> None:
         qkv_mask=qkv_mask,
     )
 
-    opt_state: MuonWithAdamWFallbackState = optimizer.init(params)
+    opt_state: MuonWithAdamWFallbackState = optimizer.init(model_params)
 
     def train_step(
         model_in: ConViT,
@@ -554,7 +562,8 @@ def main() -> None:
         eval_step, axis_name="data", devices=device_list
     )  # type: ignore[call-overload]
 
-    model_repl = jax.device_put_replicated(model, device_list)
+    model_params_repl = jax.device_put_replicated(model_params, device_list)
+    model_repl = eqx.combine(model_params_repl, model_static)
     opt_state_repl = jax.device_put_replicated(opt_state, device_list)
 
     global_batch = args.per_device_batch_size * num_devices
