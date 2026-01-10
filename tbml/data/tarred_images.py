@@ -2,6 +2,7 @@ import io
 import mmap
 import os
 import tarfile
+import threading
 from typing import ClassVar
 
 from PIL import Image
@@ -26,6 +27,7 @@ class TarredImagesRandomAccessDataset:
     _mmaps: list[mmap.mmap]
     _tars: list[tarfile.TarFile]
     _index: list[tuple[int, str]]
+    _locks: list[threading.Lock]
 
     def __init__(self, tar_paths: list[str]) -> None:
         """Initialize the dataset and index tar members.
@@ -40,6 +42,7 @@ class TarredImagesRandomAccessDataset:
         self._mmaps = []
         self._tars = []
         self._index = []
+        self._locks = []
 
         success = False
         try:
@@ -54,6 +57,7 @@ class TarredImagesRandomAccessDataset:
                 self._file_handles.append(file_handle)
                 self._mmaps.append(mapped)
                 self._tars.append(tar)
+                self._locks.append(threading.Lock())
 
                 for member in tar.getmembers():
                     if member.isfile() is False:
@@ -87,14 +91,15 @@ class TarredImagesRandomAccessDataset:
 
         tar_idx, member_name = self._index[idx]
         tar = self._tars[tar_idx]
-        member_file = tar.extractfile(member_name)
-        if member_file is None:
-            raise ValueError(f"failed to extract member: {member_name}")
+        with self._locks[tar_idx]:
+            member_file = tar.extractfile(member_name)
+            if member_file is None:
+                raise ValueError(f"failed to extract member: {member_name}")
 
-        try:
-            payload = member_file.read()
-        finally:
-            member_file.close()
+            try:
+                payload = member_file.read()
+            finally:
+                member_file.close()
 
         image = Image.open(io.BytesIO(payload))
         image.load()

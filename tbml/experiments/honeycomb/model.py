@@ -1,3 +1,5 @@
+from typing import ClassVar
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -42,18 +44,7 @@ class ConViTConfig(BaseModel):
 
 
 class PatchEmbed(eqx.Module):
-    """Patchify images and embed patches with a linear projection.
-
-    :ivar image_size: Expected input size as (height, width).
-    :ivar patch_size: Patch size (square).
-    :ivar in_channels: Number of input channels.
-    :ivar embed_dim: Output embedding dimension.
-    :ivar grid_size: Patch grid size as (height, width).
-    :ivar num_patches: Total number of patches.
-    :ivar dtype: Compute dtype.
-    :ivar param_dtype: Parameter dtype.
-    :ivar proj: Linear projection from flattened patches to embeddings.
-    """
+    """Patchify images and embed patches with a linear projection."""
 
     image_size: tuple[int, int]
     patch_size: int
@@ -146,15 +137,7 @@ class PatchEmbed(eqx.Module):
 
 
 class GPSABlock(eqx.Module):
-    """Transformer block using gated positional self-attention.
-
-    :ivar norm1: RMSNorm before attention.
-    :ivar attn: Gated positional self-attention module.
-    :ivar drop_path1: DropPath for the attention branch.
-    :ivar norm2: RMSNorm before the feed-forward.
-    :ivar mlp: SwiGLU feed-forward module.
-    :ivar drop_path2: DropPath for the feed-forward branch.
-    """
+    """Transformer block using gated positional self-attention."""
 
     norm1: RMSNorm
     attn: GatedPositionalSelfAttention
@@ -254,15 +237,7 @@ class GPSABlock(eqx.Module):
 
 
 class SABlock(eqx.Module):
-    """Transformer block using standard self-attention.
-
-    :ivar norm1: RMSNorm before attention.
-    :ivar attn: Standard self-attention module.
-    :ivar drop_path1: DropPath for the attention branch.
-    :ivar norm2: RMSNorm before the feed-forward.
-    :ivar mlp: SwiGLU feed-forward module.
-    :ivar drop_path2: DropPath for the feed-forward branch.
-    """
+    """Transformer block using standard self-attention."""
 
     norm1: RMSNorm
     attn: SelfAttention
@@ -358,14 +333,12 @@ class SABlock(eqx.Module):
 
 
 class ConViT(eqx.Module):
-    """ConViT backbone with GPSA and SA transformer stacks.
+    """ConViT backbone with GPSA and SA transformer stacks."""
 
-    :ivar config: ConViT configuration.
-    :ivar patch_embed: Patch embedding module.
-    :ivar gpsa_blocks: Stack of GPSA blocks.
-    :ivar sa_blocks: Stack of SA blocks.
-    :ivar final_norm: Final RMSNorm.
-    """
+    MUON_PARAM_EXCLUSION_PATTERNS: ClassVar[list[str]] = [
+        r"^patch_embed\..*$",
+        r"^.*_norm\d*\..*$",
+    ]
 
     config: ConViTConfig = eqx.field(static=True)
     patch_embed: PatchEmbed
