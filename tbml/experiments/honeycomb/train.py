@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jaxtyping import Array
+from jax.sharding import Mesh, NamedSharding, PartitionSpec, Sharding
 from tensorboardX import SummaryWriter  # type: ignore[import-untyped]
 from tqdm import tqdm  # type: ignore[import-untyped]
 
@@ -210,6 +211,18 @@ def _unreplicate(tree: T) -> T:
     )
 
 
+def _build_sharding(devices: list[jax.Device]) -> tuple[Mesh, NamedSharding, NamedSharding]:
+    """Build sharding helpers for data and replicated params.
+
+    :param devices: Devices to shard across.
+    :returns: Tuple of (mesh, data_sharding, replicated_sharding).
+    """
+    mesh = Mesh(np.array(devices), ("data",))
+    data_sharding = NamedSharding(mesh, PartitionSpec("data"))
+    replicated_sharding = NamedSharding(mesh, PartitionSpec())
+    return mesh, data_sharding, replicated_sharding
+
+
 def _replicate_tree(tree: T, num_devices: int) -> T:
     """Replicate array leaves along a leading device axis.
 
@@ -231,7 +244,7 @@ def _replicate_tree(tree: T, num_devices: int) -> T:
 def _prefetch_to_device(
     iterator: Iterable[np.ndarray],
     size: int,
-    sharding: jax.sharding.Sharding,
+    sharding: Sharding,
 ) -> Iterator[Array]:
     """Prefetch batches to devices using a background thread.
 
@@ -249,7 +262,7 @@ def _prefetch_to_device(
     def _worker() -> None:
         try:
             for item in iterator:
-                device_item = jax.device_put(item, sharding=sharding)
+                device_item = jax.device_put(item, device=sharding)
                 work_queue.put(device_item)
         except Exception as exc:
             work_queue.put(exc)
@@ -368,7 +381,7 @@ def main() -> None:
         raise ValueError("no devices available for training")
 
     num_devices = len(device_list)
-    data_sharding = jax.sharding.PositionalSharding(device_list)
+    _mesh, data_sharding, _replicated_sharding = _build_sharding(device_list)
     if args.per_device_batch_size <= 0:
         raise ValueError("per-device batch size must be > 0")
     if args.epochs <= 0:
@@ -581,10 +594,10 @@ def main() -> None:
     )  # type: ignore[call-overload]
 
     model_params_repl = _replicate_tree(model_params, num_devices)
-    model_params_repl = jax.device_put(model_params_repl, sharding=data_sharding)
+    model_params_repl = jax.device_put(model_params_repl, device=data_sharding)
     model_repl = eqx.combine(model_params_repl, model_static)
     opt_state_repl = _replicate_tree(opt_state, num_devices)
-    opt_state_repl = jax.device_put(opt_state_repl, sharding=data_sharding)
+    opt_state_repl = jax.device_put(opt_state_repl, device=data_sharding)
 
     global_batch = args.per_device_batch_size * num_devices
     train_steps = len(train_dataset) // global_batch
@@ -615,7 +628,7 @@ def main() -> None:
                     batch = next(train_iter)
                     step_key = jax.random.fold_in(base_key, global_step)
                     device_keys = jax.random.split(step_key, num_devices)
-                    device_keys = jax.device_put(device_keys, sharding=data_sharding)
+                    device_keys = jax.device_put(device_keys, device=data_sharding)
                     step_id = jnp.full((num_devices,), val_global_step, dtype=jnp.int32)
 
                     model_repl, opt_state_repl, loss, pred, sigreg = train_step_pmap(
@@ -658,7 +671,7 @@ def main() -> None:
                     batch = next(val_iter)
                     step_id = jnp.full((num_devices,), global_step, dtype=jnp.int32)
                     device_keys = jax.random.split(base_key, num_devices)
-                    device_keys = jax.device_put(device_keys, sharding=data_sharding)
+                    device_keys = jax.device_put(device_keys, device=data_sharding)
                     total, pred, sigreg = eval_step_pmap(model_repl, batch, device_keys, step_id)
 
                     loss_val = float(np.mean(jax.device_get(total)))
