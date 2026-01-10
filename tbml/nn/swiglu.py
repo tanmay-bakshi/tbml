@@ -3,7 +3,7 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array
 
-from tbml.nn import Linear
+from tbml.nn.linear import Linear
 from tbml.nn.init import Initializer
 
 
