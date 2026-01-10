@@ -210,16 +210,34 @@ def _unreplicate(tree: T) -> T:
     )
 
 
+def _replicate_tree(tree: T, num_devices: int) -> T:
+    """Replicate array leaves along a leading device axis.
+
+    :param tree: PyTree of parameters or optimizer state.
+    :param num_devices: Number of devices to replicate across.
+    :returns: Replicated PyTree with a leading device axis.
+    """
+    return cast(
+        T,
+        jax.tree_util.tree_map(
+            lambda value: jnp.broadcast_to(value, (num_devices,) + value.shape)
+            if eqx.is_array(value)
+            else value,
+            tree,
+        ),
+    )
+
+
 def _prefetch_to_device(
     iterator: Iterable[np.ndarray],
     size: int,
-    devices: list[jax.Device],
+    sharding: jax.sharding.Sharding,
 ) -> Iterator[Array]:
     """Prefetch batches to devices using a background thread.
 
     :param iterator: Host iterator yielding sharded host batches.
     :param size: Prefetch depth.
-    :param devices: Target devices.
+    :param sharding: Sharding specification for device placement.
     :returns: Iterator yielding device-resident batches.
     """
     if size <= 0:
@@ -231,8 +249,7 @@ def _prefetch_to_device(
     def _worker() -> None:
         try:
             for item in iterator:
-                shards = list(item)
-                device_item = jax.device_put_sharded(shards, devices)
+                device_item = jax.device_put(item, sharding=sharding)
                 work_queue.put(device_item)
         except Exception as exc:
             work_queue.put(exc)
@@ -351,6 +368,7 @@ def main() -> None:
         raise ValueError("no devices available for training")
 
     num_devices = len(device_list)
+    data_sharding = jax.sharding.PositionalSharding(device_list)
     if args.per_device_batch_size <= 0:
         raise ValueError("per-device batch size must be > 0")
     if args.epochs <= 0:
@@ -562,9 +580,11 @@ def main() -> None:
         eval_step, axis_name="data", devices=device_list
     )  # type: ignore[call-overload]
 
-    model_params_repl = jax.device_put_replicated(model_params, device_list)
+    model_params_repl = _replicate_tree(model_params, num_devices)
+    model_params_repl = jax.device_put(model_params_repl, sharding=data_sharding)
     model_repl = eqx.combine(model_params_repl, model_static)
-    opt_state_repl = jax.device_put_replicated(opt_state, device_list)
+    opt_state_repl = _replicate_tree(opt_state, num_devices)
+    opt_state_repl = jax.device_put(opt_state_repl, sharding=data_sharding)
 
     global_batch = args.per_device_batch_size * num_devices
     train_steps = len(train_dataset) // global_batch
@@ -587,7 +607,7 @@ def main() -> None:
                 num_devices,
                 executor,
             )
-            train_iter = _prefetch_to_device(train_iter_host, size=args.prefetch, devices=device_list)
+            train_iter = _prefetch_to_device(train_iter_host, size=args.prefetch, sharding=data_sharding)
             train_iter = iter(train_iter)
 
             with tqdm(total=train_steps, desc=f"Train {epoch}/{args.epochs}") as pbar:
@@ -595,7 +615,7 @@ def main() -> None:
                     batch = next(train_iter)
                     step_key = jax.random.fold_in(base_key, global_step)
                     device_keys = jax.random.split(step_key, num_devices)
-                    device_keys = jax.device_put_sharded(list(device_keys), device_list)
+                    device_keys = jax.device_put(device_keys, sharding=data_sharding)
                     step_id = jnp.full((num_devices,), val_global_step, dtype=jnp.int32)
 
                     model_repl, opt_state_repl, loss, pred, sigreg = train_step_pmap(
@@ -630,7 +650,7 @@ def main() -> None:
                 num_devices,
                 executor,
             )
-            val_iter = _prefetch_to_device(val_iter_host, size=args.prefetch, devices=device_list)
+            val_iter = _prefetch_to_device(val_iter_host, size=args.prefetch, sharding=data_sharding)
             val_iter = iter(val_iter)
 
             with tqdm(total=val_steps, desc=f"Val {epoch}/{args.epochs}") as pbar:
@@ -638,7 +658,7 @@ def main() -> None:
                     batch = next(val_iter)
                     step_id = jnp.full((num_devices,), global_step, dtype=jnp.int32)
                     device_keys = jax.random.split(base_key, num_devices)
-                    device_keys = jax.device_put_sharded(list(device_keys), device_list)
+                    device_keys = jax.device_put(device_keys, sharding=data_sharding)
                     total, pred, sigreg = eval_step_pmap(model_repl, batch, device_keys, step_id)
 
                     loss_val = float(np.mean(jax.device_get(total)))

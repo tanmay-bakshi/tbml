@@ -164,7 +164,7 @@ class MuonWithAdamWFallback:
             return jax.tree_util.tree_map(
                 lambda value: value[index],
                 mapped,
-                is_leaf=lambda value: isinstance(value, tuple),
+                is_leaf=lambda value: isinstance(value, tuple) and len(value) == 4,
             )
 
         updates = _select(0)
