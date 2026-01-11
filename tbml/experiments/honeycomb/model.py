@@ -548,14 +548,16 @@ class ConViT(eqx.Module):
         return x
 
     def __call__(self, x: Array, *, train: bool, key: Array | None) -> Array:
-        """Compute patch representations.
+        """Compute pooled embeddings (mean over patches + final norm).
 
         :param x: Input tensor of shape (B, H, W, C).
         :param train: Whether to enable dropout and DropPath.
         :param key: PRNG key for dropout and DropPath.
-        :returns: Patch representations of shape (B, num_patches, d_model).
+        :returns: Pooled embeddings of shape (B, d_model).
         """
-        return self.final_norm(self.encode_patches(x, train=train, key=key))
+        patches = self.encode_patches(x, train=train, key=key)
+        pooled = jnp.mean(patches, axis=1)
+        return self.final_norm(pooled)
 
 
 class TimestepEmbedder(eqx.Module):

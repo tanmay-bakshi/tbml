@@ -428,9 +428,7 @@ def _encode_images(
         images = images.astype(dtype)
     else:
         images = images.astype(dtype)
-    patches = model.encode_patches(images, train=train, key=key)
-    pooled = jnp.mean(patches, axis=1)
-    pooled = model.final_norm(pooled)
+    pooled = model(images, train=train, key=key)
     return pooled.reshape((bsz, num_views, pooled.shape[-1]))
 
 
