@@ -211,7 +211,7 @@ class SelfAttention(eqx.Module):
 
         qf = q.astype(jnp.float32)
         kf = k.astype(jnp.float32)
-        vf = v.transpose((0, 2, 1, 3)).astype(v.dtype)
+        vf = v.astype(v.dtype)
 
         att = jnp.matmul(qf, jnp.swapaxes(kf, -2, -1)) / math.sqrt(head_dim)
 
