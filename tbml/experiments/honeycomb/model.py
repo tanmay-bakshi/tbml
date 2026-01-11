@@ -490,6 +490,7 @@ class ConViT(eqx.Module):
         :returns: Patch representations of shape (B, num_patches, d_model).
         """
         x = self.patch_embed(x)
+        x = x + self.pos_embed.astype(x.dtype)
         total_blocks = len(self.gpsa_blocks) + len(self.sa_blocks)
         if key is None:
             block_keys: list[Array | None] = [None] * total_blocks
@@ -498,9 +499,6 @@ class ConViT(eqx.Module):
 
         for block, block_key in zip(self.gpsa_blocks, block_keys[: len(self.gpsa_blocks)]):
             x = block(x, train=train, key=block_key)
-
-        if len(self.sa_blocks) > 0:
-            x = x + self.pos_embed.astype(x.dtype)
 
         for block, block_key in zip(self.sa_blocks, block_keys[len(self.gpsa_blocks) :]):
             x = block(x, train=train, key=block_key)

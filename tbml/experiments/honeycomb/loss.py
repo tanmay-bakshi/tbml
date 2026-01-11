@@ -201,7 +201,7 @@ def lejepa_loss(
     global_embeddings = embeddings[:, :num_global_views, :]
     centers = jnp.mean(global_embeddings, axis=1)
     diffs = embeddings - centers[:, None, :]
-    pred_loss = jnp.mean(jnp.sum(jnp.square(diffs), axis=-1))
+    pred_loss = jnp.mean(jnp.square(diffs))
 
     sigreg = sigreg_loss_views(
         embeddings,
