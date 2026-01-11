@@ -105,7 +105,18 @@ class SwiGLUFeedForward(eqx.Module):
         :returns: Output tensor of shape (B, T, d_model).
         :raises ValueError: If dropout is enabled without a PRNG key.
         """
-        gated = jax.nn.silu(self.gate_proj(x)) * self.up_proj(x)
+        gate_weight = self.gate_proj.weight.astype(self.dtype)
+        up_weight = self.up_proj.weight.astype(self.dtype)
+        fused_weight = jnp.concatenate([gate_weight, up_weight], axis=0)
+        proj = jnp.einsum("...i,oi->...o", x, fused_weight)
+        if self.gate_proj.bias is not None and self.up_proj.bias is not None:
+            fused_bias = jnp.concatenate(
+                [self.gate_proj.bias.astype(self.dtype), self.up_proj.bias.astype(self.dtype)],
+                axis=0,
+            )
+            proj = proj + fused_bias
+        gate, up = jnp.split(proj, 2, axis=-1)
+        gated = jax.nn.silu(gate) * up
         out = self.down_proj(gated)
         if self.resid_dropout > 0.0 and key is not None:
             out = self.resid_dropout_layer(out, key=key, inference=train is False)

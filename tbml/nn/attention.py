@@ -1,4 +1,6 @@
 import math
+from functools import lru_cache
+import numpy as np
 
 import equinox as eqx
 import jax
@@ -7,6 +9,24 @@ from jaxtyping import Array
 
 from tbml.nn.linear import Linear
 from tbml.nn.init import Initializer
+
+
+def _build_rel_pos(grid_size: tuple[int, int]) -> np.ndarray:
+    """Build relative position features for a square patch grid."""
+    coords_h = np.arange(grid_size[0], dtype=np.float32)
+    coords_w = np.arange(grid_size[1], dtype=np.float32)
+    grid_h, grid_w = np.meshgrid(coords_h, coords_w, indexing="ij")
+    coords = np.stack((grid_h, grid_w), axis=-1).reshape((grid_size[0] * grid_size[1], 2))
+    delta = coords[None, :, :] - coords[:, None, :]
+    delta1 = delta[..., 0]
+    delta2 = delta[..., 1]
+    dist2 = np.square(delta1) + np.square(delta2)
+    return np.stack((dist2, delta1, delta2), axis=-1)
+
+
+@lru_cache(maxsize=16)
+def _cached_rel_pos(grid_size: tuple[int, int]) -> np.ndarray:
+    return _build_rel_pos(grid_size)
 
 
 class SelfAttention(eqx.Module):
@@ -36,6 +56,7 @@ class SelfAttention(eqx.Module):
     is_causal: bool
     dtype: jnp.dtype
     param_dtype: jnp.dtype
+    attn_implementation: str | None = eqx.field(static=True)
     q_proj: Linear
     k_proj: Linear
     v_proj: Linear
@@ -56,6 +77,7 @@ class SelfAttention(eqx.Module):
         param_dtype: jnp.dtype = jnp.float32,
         qkv_kernel_init: Initializer = jax.nn.initializers.lecun_normal(),
         o_kernel_init: Initializer = jax.nn.initializers.lecun_normal(),
+        attn_implementation: str | None = None,
         key: Array,
     ) -> None:
         """Initialize attention parameters.
@@ -99,6 +121,7 @@ class SelfAttention(eqx.Module):
         self.is_causal = is_causal
         self.dtype = dtype
         self.param_dtype = param_dtype
+        self.attn_implementation = attn_implementation
 
         self.q_proj = Linear(
             in_features=d_model,
@@ -158,6 +181,25 @@ class SelfAttention(eqx.Module):
         k = self.k_proj(x)
         v = self.v_proj(x)
 
+        use_fast_attn = self.attn_implementation is not None and self.attn_dropout == 0.0
+        if use_fast_attn:
+            q = q.reshape((bsz, seqlen, self.n_heads, head_dim))
+            k = k.reshape((bsz, seqlen, self.n_kv_heads, head_dim))
+            v = v.reshape((bsz, seqlen, self.n_kv_heads, head_dim))
+            y = jax.nn.dot_product_attention(
+                q,
+                k,
+                v,
+                is_causal=self.is_causal,
+                implementation=self.attn_implementation,
+            )
+            y = y.reshape((bsz, seqlen, self.n_heads * head_dim))
+            y = self.o_proj(y)
+            if self.resid_dropout > 0.0 and key is not None:
+                key, resid_key = jax.random.split(key)
+                y = self.resid_dropout_layer(y, key=resid_key, inference=train is False)
+            return y
+
         q = q.reshape((bsz, seqlen, self.n_heads, head_dim)).transpose((0, 2, 1, 3))
         k = k.reshape((bsz, seqlen, self.n_kv_heads, head_dim)).transpose((0, 2, 1, 3))
         v = v.reshape((bsz, seqlen, self.n_kv_heads, head_dim)).transpose((0, 2, 1, 3))
@@ -169,7 +211,7 @@ class SelfAttention(eqx.Module):
 
         qf = q.astype(jnp.float32)
         kf = k.astype(jnp.float32)
-        vf = v.astype(jnp.float32)
+        vf = v.transpose((0, 2, 1, 3)).astype(v.dtype)
 
         att = jnp.matmul(qf, jnp.swapaxes(kf, -2, -1)) / math.sqrt(head_dim)
 
@@ -218,6 +260,7 @@ class GatedPositionalSelfAttention(eqx.Module):
     resid_dropout: float
     dtype: jnp.dtype
     param_dtype: jnp.dtype
+    attn_implementation: str | None = eqx.field(static=True)
     q_proj: Linear
     k_proj: Linear
     v_proj: Linear
@@ -241,6 +284,7 @@ class GatedPositionalSelfAttention(eqx.Module):
         param_dtype: jnp.dtype = jnp.float32,
         qkv_kernel_init: Initializer = jax.nn.initializers.lecun_normal(),
         o_kernel_init: Initializer = jax.nn.initializers.lecun_normal(),
+        attn_implementation: str | None = None,
         key: Array,
     ) -> None:
         """Initialize GPSA parameters.
@@ -281,6 +325,7 @@ class GatedPositionalSelfAttention(eqx.Module):
         self.resid_dropout = resid_dropout
         self.dtype = dtype
         self.param_dtype = param_dtype
+        self.attn_implementation = attn_implementation
 
         self.q_proj = Linear(
             in_features=d_model,
@@ -364,14 +409,51 @@ class GatedPositionalSelfAttention(eqx.Module):
 
         bsz, seqlen, _ = x.shape
         expected_seqlen = self.grid_size[0] * self.grid_size[1]
-        if seqlen != expected_seqlen:
-            raise ValueError("sequence length must match grid_size product")
+        if seqlen == expected_seqlen:
+            rel_pos = _cached_rel_pos(self.grid_size)
+        else:
+            grid_dim = int(math.sqrt(seqlen))
+            if grid_dim * grid_dim != seqlen:
+                raise ValueError("sequence length must be a perfect square for GPSA")
+            rel_pos = _cached_rel_pos((grid_dim, grid_dim))
 
         head_dim = self.d_model // self.n_heads
 
         q = self.q_proj(x)
         k = self.k_proj(x)
         v = self.v_proj(x)
+
+        use_fast_attn = self.attn_implementation is not None and self.attn_dropout == 0.0
+        if use_fast_attn:
+            q = q.reshape((bsz, seqlen, self.n_heads, head_dim))
+            k = k.reshape((bsz, seqlen, self.n_heads, head_dim))
+            v = v.reshape((bsz, seqlen, self.n_heads, head_dim))
+            content_out = jax.nn.dot_product_attention(
+                q,
+                k,
+                v,
+                is_causal=False,
+                implementation=self.attn_implementation,
+            )
+
+            pos_scores = jnp.einsum(
+                "hd,ijd->hij",
+                self.v_pos.astype(jnp.float32),
+                jnp.asarray(rel_pos),
+            )
+            pos_attn = jax.nn.softmax(pos_scores, axis=-1)[None, ...]
+            vf = v.transpose((0, 2, 1, 3)).astype(jnp.float32)
+            pos_out = jnp.matmul(pos_attn, vf).transpose((0, 2, 1, 3))
+
+            gating = jax.nn.sigmoid(self.gating_param.astype(jnp.float32)).astype(content_out.dtype)
+            gating = gating[None, None, :, None]
+            y = (1.0 - gating) * content_out + gating * pos_out.astype(content_out.dtype)
+            y = y.reshape((bsz, seqlen, self.n_heads * head_dim))
+            y = self.o_proj(y)
+            if self.resid_dropout > 0.0 and key is not None:
+                key, resid_key = jax.random.split(key)
+                y = self.resid_dropout_layer(y, key=resid_key, inference=train is False)
+            return y
 
         q = q.reshape((bsz, seqlen, self.n_heads, head_dim)).transpose((0, 2, 1, 3))
         k = k.reshape((bsz, seqlen, self.n_heads, head_dim)).transpose((0, 2, 1, 3))
@@ -384,23 +466,15 @@ class GatedPositionalSelfAttention(eqx.Module):
         content_scores = jnp.matmul(qf, jnp.swapaxes(kf, -2, -1)) / math.sqrt(head_dim)
         content_attn = jax.nn.softmax(content_scores, axis=-1)
 
-        height, width = self.grid_size
-        coords_h = jnp.arange(height, dtype=jnp.float32)
-        coords_w = jnp.arange(width, dtype=jnp.float32)
-        grid_h, grid_w = jnp.meshgrid(coords_h, coords_w, indexing="ij")
-        coords = jnp.stack((grid_h, grid_w), axis=-1).reshape((seqlen, 2))
-        delta = coords[None, :, :] - coords[:, None, :]
-        delta1 = delta[..., 0]
-        delta2 = delta[..., 1]
-        dist2 = jnp.square(delta1) + jnp.square(delta2)
-        rel_pos = jnp.stack((dist2, delta1, delta2), axis=-1)
-
-        pos_scores = jnp.einsum("hd,ijd->hij", self.v_pos.astype(jnp.float32), rel_pos)
+        pos_scores = jnp.einsum(
+            "hd,ijd->hij",
+            self.v_pos.astype(jnp.float32),
+            jnp.asarray(rel_pos),
+        )
         pos_attn = jax.nn.softmax(pos_scores, axis=-1)[None, ...]
 
         gating = jax.nn.sigmoid(self.gating_param.astype(jnp.float32))[None, :, None, None]
         attn = (1.0 - gating) * content_attn + gating * pos_attn
-        attn = attn / jnp.sum(attn, axis=-1, keepdims=True)
 
         if self.attn_dropout > 0.0 and key is not None:
             key, attn_key = jax.random.split(key)

@@ -160,11 +160,22 @@ class MuonWithAdamWFallback:
             self.qkv_mask,
         )
 
+        def _is_update_tuple(value: object) -> bool:
+            if isinstance(value, tuple) is False or len(value) != 4:
+                return False
+            for item in value:
+                if item is None:
+                    continue
+                if isinstance(item, (jax.Array, jax.core.Tracer)):
+                    continue
+                return False
+            return True
+
         def _select(index: int) -> PyTree:
             return jax.tree_util.tree_map(
                 lambda value: value[index],
                 mapped,
-                is_leaf=lambda value: isinstance(value, tuple) and len(value) == 4,
+                is_leaf=_is_update_tuple,
             )
 
         updates = _select(0)

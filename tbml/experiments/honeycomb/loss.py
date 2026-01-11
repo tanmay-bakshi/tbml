@@ -65,29 +65,101 @@ def sigreg_loss(
     key = jax.random.PRNGKey(seed)
     step = jnp.asarray(global_step, dtype=jnp.int32)
     key = jax.random.fold_in(key, step)
-    work_dtype = embeddings.dtype
-    directions = jax.random.normal(key, (dim, num_slices), dtype=work_dtype)
+    embeddings_f32 = embeddings.astype(jnp.float32)
+    directions = jax.random.normal(key, (dim, num_slices), dtype=jnp.float32)
     directions = directions / jnp.linalg.norm(directions, axis=0, keepdims=True)
 
-    t = jnp.linspace(t_min, t_max, num_knots, dtype=work_dtype)
+    t = jnp.linspace(t_min, t_max, num_knots, dtype=jnp.float32)
     exp_f = jnp.exp(-0.5 * jnp.square(t))
 
-    projections = jnp.matmul(embeddings, directions)
+    projections = jnp.matmul(embeddings_f32, directions)
     x_t = projections[:, :, None] * t[None, None, :]
-    ecf = jnp.exp(1j * x_t).mean(axis=0)
+    ecf_real = jnp.cos(x_t).mean(axis=0)
+    ecf_imag = jnp.sin(x_t).mean(axis=0)
     if axis_name is not None:
-        ecf = jax.lax.pmean(ecf, axis_name)
+        ecf_real = jax.lax.pmean(ecf_real, axis_name)
+        ecf_imag = jax.lax.pmean(ecf_imag, axis_name)
 
-    err = jnp.square(jnp.abs(ecf - exp_f[None, :])) * exp_f[None, :]
+    err = (jnp.square(ecf_real - exp_f[None, :]) + jnp.square(ecf_imag)) * exp_f[None, :]
     ep_stat = _trapz(err, t, axis=-1)
 
     if axis_name is not None:
         axis_size = jax.lax.psum(jnp.asarray(1, dtype=jnp.int32), axis_name)
-        total_batch = jnp.asarray(batch_size, dtype=ep_stat.dtype) * axis_size
+        total_batch = jnp.asarray(batch_size, dtype=jnp.float32) * axis_size
     else:
-        total_batch = jnp.asarray(batch_size, dtype=ep_stat.dtype)
+        total_batch = jnp.asarray(batch_size, dtype=jnp.float32)
 
     return jnp.mean(ep_stat * total_batch)
+
+
+def sigreg_loss_views(
+    embeddings: Array,
+    *,
+    global_step: Array,
+    num_slices: int = 256,
+    seed: int = 0,
+    axis_name: str | None = None,
+    t_min: float = -5.0,
+    t_max: float = 5.0,
+    num_knots: int = 17,
+) -> Array:
+    """Compute the SIGReg loss across multiple views.
+
+    :param embeddings: Embeddings of shape (B, V, K).
+    :param global_step: Global training step used to sync random directions.
+    :param num_slices: Number of random projection directions.
+    :param seed: Random seed for direction sampling.
+    :param axis_name: Optional pmapped axis name for cross-device aggregation.
+    :param t_min: Lower bound for integration points.
+    :param t_max: Upper bound for integration points.
+    :param num_knots: Number of integration knots.
+    :returns: Scalar SIGReg loss averaged over views.
+    """
+    if embeddings.ndim != 3:
+        raise ValueError("embeddings must have shape (B, V, K)")
+    if num_slices <= 0:
+        raise ValueError("num_slices must be > 0")
+    if num_knots <= 1:
+        raise ValueError("num_knots must be > 1")
+    if t_min >= t_max:
+        raise ValueError("t_min must be < t_max")
+
+    batch_size, num_views, dim = embeddings.shape
+    if batch_size <= 0:
+        raise ValueError("embeddings must have a positive batch size")
+    if num_views <= 0:
+        raise ValueError("embeddings must have a positive number of views")
+    if dim <= 0:
+        raise ValueError("embeddings must have a positive feature dimension")
+
+    key = jax.random.PRNGKey(seed)
+    step = jnp.asarray(global_step, dtype=jnp.int32)
+    key = jax.random.fold_in(key, step)
+    embeddings_f32 = embeddings.astype(jnp.float32)
+    directions = jax.random.normal(key, (dim, num_slices), dtype=jnp.float32)
+    directions = directions / jnp.linalg.norm(directions, axis=0, keepdims=True)
+
+    t = jnp.linspace(t_min, t_max, num_knots, dtype=jnp.float32)
+    exp_f = jnp.exp(-0.5 * jnp.square(t))
+
+    projections = jnp.einsum("bvk,ks->bvs", embeddings_f32, directions)
+    x_t = projections[:, :, :, None] * t[None, None, None, :]
+    ecf_real = jnp.cos(x_t).mean(axis=0)
+    ecf_imag = jnp.sin(x_t).mean(axis=0)
+    if axis_name is not None:
+        ecf_real = jax.lax.pmean(ecf_real, axis_name)
+        ecf_imag = jax.lax.pmean(ecf_imag, axis_name)
+
+    err = (jnp.square(ecf_real - exp_f[None, None, :]) + jnp.square(ecf_imag)) * exp_f[None, None, :]
+    ep_stat = _trapz(err, t, axis=-1)
+
+    if axis_name is not None:
+        axis_size = jax.lax.psum(jnp.asarray(1, dtype=jnp.int32), axis_name)
+        total_batch = jnp.asarray(batch_size, dtype=jnp.float32) * axis_size
+    else:
+        total_batch = jnp.asarray(batch_size, dtype=jnp.float32)
+
+    return jnp.mean(jnp.mean(ep_stat * total_batch, axis=-1))
 
 
 def lejepa_loss(
@@ -131,17 +203,13 @@ def lejepa_loss(
     diffs = embeddings - centers[:, None, :]
     pred_loss = jnp.mean(jnp.sum(jnp.square(diffs), axis=-1))
 
-    views = jnp.moveaxis(embeddings, 1, 0)
-    sigreg_values = jax.vmap(
-        lambda view_emb: sigreg_loss(
-            view_emb,
-            global_step=global_step,
-            num_slices=num_slices,
-            seed=seed,
-            axis_name=axis_name,
-        )
-    )(views)
-    sigreg = jnp.mean(sigreg_values)
+    sigreg = sigreg_loss_views(
+        embeddings,
+        global_step=global_step,
+        num_slices=num_slices,
+        seed=seed,
+        axis_name=axis_name,
+    )
 
     total = (1.0 - sigreg_weight) * pred_loss + sigreg_weight * sigreg
     return total, pred_loss, sigreg

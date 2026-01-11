@@ -1,9 +1,7 @@
 import os
 import threading
 
-import jax.numpy as jnp
 import numpy as np
-from jaxtyping import Array
 from PIL import Image
 
 from tbml.data import TarredImagesRandomAccessDataset
@@ -18,9 +16,13 @@ class LeJEPADataset:
     _global_view_dim: int
     _num_local_views: int
     _local_view_dim: int
-    _rng: np.random.Generator
+    _seed: int | None
+    _seed_seq: np.random.SeedSequence | None
+    _seed_lock: threading.Lock
+    _rng_local: threading.local
     _pid: int
-    _rng_lock: threading.Lock
+    _normalize: bool
+    _device_augment: bool
     _mean: np.ndarray | None
     _std: np.ndarray | None
 
@@ -33,6 +35,9 @@ class LeJEPADataset:
         num_local_views: int,
         local_view_dim: int,
         mean_std: tuple[tuple[float, float, float], tuple[float, float, float]] | None = None,
+        seed: int | None = None,
+        normalize: bool = True,
+        device_augment: bool = False,
     ) -> None:
         """Initialize the LeJEPA dataset wrapper.
 
@@ -43,6 +48,9 @@ class LeJEPADataset:
         :param num_local_views: Number of local views per sample.
         :param local_view_dim: Crop size for local views.
         :param mean_std: Optional RGB mean/std for standardization.
+        :param seed: Optional seed for per-thread RNG initialization.
+        :param normalize: Whether to standardize and return float32 views.
+        :param device_augment: Whether to return base images for device-side augmentation.
         """
         if resize_dim <= 0:
             raise ValueError("resize_dim must be > 0")
@@ -67,9 +75,13 @@ class LeJEPADataset:
         self._global_view_dim = global_view_dim
         self._num_local_views = num_local_views
         self._local_view_dim = local_view_dim
-        self._rng = np.random.default_rng()
+        self._seed = seed
+        self._seed_seq = np.random.SeedSequence(seed) if seed is not None else None
+        self._seed_lock = threading.Lock()
+        self._rng_local = threading.local()
         self._pid = os.getpid()
-        self._rng_lock = threading.Lock()
+        self._normalize = normalize
+        self._device_augment = device_augment
         if mean_std is None:
             self._mean = None
             self._std = None
@@ -89,7 +101,7 @@ class LeJEPADataset:
         """
         return len(self._dataset)
 
-    def __getitem__(self, idx: int) -> Array:
+    def __getitem__(self, idx: int) -> np.ndarray:
         """Load and augment a sample into multiple views.
 
         :param idx: Dataset index.
@@ -100,13 +112,16 @@ class LeJEPADataset:
 
         current_pid = os.getpid()
         if current_pid != self._pid:
-            self._rng = np.random.default_rng()
-            self._pid = current_pid
-            self._rng_lock = threading.Lock()
+            self._reset_rngs()
 
         image = self._dataset[idx]
+        image.draft("RGB", (self._resize_dim, self._resize_dim))
         if image.mode != "RGB":
             image = image.convert("RGB")
+
+        if self._device_augment:
+            image = self._resize_square(image, self._resize_dim)
+            return np.asarray(image, dtype=np.uint8)
 
         image = self._resize_short_side(image, self._resize_dim)
 
@@ -125,11 +140,34 @@ class LeJEPADataset:
         ]
 
         views = global_views + local_views
-        stacked = np.stack([np.asarray(view, dtype=np.float32) for view in views], axis=0)
-        if self._mean is not None and self._std is not None:
-            stacked = stacked / np.float32(255.0)
-            stacked = (stacked - self._mean[None, None, None, :]) / self._std[None, None, None, :]
-        return jnp.asarray(stacked)
+        if self._normalize:
+            stacked = np.stack([np.asarray(view, dtype=np.float32) for view in views], axis=0)
+            if self._mean is not None and self._std is not None:
+                stacked = stacked / np.float32(255.0)
+                stacked = (stacked - self._mean[None, None, None, :]) / self._std[
+                    None, None, None, :
+                ]
+        else:
+            stacked = np.stack([np.asarray(view, dtype=np.uint8) for view in views], axis=0)
+        return stacked
+
+    def _reset_rngs(self) -> None:
+        self._pid = os.getpid()
+        self._seed_seq = np.random.SeedSequence(self._seed) if self._seed is not None else None
+        self._seed_lock = threading.Lock()
+        self._rng_local = threading.local()
+
+    def _get_rng(self) -> np.random.Generator:
+        rng = getattr(self._rng_local, "rng", None)
+        if rng is None:
+            if self._seed_seq is None:
+                rng = np.random.default_rng()
+            else:
+                with self._seed_lock:
+                    child = self._seed_seq.spawn(1)[0]
+                rng = np.random.default_rng(child)
+            self._rng_local.rng = rng
+        return rng
 
     def _resize_short_side(self, image: Image.Image, target: int) -> Image.Image:
         """Resize the image so that the shorter side matches ``target``.
@@ -150,6 +188,15 @@ class LeJEPADataset:
             return image
         return image.resize((new_width, new_height), resample=Image.Resampling.BICUBIC)
 
+    def _resize_square(self, image: Image.Image, target: int) -> Image.Image:
+        """Resize the image to a square of size ``target``.
+
+        :param image: Input image.
+        :param target: Target square dimension.
+        :returns: Resized square image.
+        """
+        return image.resize((target, target), resample=Image.Resampling.BILINEAR)
+
     def _random_crop(self, image: Image.Image, crop_dim: int) -> Image.Image:
         """Sample a random square crop from the image.
 
@@ -163,9 +210,9 @@ class LeJEPADataset:
 
         max_left = width - crop_dim
         max_top = height - crop_dim
-        with self._rng_lock:
-            left = int(self._rng.integers(0, max_left + 1))
-            top = int(self._rng.integers(0, max_top + 1))
+        rng = self._get_rng()
+        left = int(rng.integers(0, max_left + 1))
+        top = int(rng.integers(0, max_top + 1))
         right = left + crop_dim
         bottom = top + crop_dim
         return image.crop((left, top, right, bottom))

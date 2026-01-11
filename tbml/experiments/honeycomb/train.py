@@ -3,6 +3,7 @@ import json
 import os
 import queue
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Iterable, Iterator, TypeVar, cast
@@ -32,12 +33,40 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--runs-folder", type=str, required=True)
     parser.add_argument("--data-folder", type=str, required=True)
     parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--max-train-steps", type=int, default=0)
+    parser.add_argument("--max-val-steps", type=int, default=0)
+    parser.add_argument("--log-every", type=int, default=1)
+    parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--profile-warmup-steps", type=int, default=1)
+    parser.add_argument("--attn-impl", type=str, default="auto", choices=["auto", "cudnn", "xla"])
     parser.add_argument("--per-device-batch-size", type=int, default=32)
     parser.add_argument("--num-devices", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--prefetch", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "bfloat16", "float16"])
+    parser.add_argument("--device-normalize", dest="device_normalize", action="store_true")
+    parser.add_argument(
+        "--no-device-normalize",
+        dest="device_normalize",
+        action="store_false",
+    )
+    parser.add_argument("--device-augment", dest="device_augment", action="store_true")
+    parser.add_argument(
+        "--no-device-augment",
+        dest="device_augment",
+        action="store_false",
+    )
+    parser.add_argument(
+        "--device-augment-resize-locals",
+        dest="device_augment_resize_locals",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--device-augment-keep-local-size",
+        dest="device_augment_resize_locals",
+        action="store_false",
+    )
 
     parser.add_argument("--image-size", type=str, default="224,224")
     parser.add_argument("--patch-size", type=int, default=16)
@@ -79,7 +108,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--adamw-eps", type=float, default=1e-8)
     parser.add_argument("--adamw-weight-decay", type=float, default=0.01)
 
-    parser.set_defaults(muon_nesterov=True)
+    parser.set_defaults(
+        muon_nesterov=True,
+        device_normalize=True,
+        device_augment=True,
+        device_augment_resize_locals=False,
+    )
     return parser.parse_args()
 
 
@@ -176,9 +210,9 @@ def _flatten_param_names(params: eqx.Module) -> list[str]:
     :param params: Parameter PyTree.
     :returns: List of flattened parameter names.
     """
-    paths, _ = jax.tree_util.tree_flatten_with_path(params)
+    paths_and_values, _ = jax.tree_util.tree_flatten_with_path(params)
     names: list[str] = []
-    for path in paths:
+    for path, _value in paths_and_values:
         parts: list[str] = []
         for key in path:
             if isinstance(key, jax.tree_util.GetAttrKey):
@@ -245,6 +279,8 @@ def _prefetch_to_device(
     iterator: Iterable[np.ndarray],
     size: int,
     sharding: Sharding,
+    *,
+    host_cast_dtype: np.dtype | None = None,
 ) -> Iterator[Array]:
     """Prefetch batches to devices using a background thread.
 
@@ -262,6 +298,8 @@ def _prefetch_to_device(
     def _worker() -> None:
         try:
             for item in iterator:
+                if host_cast_dtype is not None:
+                    item = item.astype(host_cast_dtype, copy=False)
                 device_item = jax.device_put(item, device=sharding)
                 work_queue.put(device_item)
         except Exception as exc:
@@ -305,8 +343,107 @@ def _iter_batches(
             items = [dataset[int(idx)] for idx in batch_indices]
         else:
             items = list(executor.map(dataset.__getitem__, batch_indices))
-        stacked = np.stack([np.asarray(item) for item in items], axis=0)
+        stacked = np.stack(items, axis=0)
         yield stacked.reshape((num_devices, per_device_batch) + stacked.shape[1:])
+
+
+def _augment_views(
+    images: Array,
+    key: Array,
+    *,
+    num_global_views: int,
+    global_view_dim: int,
+    num_local_views: int,
+    local_view_dim: int,
+    resize_locals: bool,
+) -> tuple[Array, Array]:
+    """Create global/local crops on device.
+
+    :param images: Input images of shape (B, H, W, C).
+    :param key: PRNG key for sampling crops.
+    :param resize_locals: Whether to resize local crops to the global size.
+    :returns: Tuple of (global_views, local_views).
+    """
+    if images.ndim != 4:
+        raise ValueError("images must have shape (B, H, W, C)")
+    bsz, height, width, channels = images.shape
+
+    def _random_crops(source: Array, crop_key: Array, num_views: int, crop_dim: int) -> Array:
+        if num_views == 0:
+            return jnp.zeros((bsz, 0, crop_dim, crop_dim, channels), dtype=source.dtype)
+        max_y = height - crop_dim
+        max_x = width - crop_dim
+        key_y, key_x = jax.random.split(crop_key)
+        ys = jax.random.randint(key_y, (bsz, num_views), 0, max_y + 1)
+        xs = jax.random.randint(key_x, (bsz, num_views), 0, max_x + 1)
+
+        def _crop_one(img: Array, y: Array, x: Array) -> Array:
+            return jax.lax.dynamic_slice(img, (y, x, 0), (crop_dim, crop_dim, channels))
+
+        def _crop_views(img: Array, yv: Array, xv: Array) -> Array:
+            return jax.vmap(_crop_one, in_axes=(None, 0, 0))(img, yv, xv)
+
+        return jax.vmap(_crop_views, in_axes=(0, 0, 0))(source, ys, xs)
+
+    key, global_key = jax.random.split(key)
+    global_views = _random_crops(images, global_key, num_global_views, global_view_dim)
+
+    if num_local_views > 0:
+        key, local_key = jax.random.split(key)
+        local_views = _random_crops(images, local_key, num_local_views, local_view_dim)
+        if resize_locals:
+            local_views = jax.image.resize(
+                local_views.astype(jnp.float32),
+                (bsz, num_local_views, global_view_dim, global_view_dim, channels),
+                method="bilinear",
+            )
+    else:
+        local_views = jnp.zeros(
+            (bsz, 0, local_view_dim, local_view_dim, channels),
+            dtype=images.dtype,
+        )
+    return global_views, local_views
+
+
+def _encode_images(
+    model: ConViT,
+    views: Array,
+    *,
+    train: bool,
+    key: Array | None,
+    dtype: jnp.dtype,
+    mean: Array | None,
+    std: Array | None,
+    normalize_on_device: bool,
+) -> Array:
+    """Encode same-size views into pooled embeddings.
+
+    :param model: ConViT encoder.
+    :param views: Input views of shape (B, V, H, W, C).
+    :param train: Whether to enable dropout.
+    :param key: PRNG key for dropout.
+    :param dtype: Compute dtype.
+    :param mean: Optional per-channel mean.
+    :param std: Optional per-channel std.
+    :param normalize_on_device: Whether to normalize inputs on device.
+    :returns: Embeddings of shape (B, V, K).
+    """
+    if views.ndim != 5:
+        raise ValueError("views must have shape (B, V, H, W, C)")
+    bsz, num_views, height, width, channels = views.shape
+    images = views.reshape((bsz * num_views, height, width, channels))
+    if normalize_on_device:
+        images = images.astype(jnp.float32)
+        if mean is not None and std is not None:
+            images = images / jnp.asarray(255.0, dtype=images.dtype)
+            images = (images - mean) / std
+        images = images.astype(dtype)
+    else:
+        images = images.astype(dtype)
+    patches = model.encode_patches(images, train=train, key=key)
+    pooled = jnp.mean(patches, axis=1)
+    pooled = model.final_norm(pooled)
+    return pooled.reshape((bsz, num_views, pooled.shape[-1]))
 
 
 def _encode_views(
@@ -316,23 +453,106 @@ def _encode_views(
     train: bool,
     key: jax.Array | None,
     dtype: jnp.dtype,
+    mean: Array | None,
+    std: Array | None,
+    normalize_on_device: bool,
+    augment_on_device: bool,
+    num_global_views: int,
+    global_view_dim: int,
+    num_local_views: int,
+    local_view_dim: int,
+    resize_local_views: bool,
 ) -> Array:
     """Encode a batch of views into pooled embeddings.
 
     :param model: ConViT encoder.
-    :param batch: Input views of shape (B, V, H, W, C).
+    :param batch: Input views of shape (B, V, H, W, C) or base images of shape (B, H, W, C).
     :param train: Whether to enable dropout.
     :param key: PRNG key for dropout.
     :param dtype: Compute dtype.
+    :param mean: Optional per-channel mean.
+    :param std: Optional per-channel std.
+    :param normalize_on_device: Whether to normalize inputs on device.
+    :param augment_on_device: Whether to generate views on device.
+    :param num_global_views: Number of global views to sample.
+    :param global_view_dim: Global view crop size.
+    :param num_local_views: Number of local views to sample.
+    :param local_view_dim: Local view crop size.
+    :param resize_local_views: Whether local views are resized to the global size.
     :returns: Embeddings of shape (B, V, K).
     """
-    if batch.ndim != 5:
-        raise ValueError("batch must have shape (B, V, H, W, C)")
-    bsz, views, height, width, channels = batch.shape
-    images = batch.reshape((bsz * views, height, width, channels)).astype(dtype)
-    outputs = model(images, train=train, key=key)
-    pooled = jnp.mean(outputs, axis=1)
-    return pooled.reshape((bsz, views, pooled.shape[-1]))
+    if augment_on_device:
+        if key is None:
+            raise ValueError("device augmentation requires a PRNG key")
+        if batch.ndim != 4:
+            raise ValueError("batch must have shape (B, H, W, C) for device augmentation")
+        key, aug_key = jax.random.split(key)
+        global_views, local_views = _augment_views(
+            batch,
+            aug_key,
+            num_global_views=num_global_views,
+            global_view_dim=global_view_dim,
+            num_local_views=num_local_views,
+            local_view_dim=local_view_dim,
+            resize_locals=resize_local_views,
+        )
+        if num_local_views > 0 and global_views.shape[2:4] == local_views.shape[2:4]:
+            key, encode_key = jax.random.split(key)
+            combined = jnp.concatenate([global_views, local_views], axis=1)
+            return _encode_images(
+                model,
+                combined,
+                train=train,
+                key=encode_key,
+                dtype=dtype,
+                mean=mean,
+                std=std,
+                normalize_on_device=normalize_on_device,
+            )
+
+        outputs: list[Array] = []
+        if num_global_views > 0:
+            key, global_key = jax.random.split(key)
+            outputs.append(
+                _encode_images(
+                    model,
+                    global_views,
+                    train=train,
+                    key=global_key,
+                    dtype=dtype,
+                    mean=mean,
+                    std=std,
+                    normalize_on_device=normalize_on_device,
+                )
+            )
+        if num_local_views > 0:
+            key, local_key = jax.random.split(key)
+            outputs.append(
+                _encode_images(
+                    model,
+                    local_views,
+                    train=train,
+                    key=local_key,
+                    dtype=dtype,
+                    mean=mean,
+                    std=std,
+                    normalize_on_device=normalize_on_device,
+                )
+            )
+        if len(outputs) == 1:
+            return outputs[0]
+        return jnp.concatenate(outputs, axis=1)
+
+    return _encode_images(
+        model,
+        batch,
+        train=train,
+        key=key,
+        dtype=dtype,
+        mean=mean,
+        std=std,
+        normalize_on_device=normalize_on_device,
+    )
 
 
 def _save_checkpoint(
@@ -382,10 +602,38 @@ def main() -> None:
 
     num_devices = len(device_list)
     _mesh, data_sharding, _replicated_sharding = _build_sharding(device_list)
+    attn_impl = args.attn_impl
+    if attn_impl == "auto":
+        if any(dev.platform == "gpu" for dev in device_list) and dtype in (
+            jnp.float16,
+            jnp.bfloat16,
+        ):
+            attn_impl = "cudnn"
+        else:
+            attn_impl = "xla"
     if args.per_device_batch_size <= 0:
         raise ValueError("per-device batch size must be > 0")
     if args.epochs <= 0:
         raise ValueError("epochs must be > 0")
+    if args.max_train_steps < 0:
+        raise ValueError("max-train-steps must be >= 0")
+    if args.max_val_steps < 0:
+        raise ValueError("max-val-steps must be >= 0")
+    if args.log_every <= 0:
+        raise ValueError("log-every must be > 0")
+    if args.profile_warmup_steps < 0:
+        raise ValueError("profile-warmup-steps must be >= 0")
+    if args.attn_impl not in {"auto", "cudnn", "xla"}:
+        raise ValueError("attn-impl must be auto, cudnn, or xla")
+    if args.device_augment and args.device_normalize is False:
+        raise ValueError("device_augment requires device_normalize to be enabled")
+    if args.global_view_dim != image_size[0] or args.global_view_dim != image_size[1]:
+        raise ValueError("global_view_dim must match image_size for the encoder")
+    if args.global_view_dim % args.patch_size != 0:
+        raise ValueError("global_view_dim must be divisible by patch_size")
+    if args.device_augment and not args.device_augment_resize_locals:
+        if args.local_view_dim % args.patch_size != 0:
+            raise ValueError("local_view_dim must be divisible by patch_size when keeping local size")
     if args.num_workers < 0:
         raise ValueError("num_workers must be >= 0")
     if args.prefetch <= 0:
@@ -393,16 +641,29 @@ def main() -> None:
     if args.sigreg_weight < 0.0 or args.sigreg_weight > 1.0:
         raise ValueError("sigreg_weight must be in [0, 1]")
 
+    effective_prefetch = args.prefetch
+    if args.num_workers > 0:
+        auto_prefetch = min(args.num_workers * 2, 8)
+        effective_prefetch = max(args.prefetch, auto_prefetch)
+
     train_paths = _collect_tar_paths(args.data_folder, "train")
     val_paths = _collect_tar_paths(args.data_folder, "validation")
 
     mean_std = None
     if args.no_standardize is False:
         mean_std = (mean, std)
+    normalize_on_device = args.device_normalize
+    augment_on_device = args.device_augment
+    device_mean = None
+    device_std = None
+    if mean_std is not None and normalize_on_device:
+        device_mean = jnp.asarray(mean, dtype=jnp.float32)
+        device_std = jnp.asarray(std, dtype=jnp.float32)
 
     train_base = TarredImagesRandomAccessDataset(train_paths)
     val_base = TarredImagesRandomAccessDataset(val_paths)
 
+    dataset_normalize = (normalize_on_device is False) and (augment_on_device is False)
     train_dataset = LeJEPADataset(
         train_base,
         resize_dim=args.resize_dim,
@@ -411,6 +672,9 @@ def main() -> None:
         num_local_views=args.num_local_views,
         local_view_dim=args.local_view_dim,
         mean_std=mean_std,
+        seed=args.seed,
+        normalize=dataset_normalize,
+        device_augment=augment_on_device,
     )
     val_dataset = LeJEPADataset(
         val_base,
@@ -420,6 +684,9 @@ def main() -> None:
         num_local_views=args.num_local_views,
         local_view_dim=args.local_view_dim,
         mean_std=mean_std,
+        seed=args.seed,
+        normalize=dataset_normalize,
+        device_augment=augment_on_device,
     )
 
     model_config = ConViTConfig(
@@ -440,6 +707,7 @@ def main() -> None:
 
     run_config: dict[str, object] = {
         "model": model_config.model_dump(),
+        "attention": {"implementation": attn_impl},
         "data": {
             "resize_dim": args.resize_dim,
             "num_global_views": args.num_global_views,
@@ -447,6 +715,9 @@ def main() -> None:
             "num_local_views": args.num_local_views,
             "local_view_dim": args.local_view_dim,
             "mean_std": mean_std,
+            "device_normalize": args.device_normalize,
+            "device_augment": args.device_augment,
+            "device_augment_resize_locals": args.device_augment_resize_locals,
         },
         "loss": {
             "sigreg_weight": args.sigreg_weight,
@@ -468,10 +739,17 @@ def main() -> None:
         },
         "training": {
             "epochs": args.epochs,
+            "max_train_steps": args.max_train_steps,
+            "max_val_steps": args.max_val_steps,
             "per_device_batch_size": args.per_device_batch_size,
             "num_devices": num_devices,
             "seed": args.seed,
             "dtype": args.dtype,
+            "log_every": args.log_every,
+            "profile": args.profile,
+            "profile_warmup_steps": args.profile_warmup_steps,
+            "num_workers": args.num_workers,
+            "prefetch": effective_prefetch,
         },
     }
 
@@ -483,7 +761,13 @@ def main() -> None:
 
     base_key = jax.random.PRNGKey(args.seed)
     model_key, base_key = jax.random.split(base_key)
-    model = ConViT(model_config, dtype=dtype, param_dtype=dtype, key=model_key)
+    model = ConViT(
+        model_config,
+        dtype=dtype,
+        param_dtype=dtype,
+        attn_implementation=attn_impl,
+        key=model_key,
+    )
 
     model_params, model_static = eqx.partition(model, eqx.is_array)
     flat_names = _flatten_param_names(model_params)
@@ -541,7 +825,22 @@ def main() -> None:
         global_step: Array,
     ) -> tuple[ConViT, MuonWithAdamWFallbackState, Array, Array, Array]:
         def _loss_fn(model_inner: ConViT) -> tuple[Array, tuple[Array, Array]]:
-            emb = _encode_views(model_inner, batch, train=True, key=key, dtype=dtype)
+            emb = _encode_views(
+                model_inner,
+                batch,
+                train=True,
+                key=key,
+                dtype=dtype,
+                mean=device_mean,
+                std=device_std,
+                normalize_on_device=normalize_on_device,
+                augment_on_device=augment_on_device,
+                num_global_views=args.num_global_views,
+                global_view_dim=args.global_view_dim,
+                num_local_views=args.num_local_views,
+                local_view_dim=args.local_view_dim,
+                resize_local_views=args.device_augment_resize_locals,
+            )
             total, pred, sigreg = lejepa_loss(
                 emb,
                 args.num_global_views,
@@ -571,7 +870,22 @@ def main() -> None:
         key: Array,
         global_step: Array,
     ) -> tuple[Array, Array, Array]:
-        emb = _encode_views(model_in, batch, train=False, key=None, dtype=dtype)
+        emb = _encode_views(
+            model_in,
+            batch,
+            train=False,
+            key=key,
+            dtype=dtype,
+            mean=device_mean,
+            std=device_std,
+            normalize_on_device=normalize_on_device,
+            augment_on_device=augment_on_device,
+            num_global_views=args.num_global_views,
+            global_view_dim=args.global_view_dim,
+            num_local_views=args.num_local_views,
+            local_view_dim=args.local_view_dim,
+            resize_local_views=args.device_augment_resize_locals,
+        )
         total, pred, sigreg = lejepa_loss(
             emb,
             args.num_global_views,
@@ -587,7 +901,10 @@ def main() -> None:
         return total, pred, sigreg
 
     train_step_pmap = eqx.filter_pmap(
-        train_step, axis_name="data", devices=device_list
+        train_step,
+        axis_name="data",
+        devices=device_list,
+        donate="all",
     )  # type: ignore[call-overload]
     eval_step_pmap = eqx.filter_pmap(
         eval_step, axis_name="data", devices=device_list
@@ -602,6 +919,10 @@ def main() -> None:
     global_batch = args.per_device_batch_size * num_devices
     train_steps = len(train_dataset) // global_batch
     val_steps = len(val_dataset) // global_batch
+    if args.max_train_steps > 0:
+        train_steps = min(train_steps, args.max_train_steps)
+    if args.max_val_steps > 0:
+        val_steps = min(val_steps, args.max_val_steps)
     if train_steps <= 0 or val_steps <= 0:
         raise ValueError("dataset too small for the requested batch size")
 
@@ -609,10 +930,23 @@ def main() -> None:
     global_step = 0
     val_global_step = 0
     executor = ThreadPoolExecutor(max_workers=args.num_workers) if args.num_workers > 0 else None
+    host_cast_dtype: np.dtype | None = None
+    if normalize_on_device is False and dtype != jnp.float32:
+        host_cast_dtype = np.float16
+    perf_steps = 0
+    perf_data_time = 0.0
+    perf_compute_time = 0.0
+    perf_log_time = 0.0
+    perf_warmup = args.profile_warmup_steps
+    last_loss_val = 0.0
+    last_pred_val = 0.0
+    last_sig_val = 0.0
 
     try:
         for epoch in range(1, args.epochs + 1):
             train_indices = rng.permutation(len(train_dataset))
+            if train_steps * global_batch < len(train_indices):
+                train_indices = train_indices[: train_steps * global_batch]
             train_iter_host = _iter_batches(
                 train_dataset,
                 train_indices,
@@ -620,16 +954,23 @@ def main() -> None:
                 num_devices,
                 executor,
             )
-            train_iter = _prefetch_to_device(train_iter_host, size=args.prefetch, sharding=data_sharding)
+            train_iter = _prefetch_to_device(
+                train_iter_host,
+                size=effective_prefetch,
+                sharding=data_sharding,
+                host_cast_dtype=host_cast_dtype,
+            )
             train_iter = iter(train_iter)
 
             with tqdm(total=train_steps, desc=f"Train {epoch}/{args.epochs}") as pbar:
                 for _ in range(train_steps):
+                    step_start = time.perf_counter()
                     batch = next(train_iter)
+                    data_done = time.perf_counter()
                     step_key = jax.random.fold_in(base_key, global_step)
                     device_keys = jax.random.split(step_key, num_devices)
                     device_keys = jax.device_put(device_keys, device=data_sharding)
-                    step_id = jnp.full((num_devices,), val_global_step, dtype=jnp.int32)
+                    step_id = jnp.full((num_devices,), global_step, dtype=jnp.int32)
 
                     model_repl, opt_state_repl, loss, pred, sigreg = train_step_pmap(
                         model_repl,
@@ -638,24 +979,43 @@ def main() -> None:
                         device_keys,
                         step_id,
                     )
+                    if args.profile:
+                        jax.block_until_ready(loss)
+                    compute_done = time.perf_counter()
 
-                    loss_val = float(np.mean(jax.device_get(loss)))
-                    pred_val = float(np.mean(jax.device_get(pred)))
-                    sig_val = float(np.mean(jax.device_get(sigreg)))
+                    log_this_step = (global_step % args.log_every) == 0
+                    if log_this_step:
+                        loss_val = float(np.mean(jax.device_get(loss)))
+                        pred_val = float(np.mean(jax.device_get(pred)))
+                        sig_val = float(np.mean(jax.device_get(sigreg)))
+                        last_loss_val = loss_val
+                        last_pred_val = pred_val
+                        last_sig_val = sig_val
 
-                    writer.add_scalar("train/total_loss", loss_val, global_step)
-                    writer.add_scalar("train/pred_loss", pred_val, global_step)
-                    writer.add_scalar("train/sigreg_loss", sig_val, global_step)
+                        writer.add_scalar("train/total_loss", loss_val, global_step)
+                        writer.add_scalar("train/pred_loss", pred_val, global_step)
+                        writer.add_scalar("train/sigreg_loss", sig_val, global_step)
 
-                    pbar.set_postfix(
-                        total=f"{loss_val:.4f}",
-                        pred=f"{pred_val:.4f}",
-                        sigreg=f"{sig_val:.4f}",
-                    )
+                    if log_this_step:
+                        pbar.set_postfix(
+                            total=f"{last_loss_val:.4f}",
+                            pred=f"{last_pred_val:.4f}",
+                            sigreg=f"{last_sig_val:.4f}",
+                        )
                     pbar.update(1)
                     global_step += 1
+                    log_done = time.perf_counter()
+
+                    if args.profile:
+                        if perf_steps + perf_warmup < global_step:
+                            perf_steps += 1
+                            perf_data_time += data_done - step_start
+                            perf_compute_time += compute_done - data_done
+                            perf_log_time += log_done - compute_done
 
             val_indices = np.arange(len(val_dataset))
+            if val_steps * global_batch < len(val_indices):
+                val_indices = val_indices[: val_steps * global_batch]
             val_iter_host = _iter_batches(
                 val_dataset,
                 val_indices,
@@ -663,7 +1023,12 @@ def main() -> None:
                 num_devices,
                 executor,
             )
-            val_iter = _prefetch_to_device(val_iter_host, size=args.prefetch, sharding=data_sharding)
+            val_iter = _prefetch_to_device(
+                val_iter_host,
+                size=effective_prefetch,
+                sharding=data_sharding,
+                host_cast_dtype=host_cast_dtype,
+            )
             val_iter = iter(val_iter)
 
             with tqdm(total=val_steps, desc=f"Val {epoch}/{args.epochs}") as pbar:
@@ -700,6 +1065,27 @@ def main() -> None:
             }
             _save_checkpoint(run_dir, epoch, model_host, opt_state_host, metadata)
             writer.flush()
+            if args.profile and perf_steps > 0:
+                total_time = perf_data_time + perf_compute_time + perf_log_time
+                if total_time > 0.0:
+                    step_time = total_time / perf_steps
+                    steps_per_sec = perf_steps / total_time
+                    data_pct = 100.0 * perf_data_time / total_time
+                    compute_pct = 100.0 * perf_compute_time / total_time
+                    log_pct = 100.0 * perf_log_time / total_time
+                    print(
+                        "Perf summary (train): "
+                        f"steps={perf_steps}, "
+                        f"step_time={step_time:.4f}s, "
+                        f"steps_per_sec={steps_per_sec:.2f}, "
+                        f"data={data_pct:.1f}%, "
+                        f"compute={compute_pct:.1f}%, "
+                        f"log={log_pct:.1f}%"
+                    )
+                perf_steps = 0
+                perf_data_time = 0.0
+                perf_compute_time = 0.0
+                perf_log_time = 0.0
     finally:
         if executor is not None:
             executor.shutdown(wait=True)

@@ -2,7 +2,6 @@ import io
 import mmap
 import os
 import tarfile
-import threading
 from typing import ClassVar
 
 from PIL import Image
@@ -25,9 +24,7 @@ class TarredImagesRandomAccessDataset:
     tar_paths: list[str]
     _file_handles: list[io.BufferedReader]
     _mmaps: list[mmap.mmap]
-    _tars: list[tarfile.TarFile]
-    _index: list[tuple[int, str]]
-    _locks: list[threading.Lock]
+    _index: list[tuple[int, int, int]]
 
     def __init__(self, tar_paths: list[str]) -> None:
         """Initialize the dataset and index tar members.
@@ -40,9 +37,7 @@ class TarredImagesRandomAccessDataset:
         self.tar_paths = tar_paths
         self._file_handles = []
         self._mmaps = []
-        self._tars = []
         self._index = []
-        self._locks = []
 
         success = False
         try:
@@ -52,20 +47,19 @@ class TarredImagesRandomAccessDataset:
 
                 file_handle = open(path, "rb")
                 mapped = mmap.mmap(file_handle.fileno(), 0, access=mmap.ACCESS_READ)
-                tar = tarfile.open(fileobj=mapped, mode="r:")
 
                 self._file_handles.append(file_handle)
                 self._mmaps.append(mapped)
-                self._tars.append(tar)
-                self._locks.append(threading.Lock())
-
-                for member in tar.getmembers():
-                    if member.isfile() is False:
-                        continue
-                    _, ext = os.path.splitext(member.name)
-                    if ext.lower() not in self._IMAGE_EXTENSIONS:
-                        continue
-                    self._index.append((tar_idx, member.name))
+                with tarfile.open(path, mode="r:") as tar:
+                    for member in tar.getmembers():
+                        if member.isfile() is False:
+                            continue
+                        _, ext = os.path.splitext(member.name)
+                        if ext.lower() not in self._IMAGE_EXTENSIONS:
+                            continue
+                        if member.offset_data is None or member.size <= 0:
+                            continue
+                        self._index.append((tar_idx, member.offset_data, member.size))
             success = True
         finally:
             if success is False:
@@ -89,25 +83,13 @@ class TarredImagesRandomAccessDataset:
         if idx < 0 or idx >= len(self._index):
             raise IndexError("index out of range")
 
-        tar_idx, member_name = self._index[idx]
-        tar = self._tars[tar_idx]
-        with self._locks[tar_idx]:
-            member_file = tar.extractfile(member_name)
-            if member_file is None:
-                raise ValueError(f"failed to extract member: {member_name}")
-
-            try:
-                payload = member_file.read()
-            finally:
-                member_file.close()
+        tar_idx, offset, size = self._index[idx]
+        payload = self._mmaps[tar_idx][offset : offset + size]
 
         image = Image.open(io.BytesIO(payload))
-        image.load()
         return image
 
     def _close(self) -> None:
-        for tar in self._tars:
-            tar.close()
         for mapped in self._mmaps:
             mapped.close()
         for handle in self._file_handles:

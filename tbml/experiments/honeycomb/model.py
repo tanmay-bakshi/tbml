@@ -117,22 +117,24 @@ class PatchEmbed(eqx.Module):
 
         :param x: Input tensor of shape (B, H, W, C).
         :returns: Patch embeddings of shape (B, num_patches, embed_dim).
-        :raises ValueError: If the input shape does not match the configuration.
+        :raises ValueError: If the input size is not divisible by the patch size.
         """
         if x.ndim != 4:
             raise ValueError("input must have shape (B, H, W, C)")
         bsz, height, width, channels = x.shape
-        if height != self.image_size[0] or width != self.image_size[1]:
-            raise ValueError("input spatial size must match image_size")
+        if height % self.patch_size != 0 or width % self.patch_size != 0:
+            raise ValueError("input spatial size must be divisible by patch_size")
         if channels != self.in_channels:
             raise ValueError("input channel count must match in_channels")
 
-        grid_h, grid_w = self.grid_size
+        grid_h = height // self.patch_size
+        grid_w = width // self.patch_size
+        num_patches = grid_h * grid_w
         patch = self.patch_size
         x = x.astype(self.dtype)
         x = x.reshape((bsz, grid_h, patch, grid_w, patch, channels))
         x = x.transpose((0, 1, 3, 2, 4, 5))
-        x = x.reshape((bsz, self.num_patches, patch * patch * channels))
+        x = x.reshape((bsz, num_patches, patch * patch * channels))
         return self.proj(x)
 
 
@@ -162,6 +164,7 @@ class GPSABlock(eqx.Module):
         qkv_kernel_init: Initializer,
         o_kernel_init: Initializer,
         mlp_kernel_init: Initializer,
+        attn_implementation: str | None,
         key: Array,
     ) -> None:
         """Initialize a GPSA transformer block.
@@ -195,6 +198,7 @@ class GPSABlock(eqx.Module):
             param_dtype=param_dtype,
             qkv_kernel_init=qkv_kernel_init,
             o_kernel_init=o_kernel_init,
+            attn_implementation=attn_implementation,
             key=attn_key,
         )
         self.drop_path1 = DropPath(drop_path_prob)
@@ -260,6 +264,7 @@ class SABlock(eqx.Module):
         qkv_kernel_init: Initializer,
         o_kernel_init: Initializer,
         mlp_kernel_init: Initializer,
+        attn_implementation: str | None,
         key: Array,
     ) -> None:
         """Initialize a SA transformer block.
@@ -291,6 +296,7 @@ class SABlock(eqx.Module):
             param_dtype=param_dtype,
             qkv_kernel_init=qkv_kernel_init,
             o_kernel_init=o_kernel_init,
+            attn_implementation=attn_implementation,
             key=attn_key,
         )
         self.drop_path1 = DropPath(drop_path_prob)
@@ -342,6 +348,7 @@ class ConViT(eqx.Module):
 
     config: ConViTConfig = eqx.field(static=True)
     patch_embed: PatchEmbed
+    pos_embed: Array
     gpsa_blocks: tuple[GPSABlock, ...]
     sa_blocks: tuple[SABlock, ...]
     final_norm: RMSNorm
@@ -352,6 +359,7 @@ class ConViT(eqx.Module):
         *,
         dtype: jnp.dtype = jnp.float32,
         param_dtype: jnp.dtype = jnp.float32,
+        attn_implementation: str | None = None,
         key: Array,
     ) -> None:
         """Initialize the ConViT model.
@@ -359,6 +367,7 @@ class ConViT(eqx.Module):
         :param config: ConViT configuration.
         :param dtype: Compute dtype.
         :param param_dtype: Parameter dtype.
+        :param attn_implementation: Attention backend implementation.
         :param key: PRNG key for parameter initialization.
         """
         if config.image_size[0] <= 0 or config.image_size[1] <= 0:
@@ -401,9 +410,10 @@ class ConViT(eqx.Module):
             raise ValueError("mlp_hidden_dim must be > 0")
 
         init = truncated_normal_init(config.init_std)
-        keys = jax.random.split(key, 1 + total_layers)
+        keys = jax.random.split(key, 2 + total_layers)
         patch_key = keys[0]
-        block_keys = keys[1:]
+        pos_key = keys[1]
+        block_keys = keys[2:]
 
         self.config = config
         self.patch_embed = PatchEmbed(
@@ -415,6 +425,11 @@ class ConViT(eqx.Module):
             param_dtype=param_dtype,
             kernel_init=init,
             key=patch_key,
+        )
+        self.pos_embed = init(
+            pos_key,
+            (1, self.patch_embed.num_patches, config.d_model),
+            param_dtype,
         )
 
         drop_rates = _build_drop_rates(config.drop_path_rate, total_layers)
@@ -437,6 +452,7 @@ class ConViT(eqx.Module):
                     qkv_kernel_init=init,
                     o_kernel_init=init,
                     mlp_kernel_init=init,
+                    attn_implementation=attn_implementation,
                     key=block_keys[idx],
                 )
             )
@@ -456,6 +472,7 @@ class ConViT(eqx.Module):
                     qkv_kernel_init=init,
                     o_kernel_init=init,
                     mlp_kernel_init=init,
+                    attn_implementation=attn_implementation,
                     key=block_keys[block_idx],
                 )
             )
@@ -463,6 +480,32 @@ class ConViT(eqx.Module):
         self.gpsa_blocks = tuple(gpsa_blocks)
         self.sa_blocks = tuple(sa_blocks)
         self.final_norm = RMSNorm(config.d_model, dtype=dtype, param_dtype=param_dtype)
+
+    def encode_patches(self, x: Array, *, train: bool, key: Array | None) -> Array:
+        """Compute patch representations before the final normalization.
+
+        :param x: Input tensor of shape (B, H, W, C).
+        :param train: Whether to enable dropout and DropPath.
+        :param key: PRNG key for dropout and DropPath.
+        :returns: Patch representations of shape (B, num_patches, d_model).
+        """
+        x = self.patch_embed(x)
+        total_blocks = len(self.gpsa_blocks) + len(self.sa_blocks)
+        if key is None:
+            block_keys: list[Array | None] = [None] * total_blocks
+        else:
+            block_keys = list(jax.random.split(key, total_blocks))
+
+        for block, block_key in zip(self.gpsa_blocks, block_keys[: len(self.gpsa_blocks)]):
+            x = block(x, train=train, key=block_key)
+
+        if len(self.sa_blocks) > 0:
+            x = x + self.pos_embed.astype(x.dtype)
+
+        for block, block_key in zip(self.sa_blocks, block_keys[len(self.gpsa_blocks) :]):
+            x = block(x, train=train, key=block_key)
+
+        return x
 
     def __call__(self, x: Array, *, train: bool, key: Array | None) -> Array:
         """Compute patch representations.
@@ -472,19 +515,7 @@ class ConViT(eqx.Module):
         :param key: PRNG key for dropout and DropPath.
         :returns: Patch representations of shape (B, num_patches, d_model).
         """
-        x = self.patch_embed(x)
-        blocks = self.gpsa_blocks + self.sa_blocks
-        total_blocks = len(blocks)
-
-        if key is None:
-            block_keys: list[Array | None] = [None] * total_blocks
-        else:
-            block_keys = list(jax.random.split(key, total_blocks))
-
-        for block, block_key in zip(blocks, block_keys):
-            x = block(x, train=train, key=block_key)
-
-        return self.final_norm(x)
+        return self.final_norm(self.encode_patches(x, train=train, key=key))
 
 
 def _build_drop_rates(drop_path_rate: float, total_layers: int) -> list[float]:
