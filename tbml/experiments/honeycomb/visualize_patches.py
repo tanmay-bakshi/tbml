@@ -208,7 +208,12 @@ def _compute_patch_embeddings(
     image_tensor = jnp.expand_dims(image_tensor, axis=0)
     embeddings = model.encode_patches(image_tensor, train=False, key=None)
     embeddings = jax.device_get(embeddings)
-    return np.asarray(embeddings, dtype=np.float32)[0]
+    patches = np.asarray(embeddings, dtype=np.float32)[0]
+    if model.config.use_cls_token is True:
+        if patches.shape[0] <= 0:
+            raise ValueError("expected at least one patch embedding")
+        patches = patches[:-1]
+    return patches
 
 
 def _pca_to_rgb(embeddings: np.ndarray) -> np.ndarray:

@@ -35,6 +35,7 @@ class ConViTConfig(BaseModel):
     :ivar drop_path_rate: Stochastic depth rate at the final block.
     :ivar locality_strength: GPSA locality strength (alpha).
     :ivar init_std: Standard deviation for truncated normal initialization.
+    :ivar use_cls_token: Whether to append a CLS token before SA layers.
     """
 
     image_size: tuple[int, int] = Field(default=(224, 224))
@@ -50,6 +51,7 @@ class ConViTConfig(BaseModel):
     drop_path_rate: float = Field(default=0.0)
     locality_strength: float = Field(default=1.0)
     init_std: float = Field(default=0.02)
+    use_cls_token: bool = Field(default=False)
 
 
 class ConViTConditionedDiTConfig(BaseModel):
@@ -391,6 +393,7 @@ class ConViT(eqx.Module):
     config: ConViTConfig = eqx.field(static=True)
     patch_embed: PatchEmbed
     pos_embed: Array
+    cls_token: Array | None
     gpsa_blocks: tuple[GPSABlock, ...]
     sa_blocks: tuple[SABlock, ...]
     final_norm: RMSNorm
@@ -428,6 +431,8 @@ class ConViT(eqx.Module):
             raise ValueError("n_gpsa_layers must be >= 0")
         if config.n_sa_layers < 0:
             raise ValueError("n_sa_layers must be >= 0")
+        if config.use_cls_token is True and config.n_sa_layers <= 0:
+            raise ValueError("use_cls_token requires at least one SA layer")
         if config.mlp_ratio <= 0.0:
             raise ValueError("mlp_ratio must be > 0")
         if config.attn_dropout < 0.0 or config.attn_dropout >= 1.0:
@@ -452,10 +457,12 @@ class ConViT(eqx.Module):
             raise ValueError("mlp_hidden_dim must be > 0")
 
         init = truncated_normal_init(config.init_std)
-        keys = jax.random.split(key, 2 + total_layers)
+        extra_keys = 3 if config.use_cls_token is True else 2
+        keys = jax.random.split(key, extra_keys + total_layers)
         patch_key = keys[0]
         pos_key = keys[1]
-        block_keys = keys[2:]
+        cls_key = keys[2] if config.use_cls_token is True else None
+        block_keys = keys[extra_keys:]
 
         self.config = config
         self.patch_embed = PatchEmbed(
@@ -473,6 +480,12 @@ class ConViT(eqx.Module):
             (1, self.patch_embed.num_patches, config.d_model),
             param_dtype,
         )
+        if config.use_cls_token is True:
+            if cls_key is None:
+                raise ValueError("cls_key must be provided when use_cls_token is True")
+            self.cls_token = init(cls_key, (config.d_model,), param_dtype)
+        else:
+            self.cls_token = None
 
         drop_rates = _build_drop_rates(config.drop_path_rate, total_layers)
         gpsa_blocks: list[GPSABlock] = []
@@ -529,7 +542,8 @@ class ConViT(eqx.Module):
         :param x: Input tensor of shape (B, H, W, C).
         :param train: Whether to enable dropout and DropPath.
         :param key: PRNG key for dropout and DropPath.
-        :returns: Patch representations of shape (B, num_patches, d_model).
+        :returns: Patch representations of shape (B, num_patches, d_model) or
+            (B, num_patches + 1, d_model) when CLS is enabled.
         """
         x = self.patch_embed(x)
         x = x + self.pos_embed.astype(x.dtype)
@@ -541,6 +555,10 @@ class ConViT(eqx.Module):
 
         for block, block_key in zip(self.gpsa_blocks, block_keys[: len(self.gpsa_blocks)]):
             x = block(x, train=train, key=block_key)
+
+        if self.cls_token is not None:
+            cls = jnp.broadcast_to(self.cls_token.astype(x.dtype), (x.shape[0], 1, x.shape[-1]))
+            x = jnp.concatenate([x, cls], axis=1)
 
         for block, block_key in zip(self.sa_blocks, block_keys[len(self.gpsa_blocks) :]):
             x = block(x, train=train, key=block_key)
@@ -556,6 +574,9 @@ class ConViT(eqx.Module):
         :returns: Pooled embeddings of shape (B, d_model).
         """
         patches = self.encode_patches(x, train=train, key=key)
+        if self.cls_token is not None:
+            cls = patches[:, -1, :]
+            return self.final_norm(cls)
         pooled = jnp.mean(patches, axis=1)
         return self.final_norm(pooled)
 
@@ -958,6 +979,10 @@ class ConViTConditionedDiT(eqx.Module):
             block_keys = keys[1:]
 
         cond_tokens = self.conditioner.encode_patches(conditioning, train=train, key=cond_key)
+        if self.conditioner.config.use_cls_token is True:
+            if cond_tokens.shape[1] <= 1:
+                raise ValueError("conditioning must yield at least one patch token")
+            cond_tokens = cond_tokens[:, :-1, :]
         cond_tokens = cond_tokens + self.cond_token.astype(cond_tokens.dtype)
 
         noise_tokens = self.noise_patch_embed(noisy)

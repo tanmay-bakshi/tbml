@@ -70,6 +70,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--drop-path-rate", type=float, default=0.0)
     parser.add_argument("--locality-strength", type=float, default=1.0)
     parser.add_argument("--init-std", type=float, default=0.02)
+    parser.add_argument("--use-cls-token", dest="use_cls_token", action="store_true")
+    parser.add_argument("--no-use-cls-token", dest="use_cls_token", action="store_false")
 
     parser.add_argument("--resize-dim", type=int, default=256)
     parser.add_argument("--num-global-views", type=int, default=2)
@@ -101,6 +103,7 @@ def _parse_args() -> argparse.Namespace:
         muon_nesterov=True,
         device_normalize=True,
         device_augment=True,
+        use_cls_token=False,
     )
     return parser.parse_args()
 
@@ -611,6 +614,8 @@ def main() -> None:
         raise ValueError("attn-impl must be auto, cudnn, or xla")
     if args.device_augment and args.device_normalize is False:
         raise ValueError("device_augment requires device_normalize to be enabled")
+    if args.use_cls_token is True and args.n_sa_layers <= 0:
+        raise ValueError("use_cls_token requires at least one SA layer")
     if args.global_view_dim != image_size[0] or args.global_view_dim != image_size[1]:
         raise ValueError("global_view_dim must match image_size for the encoder")
     if args.global_view_dim % args.patch_size != 0:
@@ -684,6 +689,7 @@ def main() -> None:
         drop_path_rate=args.drop_path_rate,
         locality_strength=args.locality_strength,
         init_std=args.init_std,
+        use_cls_token=args.use_cls_token,
     )
 
     run_config: dict[str, object] = {
