@@ -598,6 +598,8 @@ def main() -> None:
             attn_impl = "cudnn"
         else:
             attn_impl = "xla"
+    if args.use_cls_token is True and attn_impl == "cudnn":
+        attn_impl = "xla"
     if args.per_device_batch_size <= 0:
         raise ValueError("per-device batch size must be > 0")
     if args.epochs <= 0:
