@@ -57,17 +57,6 @@ def _parse_args() -> argparse.Namespace:
         dest="device_augment",
         action="store_false",
     )
-    parser.add_argument(
-        "--device-augment-resize-locals",
-        dest="device_augment_resize_locals",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--device-augment-keep-local-size",
-        dest="device_augment_resize_locals",
-        action="store_false",
-    )
-
     parser.add_argument("--image-size", type=str, default="224,224")
     parser.add_argument("--patch-size", type=int, default=16)
     parser.add_argument("--in-channels", type=int, default=3)
@@ -112,7 +101,6 @@ def _parse_args() -> argparse.Namespace:
         muon_nesterov=True,
         device_normalize=True,
         device_augment=True,
-        device_augment_resize_locals=False,
     )
     return parser.parse_args()
 
@@ -461,7 +449,6 @@ def _encode_views(
     global_view_dim: int,
     num_local_views: int,
     local_view_dim: int,
-    resize_local_views: bool,
 ) -> Array:
     """Encode a batch of views into pooled embeddings.
 
@@ -478,7 +465,6 @@ def _encode_views(
     :param global_view_dim: Global view crop size.
     :param num_local_views: Number of local views to sample.
     :param local_view_dim: Local view crop size.
-    :param resize_local_views: Whether local views are resized to the global size.
     :returns: Embeddings of shape (B, V, K).
     """
     if augment_on_device:
@@ -494,7 +480,7 @@ def _encode_views(
             global_view_dim=global_view_dim,
             num_local_views=num_local_views,
             local_view_dim=local_view_dim,
-            resize_locals=resize_local_views,
+            resize_locals=True,
         )
         if num_local_views > 0 and global_views.shape[2:4] == local_views.shape[2:4]:
             key, encode_key = jax.random.split(key)
@@ -631,9 +617,6 @@ def main() -> None:
         raise ValueError("global_view_dim must match image_size for the encoder")
     if args.global_view_dim % args.patch_size != 0:
         raise ValueError("global_view_dim must be divisible by patch_size")
-    if args.device_augment and not args.device_augment_resize_locals:
-        if args.local_view_dim % args.patch_size != 0:
-            raise ValueError("local_view_dim must be divisible by patch_size when keeping local size")
     if args.num_workers < 0:
         raise ValueError("num_workers must be >= 0")
     if args.prefetch <= 0:
@@ -717,7 +700,6 @@ def main() -> None:
             "mean_std": mean_std,
             "device_normalize": args.device_normalize,
             "device_augment": args.device_augment,
-            "device_augment_resize_locals": args.device_augment_resize_locals,
         },
         "loss": {
             "sigreg_weight": args.sigreg_weight,
@@ -839,7 +821,6 @@ def main() -> None:
                 global_view_dim=args.global_view_dim,
                 num_local_views=args.num_local_views,
                 local_view_dim=args.local_view_dim,
-                resize_local_views=args.device_augment_resize_locals,
             )
             total, pred, sigreg = lejepa_loss(
                 emb,
@@ -884,7 +865,6 @@ def main() -> None:
             global_view_dim=args.global_view_dim,
             num_local_views=args.num_local_views,
             local_view_dim=args.local_view_dim,
-            resize_local_views=args.device_augment_resize_locals,
         )
         total, pred, sigreg = lejepa_loss(
             emb,
