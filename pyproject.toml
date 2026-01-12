@@ -9,6 +9,7 @@ dependencies = [
     "huggingface-hub",
     "jax",
     "jaxtyping",
+    "matplotlib",
     "numpy",
     "optax",
     "pillow",
