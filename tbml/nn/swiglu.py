@@ -1,10 +1,98 @@
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
+from typing import BinaryIO
 from jaxtyping import Array
 
-from tbml.nn.linear import Linear
 from tbml.nn.init import Initializer
+from tbml.nn.linear import Linear
+
+_DEFAULT_DESERIALISE_FILTER_SPEC = eqx.default_deserialise_filter_spec
+_DEFAULT_TREE_DESERIALISE = eqx.tree_deserialise_leaves
+
+
+class _OptionalDOut(int):
+    """Compatibility wrapper for optional d_out serialization."""
+
+
+def _load_optional_d_out(handle: BinaryIO, fallback: _OptionalDOut) -> _OptionalDOut:
+    """Load d_out if present, otherwise leave it unchanged.
+
+    :param handle: Binary file handle for deserialisation.
+    :param fallback: Default d_out value from the constructed module.
+    :returns: Loaded d_out value or the fallback.
+    """
+    try:
+        start_pos = handle.tell()
+    except OSError:
+        return fallback
+
+    try:
+        first = np.load(handle)
+    except Exception:
+        handle.seek(start_pos)
+        return fallback
+
+    if isinstance(first, np.ndarray) is False or first.ndim != 0:
+        handle.seek(start_pos)
+        return fallback
+
+    first_value = first.item()
+
+    try:
+        mid_pos = handle.tell()
+    except OSError:
+        handle.seek(start_pos)
+        return fallback
+
+    try:
+        second = np.load(handle)
+    except Exception:
+        handle.seek(start_pos)
+        return fallback
+
+    if isinstance(second, np.ndarray) is False or second.ndim != 0:
+        handle.seek(start_pos)
+        return fallback
+
+    second_value = second.item()
+    second_is_float = np.issubdtype(second.dtype, np.floating)
+    if second_is_float and 0.0 <= float(second_value) <= 1.0:
+        handle.seek(start_pos)
+        return fallback
+
+    handle.seek(mid_pos)
+    return _OptionalDOut(int(first_value))
+
+
+def _swiglu_deserialise_filter_spec(handle: BinaryIO, leaf: object) -> object:
+    """Deserialise leaves with backward-compatible d_out handling.
+
+    :param handle: Binary file handle for deserialisation.
+    :param leaf: Leaf value from the target tree.
+    :returns: Deserialised leaf.
+    """
+    if isinstance(leaf, _OptionalDOut):
+        return _load_optional_d_out(handle, leaf)
+    return _DEFAULT_DESERIALISE_FILTER_SPEC(handle, leaf)
+
+
+def _tree_deserialise_leaves(
+    path_or_file: str | BinaryIO,
+    like: object,
+    filter_spec=_DEFAULT_DESERIALISE_FILTER_SPEC,
+    is_leaf=None,
+):
+    """Wrapper around Equinox deserialisation with SwiGLU compatibility."""
+    if filter_spec is _DEFAULT_DESERIALISE_FILTER_SPEC:
+        filter_spec = _swiglu_deserialise_filter_spec
+    return _DEFAULT_TREE_DESERIALISE(path_or_file, like, filter_spec=filter_spec, is_leaf=is_leaf)
+
+
+if hasattr(eqx, "_swiglu_compat_deserialise") is False:
+    eqx.tree_deserialise_leaves = _tree_deserialise_leaves  # type: ignore[assignment]
+    eqx._swiglu_compat_deserialise = True
 
 
 class SwiGLUFeedForward(eqx.Module):
@@ -70,7 +158,7 @@ class SwiGLUFeedForward(eqx.Module):
         gate_key, up_key, down_key = jax.random.split(key, 3)
 
         self.d_model = d_model
-        self.d_out = out_dim
+        self.d_out = _OptionalDOut(out_dim)
         self.hidden_dim = hidden_dim
         self.resid_dropout = resid_dropout
         self.dtype = dtype
