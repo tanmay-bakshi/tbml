@@ -22,9 +22,7 @@ from tqdm import tqdm  # type: ignore[import-untyped]
 from tbml.experiments.honeycomb.text.dataset import _build_tokenizer
 from tbml.experiments.honeycomb.text.model import TextTransformer, TextTransformerConfig
 from tbml.nn.init import truncated_normal_init
-from tbml.nn import RMSNorm
 from tbml.nn.linear import Linear
-from tbml.nn.swiglu import SwiGLUFeedForward
 from tbml.optimizers import MuonWithAdamWFallback, MuonWithAdamWFallbackState, build_muon_masks
 
 
@@ -611,33 +609,23 @@ class SnliClassifier(eqx.Module):
 
     :ivar d_model: Base model width.
     :ivar feature_dim: Concatenated feature dimension.
-    :ivar hidden_dim: Hidden dimension for SwiGLU layers.
     :ivar num_classes: Number of output classes.
-    :ivar mlp1: First SwiGLU layer.
-    :ivar norm1: RMSNorm after the first SwiGLU layer.
-    :ivar mlp2: Second SwiGLU layer.
-    :ivar norm2: RMSNorm after the second SwiGLU layer.
-    :ivar proj: Projection to logits.
+    :ivar proj1: SNLI output head projection 1.
+    :ivar proj2: SNLI output head projection 2 (logits).
     """
 
     d_model: int
     feature_dim: int
-    hidden_dim: int
     num_classes: int
-    mlp1: SwiGLUFeedForward
-    norm1: RMSNorm
-    mlp2: SwiGLUFeedForward
-    norm2: RMSNorm
-    proj: Linear
+    proj1: Linear
+    proj2: Linear
 
     def __init__(
         self,
         d_model: int,
         *,
-        mlp_ratio: float,
         init_std: float,
         num_classes: int,
-        resid_dropout: float,
         dtype: jnp.dtype,
         param_dtype: jnp.dtype,
         key: Array,
@@ -645,59 +633,38 @@ class SnliClassifier(eqx.Module):
         """Initialize classifier parameters.
 
         :param d_model: Base model width.
-        :param mlp_ratio: Expansion ratio for the SwiGLU hidden dimension.
         :param init_std: Truncated normal standard deviation.
         :param num_classes: Number of output classes.
-        :param resid_dropout: Residual dropout probability for MLPs.
         :param dtype: Compute dtype.
         :param param_dtype: Parameter dtype.
         :param key: PRNG key for parameter initialization.
         """
         if d_model <= 0:
             raise ValueError("d_model must be > 0")
-        if mlp_ratio <= 0.0:
-            raise ValueError("mlp_ratio must be > 0")
         if init_std <= 0.0:
             raise ValueError("init_std must be > 0")
         if num_classes <= 1:
             raise ValueError("num_classes must be > 1")
 
         feature_dim = 4 * d_model
-        hidden_dim = int(d_model * mlp_ratio)
-        if hidden_dim <= 0:
-            raise ValueError("hidden_dim must be > 0")
 
-        mlp1_key, mlp2_key, proj_key = jax.random.split(key, 3)
+        proj1_key, proj2_key = jax.random.split(key, 2)
         init = truncated_normal_init(init_std)
 
         self.d_model = d_model
         self.feature_dim = feature_dim
-        self.hidden_dim = hidden_dim
         self.num_classes = num_classes
-        self.mlp1 = SwiGLUFeedForward(
-            d_model=feature_dim,
-            hidden_dim=hidden_dim,
-            d_out=d_model,
-            resid_dropout=resid_dropout,
+        self.proj1 = Linear(
+            in_features=feature_dim,
+            out_features=d_model,
+            use_bias=True,
+            bias_value=0.0,
             dtype=dtype,
             param_dtype=param_dtype,
-            gate_up_kernel_init=init,
-            down_kernel_init=init,
-            key=mlp1_key,
+            kernel_init=init,
+            key=proj1_key,
         )
-        self.norm1 = RMSNorm(d_model, dtype=dtype, param_dtype=param_dtype)
-        self.mlp2 = SwiGLUFeedForward(
-            d_model=d_model,
-            hidden_dim=hidden_dim,
-            resid_dropout=resid_dropout,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            gate_up_kernel_init=init,
-            down_kernel_init=init,
-            key=mlp2_key,
-        )
-        self.norm2 = RMSNorm(d_model, dtype=dtype, param_dtype=param_dtype)
-        self.proj = Linear(
+        self.proj2 = Linear(
             in_features=d_model,
             out_features=num_classes,
             use_bias=True,
@@ -705,7 +672,7 @@ class SnliClassifier(eqx.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=init,
-            key=proj_key,
+            key=proj2_key,
         )
 
     def __call__(self, premise: Array, hypothesis: Array, *, train: bool, key: Array | None) -> Array:
@@ -722,21 +689,13 @@ class SnliClassifier(eqx.Module):
         if premise.shape[-1] != self.d_model:
             raise ValueError("premise last dimension must match d_model")
 
-        if key is None:
-            mlp1_key = None
-            mlp2_key = None
-        else:
-            mlp1_key, mlp2_key = jax.random.split(key, 2)
-
         x = jnp.concatenate(
             [premise, hypothesis, jnp.abs(premise - hypothesis), premise * hypothesis],
             axis=-1,
         )
-        x = self.mlp1(x, train=train, key=mlp1_key)
-        x = self.norm1(x)
-        x = self.mlp2(x, train=train, key=mlp2_key)
-        x = self.norm2(x)
-        return self.proj(x)
+        x = self.proj1(x)
+        x = self.proj2(x)
+        return x
 
 
 class SnliBundle(eqx.Module):
@@ -899,10 +858,8 @@ def main() -> None:
     classifier_key, base_key = jax.random.split(base_key)
     classifier = SnliClassifier(
         d_model=model_config.d_model,
-        mlp_ratio=model_config.mlp_ratio,
         init_std=model_config.init_std,
         num_classes=3,
-        resid_dropout=model_config.resid_dropout,
         dtype=dtype,
         param_dtype=dtype,
         key=classifier_key,
