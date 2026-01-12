@@ -20,6 +20,8 @@ from tqdm import tqdm  # type: ignore[import-untyped]
 from tbml.experiments.honeycomb.loss import lejepa_loss
 from tbml.experiments.honeycomb.text.dataset import StreamingTextDataset, iter_text_batches
 from tbml.experiments.honeycomb.text.model import TextTransformer, TextTransformerConfig
+from tbml.nn.init import truncated_normal_init
+from tbml.nn.linear import Linear
 from tbml.optimizers import MuonWithAdamWFallback, MuonWithAdamWFallbackState, build_muon_masks
 
 
@@ -49,6 +51,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--prefetch", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "bfloat16", "float16"])
+    parser.add_argument("--masked-probe", dest="masked_probe", action="store_true")
+    parser.add_argument("--no-masked-probe", dest="masked_probe", action="store_false")
 
     parser.add_argument("--d-model", type=int, default=768)
     parser.add_argument("--n-heads", type=int, default=12)
@@ -89,6 +93,7 @@ def _parse_args() -> argparse.Namespace:
     parser.set_defaults(
         muon_nesterov=True,
         use_cls_token=False,
+        masked_probe=False,
     )
     return parser.parse_args()
 
@@ -153,6 +158,103 @@ def _flatten_param_names(params: eqx.Module) -> list[str]:
                 parts.append(str(key))
         names.append(".".join(parts))
     return names
+
+
+def _prefix_patterns(patterns: list[str], prefix: str) -> list[str]:
+    """Prefix regex patterns with a dotted module path.
+
+    :param patterns: Regex patterns to prefix.
+    :param prefix: Prefix to insert after the anchor.
+    :returns: Prefixed regex patterns.
+    """
+    prefixed: list[str] = []
+    for pattern in patterns:
+        if pattern.startswith("^"):
+            prefixed.append(f"^{prefix}\\.{pattern[1:]}")
+        else:
+            prefixed.append(f"^{prefix}\\.{pattern}")
+    return prefixed
+
+
+class MaskedTokenProbe(eqx.Module):
+    """Linear probe for masked-token prediction.
+
+    :ivar vocab_size: Vocabulary size for logits.
+    :ivar d_model: Input representation dimension.
+    :ivar dtype: Compute dtype.
+    :ivar param_dtype: Parameter dtype.
+    :ivar proj: Linear projection to vocab logits.
+    """
+
+    vocab_size: int
+    d_model: int
+    dtype: jnp.dtype
+    param_dtype: jnp.dtype
+    proj: Linear
+
+    def __init__(
+        self,
+        d_model: int,
+        vocab_size: int,
+        *,
+        init_std: float,
+        dtype: jnp.dtype,
+        param_dtype: jnp.dtype,
+        key: Array,
+    ) -> None:
+        """Initialize the masked-token probe.
+
+        :param d_model: Input representation dimension.
+        :param vocab_size: Vocabulary size.
+        :param init_std: Truncated normal standard deviation.
+        :param dtype: Compute dtype.
+        :param param_dtype: Parameter dtype.
+        :param key: PRNG key for parameter initialization.
+        """
+        if d_model <= 0:
+            raise ValueError("d_model must be > 0")
+        if vocab_size <= 0:
+            raise ValueError("vocab_size must be > 0")
+        if init_std <= 0.0:
+            raise ValueError("init_std must be > 0")
+
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+
+        init = truncated_normal_init(init_std)
+        self.proj = Linear(
+            in_features=d_model,
+            out_features=vocab_size,
+            use_bias=True,
+            bias_value=0.0,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=init,
+            key=key,
+        )
+
+    def __call__(self, reps: Array) -> Array:
+        """Project token representations to vocabulary logits.
+
+        :param reps: Token representations of shape (..., d_model).
+        :returns: Logits of shape (..., vocab_size).
+        """
+        if reps.shape[-1] != self.d_model:
+            raise ValueError("reps last dimension must match d_model")
+        return self.proj(reps)
+
+
+class TextTrainBundle(eqx.Module):
+    """Container for the model and optional probe.
+
+    :ivar model: Text transformer model.
+    :ivar probe: Optional masked-token probe.
+    """
+
+    model: TextTransformer
+    probe: MaskedTokenProbe | None
 
 
 T = TypeVar("T")
@@ -294,7 +396,7 @@ def _mask_tokens(
     mask_id: int,
     pad_id: int,
     eos_id: int,
-) -> Array:
+) -> tuple[Array, Array]:
     """Apply random masking to tokens.
 
     :param tokens: Token ids of shape (B, T).
@@ -304,7 +406,7 @@ def _mask_tokens(
     :param mask_id: Masking token id.
     :param pad_id: Padding token id.
     :param eos_id: EOS token id.
-    :returns: Masked token ids of shape (B, T).
+    :returns: Tuple of (masked token ids, mask positions).
     """
     if min_ratio < 0.0 or min_ratio > 1.0:
         raise ValueError("min_ratio must be in [0, 1]")
@@ -324,7 +426,7 @@ def _mask_tokens(
     eligible = jnp.logical_and(tokens != pad_id, tokens != eos_id)
     mask = jnp.logical_and(rand < ratios[:, None], eligible)
     masked_tokens = jnp.where(mask, jnp.asarray(mask_id, dtype=tokens.dtype), tokens)
-    return masked_tokens
+    return masked_tokens, mask
 
 
 def _mask_views(
@@ -337,7 +439,7 @@ def _mask_views(
     mask_id: int,
     pad_id: int,
     eos_id: int,
-) -> Array:
+) -> tuple[Array, Array]:
     """Generate multiple masked views of the token batch.
 
     :param tokens: Token ids of shape (B, T).
@@ -348,18 +450,20 @@ def _mask_views(
     :param mask_id: Masking token id.
     :param pad_id: Padding token id.
     :param eos_id: EOS token id.
-    :returns: Masked views of shape (B, V, T).
+    :returns: Tuple of (masked views, mask positions), each of shape (B, V, T).
     """
     if num_views == 0:
-        return jnp.zeros((tokens.shape[0], 0, tokens.shape[1]), dtype=tokens.dtype)
+        empty_views = jnp.zeros((tokens.shape[0], 0, tokens.shape[1]), dtype=tokens.dtype)
+        empty_mask = jnp.zeros((tokens.shape[0], 0, tokens.shape[1]), dtype=jnp.bool_)
+        return empty_views, empty_mask
 
     keys = jax.random.split(key, num_views)
 
-    def _one_view(view_key: Array) -> Array:
+    def _one_view(view_key: Array) -> tuple[Array, Array]:
         """Mask tokens using the provided view key.
 
         :param view_key: PRNG key for masking.
-        :returns: Masked token ids of shape (B, T).
+        :returns: Tuple of (masked token ids, mask positions).
         """
         return _mask_tokens(
             tokens,
@@ -371,8 +475,41 @@ def _mask_views(
             eos_id=eos_id,
         )
 
-    views = jax.vmap(_one_view)(keys)
-    return jnp.transpose(views, (1, 0, 2))
+    views, masks = jax.vmap(_one_view)(keys)
+    return jnp.transpose(views, (1, 0, 2)), jnp.transpose(masks, (1, 0, 2))
+
+
+def _pool_representations(
+    model: TextTransformer,
+    reps: Array,
+    attention_mask: Array,
+) -> Array:
+    """Pool token representations and apply final normalization.
+
+    :param model: Text transformer model.
+    :param reps: Token representations of shape (B, T, d_model).
+    :param attention_mask: Attention mask of shape (B, T).
+    :returns: Pooled embeddings of shape (B, d_model).
+    """
+    if reps.ndim != 3:
+        raise ValueError("reps must have shape (B, T, d_model)")
+    if attention_mask.ndim != 2:
+        raise ValueError("attention_mask must have shape (B, T)")
+    if reps.shape[:2] != attention_mask.shape:
+        raise ValueError("attention_mask must match reps batch and sequence dimensions")
+
+    mask = attention_mask.astype(reps.dtype)
+    lengths = jnp.sum(mask, axis=1)
+    if model.config.use_cls_token is True:
+        idx = jnp.maximum(lengths.astype(jnp.int32) - 1, 0)
+        idx = idx[:, None, None]
+        idx = jnp.broadcast_to(idx, (idx.shape[0], 1, reps.shape[-1]))
+        pooled = jnp.take_along_axis(reps, idx, axis=1).squeeze(axis=1)
+    else:
+        masked = reps * mask[:, :, None]
+        denom = jnp.maximum(lengths, 1.0)
+        pooled = jnp.sum(masked, axis=1) / denom[:, None]
+    return model.final_norm(pooled)
 
 
 def _encode_views(
@@ -391,7 +528,8 @@ def _encode_views(
     mask_id: int,
     pad_id: int,
     eos_id: int,
-) -> Array:
+    return_tokens: bool = False,
+) -> tuple[Array, Array | None, Array | None]:
     """Encode masked views into pooled embeddings.
 
     :param model: Text transformer encoder.
@@ -408,13 +546,14 @@ def _encode_views(
     :param mask_id: Masking token id.
     :param pad_id: Padding token id.
     :param eos_id: EOS token id.
-    :returns: Embeddings of shape (B, V, d_model).
+    :param return_tokens: Whether to return token representations and masks.
+    :returns: Tuple of (pooled embeddings, token reps, mask positions).
     """
     if num_global_views + num_local_views <= 0:
         raise ValueError("at least one view must be requested")
 
     key, global_key, local_key = jax.random.split(key, 3)
-    global_views = _mask_views(
+    global_views, global_masks = _mask_views(
         tokens,
         global_key,
         num_views=num_global_views,
@@ -424,7 +563,7 @@ def _encode_views(
         pad_id=pad_id,
         eos_id=eos_id,
     )
-    local_views = _mask_views(
+    local_views, local_masks = _mask_views(
         tokens,
         local_key,
         num_views=num_local_views,
@@ -436,16 +575,68 @@ def _encode_views(
     )
     if num_local_views > 0 and num_global_views > 0:
         views = jnp.concatenate([global_views, local_views], axis=1)
+        mask_positions = jnp.concatenate([global_masks, local_masks], axis=1)
     elif num_global_views > 0:
         views = global_views
+        mask_positions = global_masks
     else:
         views = local_views
+        mask_positions = local_masks
 
     bsz, num_views, seq_len = views.shape
     flat_views = views.reshape((bsz * num_views, seq_len))
     flat_mask = jnp.repeat(attention_mask, repeats=num_views, axis=0)
+    if return_tokens is True:
+        token_reps = model.encode_tokens(flat_views, flat_mask, train=train, key=key)
+        pooled = _pool_representations(model, token_reps, flat_mask)
+        pooled = pooled.reshape((bsz, num_views, pooled.shape[-1]))
+        token_reps = token_reps.reshape((bsz, num_views, seq_len, token_reps.shape[-1]))
+        return pooled, token_reps, mask_positions
     pooled = model(flat_views, flat_mask, train=train, key=key)
-    return pooled.reshape((bsz, num_views, pooled.shape[-1]))
+    return pooled.reshape((bsz, num_views, pooled.shape[-1])), None, None
+
+
+def _masked_probe_metrics(
+    probe: MaskedTokenProbe,
+    token_reps: Array,
+    mask_positions: Array,
+    tokens: Array,
+) -> tuple[Array, Array]:
+    """Compute masked-token probe loss and accuracy.
+
+    :param probe: Linear probe mapping to vocabulary logits.
+    :param token_reps: Token representations of shape (B, V, T, d_model).
+    :param mask_positions: Mask positions of shape (B, V, T).
+    :param tokens: Original token ids of shape (B, T).
+    :returns: Tuple of (cross entropy loss, accuracy).
+    """
+    if token_reps.ndim != 4:
+        raise ValueError("token_reps must have shape (B, V, T, d_model)")
+    if mask_positions.ndim != 3:
+        raise ValueError("mask_positions must have shape (B, V, T)")
+    if tokens.ndim != 2:
+        raise ValueError("tokens must have shape (B, T)")
+
+    reps = jax.lax.stop_gradient(token_reps)
+    targets = jnp.broadcast_to(tokens[:, None, :], mask_positions.shape)
+    logits = probe(reps)
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    target_log_probs = jnp.take_along_axis(log_probs, targets[..., None], axis=-1).squeeze(-1)
+    nll = -target_log_probs
+    mask = mask_positions.astype(nll.dtype)
+    masked_nll = nll * mask
+    total_masked = jnp.sum(mask)
+    loss = jnp.where(total_masked > 0, jnp.sum(masked_nll) / total_masked, 0.0)
+
+    preds = jnp.argmax(logits, axis=-1)
+    correct = preds == targets
+    correct_masked = jnp.sum(jnp.where(mask_positions, correct, False))
+    acc = jnp.where(
+        total_masked > 0,
+        correct_masked.astype(jnp.float32) / total_masked,
+        0.0,
+    )
+    return loss.astype(jnp.float32), acc
 
 
 def _save_checkpoint(
@@ -453,6 +644,7 @@ def _save_checkpoint(
     step: int,
     model: TextTransformer,
     opt_state: eqx.Module,
+    probe: MaskedTokenProbe | None,
     metadata: dict[str, object],
 ) -> None:
     """Save model, optimizer, and metadata to disk.
@@ -461,12 +653,15 @@ def _save_checkpoint(
     :param step: Global step index.
     :param model: Model to serialize.
     :param opt_state: Optimizer state to serialize.
+    :param probe: Optional masked-token probe module.
     :param metadata: Metadata to persist.
     """
     ckpt_dir = os.path.join(run_dir, f"checkpoint_step_{step:08d}")
     os.makedirs(ckpt_dir, exist_ok=False)
     eqx.tree_serialise_leaves(os.path.join(ckpt_dir, "model.eqx"), model)
     eqx.tree_serialise_leaves(os.path.join(ckpt_dir, "optimizer.eqx"), opt_state)
+    if probe is not None:
+        eqx.tree_serialise_leaves(os.path.join(ckpt_dir, "probe.eqx"), probe)
     with open(os.path.join(ckpt_dir, "metadata.json"), "w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2)
 
@@ -548,6 +743,13 @@ def main() -> None:
         init_std=args.init_std,
         use_cls_token=args.use_cls_token,
     )
+    if args.masked_probe is True:
+        exclusion_patterns = _prefix_patterns(
+            list(TextTransformer.MUON_PARAM_EXCLUSION_PATTERNS), "model"
+        )
+        exclusion_patterns.append(r"^probe\..*$")
+    else:
+        exclusion_patterns = list(TextTransformer.MUON_PARAM_EXCLUSION_PATTERNS)
 
     run_config: dict[str, object] = {
         "model": model_config.model_dump(),
@@ -577,6 +779,9 @@ def main() -> None:
             "sigreg_slices": args.sigreg_slices,
             "sigreg_seed": args.sigreg_seed,
         },
+        "probe": {
+            "masked_probe": args.masked_probe,
+        },
         "optimizer": {
             "muon_lr": args.muon_lr,
             "muon_momentum": args.muon_momentum,
@@ -588,7 +793,7 @@ def main() -> None:
             "adamw_betas": betas,
             "adamw_eps": args.adamw_eps,
             "adamw_weight_decay": args.adamw_weight_decay,
-            "muon_param_exclusion_patterns": TextTransformer.MUON_PARAM_EXCLUSION_PATTERNS,
+            "muon_param_exclusion_patterns": exclusion_patterns,
         },
         "training": {
             "max_train_steps": args.max_train_steps,
@@ -619,16 +824,30 @@ def main() -> None:
         param_dtype=dtype,
         key=model_key,
     )
+    probe: MaskedTokenProbe | None = None
+    train_bundle: TextTrainBundle | None = None
+    if args.masked_probe is True:
+        probe_key, base_key = jax.random.split(base_key)
+        probe = MaskedTokenProbe(
+            d_model=model_config.d_model,
+            vocab_size=vocab_size,
+            init_std=model_config.init_std,
+            dtype=dtype,
+            param_dtype=dtype,
+            key=probe_key,
+        )
+        train_bundle = TextTrainBundle(model=model, probe=probe)
 
-    model_params, model_static = eqx.partition(model, eqx.is_array)
-    flat_names = _flatten_param_names(model_params)
-    muon_mask, qkv_mask = build_muon_masks(
-        model_params,
-        flat_names,
-        TextTransformer.MUON_PARAM_EXCLUSION_PATTERNS,
-    )
+    if args.masked_probe is True:
+        if train_bundle is None:
+            raise ValueError("train_bundle must be initialized when masked_probe is enabled")
+        params, static = eqx.partition(train_bundle, eqx.is_array)
+    else:
+        params, static = eqx.partition(model, eqx.is_array)
+    flat_names = _flatten_param_names(params)
+    muon_mask, qkv_mask = build_muon_masks(params, flat_names, exclusion_patterns)
 
-    flat_params, _ = jax.tree_util.tree_flatten(model_params)
+    flat_params, _ = jax.tree_util.tree_flatten(params)
     flat_muon, _ = jax.tree_util.tree_flatten(muon_mask)
     if len(flat_params) != len(flat_muon):
         raise ValueError("muon_mask must align with params")
@@ -666,81 +885,198 @@ def main() -> None:
         qkv_mask=qkv_mask,
     )
 
-    opt_state: MuonWithAdamWFallbackState = optimizer.init(model_params)
+    opt_state: MuonWithAdamWFallbackState = optimizer.init(params)
 
-    def train_step(
-        model_in: TextTransformer,
-        state_in: MuonWithAdamWFallbackState,
-        batch_tokens: Array,
-        batch_mask: Array,
-        key: Array,
-        global_step: Array,
-    ) -> tuple[TextTransformer, MuonWithAdamWFallbackState, Array, Array, Array]:
-        """Run one training step.
+    if args.masked_probe is True:
+        def train_step(
+            bundle_in: TextTrainBundle,
+            state_in: MuonWithAdamWFallbackState,
+            batch_tokens: Array,
+            batch_mask: Array,
+            key: Array,
+            global_step: Array,
+        ) -> tuple[
+            TextTrainBundle,
+            MuonWithAdamWFallbackState,
+            Array,
+            Array,
+            Array,
+            Array,
+            Array,
+        ]:
+            """Run one training step with the masked-token probe.
 
-        :param model_in: Replicated model.
-        :param state_in: Replicated optimizer state.
-        :param batch_tokens: Token batch of shape (B, T).
-        :param batch_mask: Attention mask of shape (B, T).
-        :param key: PRNG key for view masking.
-        :param global_step: Global step index for loss scheduling.
-        :returns: Updated model, optimizer state, and losses.
-        """
-        def _loss_fn(model_inner: TextTransformer) -> tuple[Array, tuple[Array, Array]]:
-            """Compute the total loss and its components.
-
-            :param model_inner: Model replica used for the loss computation.
-            :returns: Tuple of (total loss, (prediction loss, sigreg loss)).
+            :param bundle_in: Replicated model and probe bundle.
+            :param state_in: Replicated optimizer state.
+            :param batch_tokens: Token batch of shape (B, T).
+            :param batch_mask: Attention mask of shape (B, T).
+            :param key: PRNG key for view masking.
+            :param global_step: Global step index for loss scheduling.
+            :returns: Updated bundle, optimizer state, and metrics.
             """
-            emb = _encode_views(
-                model_inner,
-                batch_tokens,
-                batch_mask,
-                train=True,
-                key=key,
-                num_global_views=args.num_global_views,
-                num_local_views=args.num_local_views,
-                global_mask_min=args.global_mask_min,
-                global_mask_max=args.global_mask_max,
-                local_mask_min=args.local_mask_min,
-                local_mask_max=args.local_mask_max,
-                mask_id=mask_id,
-                pad_id=pad_id,
-                eos_id=eos_id,
+
+            def _loss_fn(
+                bundle_inner: TextTrainBundle,
+            ) -> tuple[Array, tuple[Array, Array, Array, Array, Array]]:
+                """Compute LeJEPA losses and probe metrics.
+
+                :param bundle_inner: Bundle containing model and probe.
+                :returns: Tuple of (total loss, (model loss, pred, sigreg, probe loss, probe acc)).
+                """
+                model_inner = bundle_inner.model
+                if bundle_inner.probe is None:
+                    raise ValueError("probe must be present when masked_probe is enabled")
+                emb, token_reps, mask_positions = _encode_views(
+                    model_inner,
+                    batch_tokens,
+                    batch_mask,
+                    train=True,
+                    key=key,
+                    num_global_views=args.num_global_views,
+                    num_local_views=args.num_local_views,
+                    global_mask_min=args.global_mask_min,
+                    global_mask_max=args.global_mask_max,
+                    local_mask_min=args.local_mask_min,
+                    local_mask_max=args.local_mask_max,
+                    mask_id=mask_id,
+                    pad_id=pad_id,
+                    eos_id=eos_id,
+                    return_tokens=True,
+                )
+                if token_reps is None or mask_positions is None:
+                    raise ValueError("token_reps and mask_positions must be returned for probe training")
+                model_loss, pred, sigreg = lejepa_loss(
+                    emb,
+                    args.num_global_views,
+                    sigreg_weight=args.sigreg_weight,
+                    global_step=global_step,
+                    num_slices=args.sigreg_slices,
+                    seed=args.sigreg_seed,
+                    axis_name="data",
+                )
+                probe_loss, probe_acc = _masked_probe_metrics(
+                    bundle_inner.probe,
+                    token_reps,
+                    mask_positions,
+                    batch_tokens,
+                )
+                total = model_loss + probe_loss
+                return total, (model_loss, pred, sigreg, probe_loss, probe_acc)
+
+            (
+                total_loss,
+                (loss, pred_loss, sigreg_loss, probe_loss, probe_acc),
+            ), grads = eqx.filter_value_and_grad(
+                _loss_fn, has_aux=True
+            )(bundle_in)
+            grads = jax.lax.pmean(grads, axis_name="data")
+            params_inner = eqx.filter(bundle_in, eqx.is_array)
+            updates, new_state = optimizer.update(grads, state_in, params_inner)
+            new_bundle = eqx.apply_updates(bundle_in, updates)
+            _ = total_loss
+            loss = jax.lax.pmean(loss, axis_name="data")
+            pred_loss = jax.lax.pmean(pred_loss, axis_name="data")
+            sigreg_loss = jax.lax.pmean(sigreg_loss, axis_name="data")
+            probe_loss = jax.lax.pmean(probe_loss, axis_name="data")
+            probe_acc = jax.lax.pmean(probe_acc, axis_name="data")
+            return (
+                new_bundle,
+                new_state,
+                loss,
+                pred_loss,
+                sigreg_loss,
+                probe_loss,
+                probe_acc,
             )
-            total, pred, sigreg = lejepa_loss(
-                emb,
-                args.num_global_views,
-                sigreg_weight=args.sigreg_weight,
-                global_step=global_step,
-                num_slices=args.sigreg_slices,
-                seed=args.sigreg_seed,
-                axis_name="data",
-            )
-            return total, (pred, sigreg)
 
-        (loss, (pred_loss, sigreg_loss)), grads = eqx.filter_value_and_grad(
-            _loss_fn, has_aux=True
-        )(model_in)
-        grads = jax.lax.pmean(grads, axis_name="data")
-        params_inner = eqx.filter(model_in, eqx.is_array)
-        updates, new_state = optimizer.update(grads, state_in, params_inner)
-        new_model = eqx.apply_updates(model_in, updates)
-        loss = jax.lax.pmean(loss, axis_name="data")
-        pred_loss = jax.lax.pmean(pred_loss, axis_name="data")
-        sigreg_loss = jax.lax.pmean(sigreg_loss, axis_name="data")
-        return new_model, new_state, loss, pred_loss, sigreg_loss
+        train_step_pmap = eqx.filter_pmap(
+            train_step,
+            axis_name="data",
+            devices=device_list,
+            donate="all",
+        )  # type: ignore[call-overload]
+    else:
+        def train_step(
+            model_in: TextTransformer,
+            state_in: MuonWithAdamWFallbackState,
+            batch_tokens: Array,
+            batch_mask: Array,
+            key: Array,
+            global_step: Array,
+        ) -> tuple[TextTransformer, MuonWithAdamWFallbackState, Array, Array, Array]:
+            """Run one training step.
 
-    train_step_pmap = eqx.filter_pmap(
-        train_step,
-        axis_name="data",
-        devices=device_list,
-        donate="all",
-    )  # type: ignore[call-overload]
+            :param model_in: Replicated model.
+            :param state_in: Replicated optimizer state.
+            :param batch_tokens: Token batch of shape (B, T).
+            :param batch_mask: Attention mask of shape (B, T).
+            :param key: PRNG key for view masking.
+            :param global_step: Global step index for loss scheduling.
+            :returns: Updated model, optimizer state, and losses.
+            """
 
-    model_params_repl = _replicate_tree(model_params, num_devices)
-    model_params_repl = jax.device_put(model_params_repl, device=data_sharding)
-    model_repl = eqx.combine(model_params_repl, model_static)
+            def _loss_fn(model_inner: TextTransformer) -> tuple[Array, tuple[Array, Array]]:
+                """Compute the total loss and its components.
+
+                :param model_inner: Model replica used for the loss computation.
+                :returns: Tuple of (total loss, (prediction loss, sigreg loss)).
+                """
+                emb, _token_reps, _mask_positions = _encode_views(
+                    model_inner,
+                    batch_tokens,
+                    batch_mask,
+                    train=True,
+                    key=key,
+                    num_global_views=args.num_global_views,
+                    num_local_views=args.num_local_views,
+                    global_mask_min=args.global_mask_min,
+                    global_mask_max=args.global_mask_max,
+                    local_mask_min=args.local_mask_min,
+                    local_mask_max=args.local_mask_max,
+                    mask_id=mask_id,
+                    pad_id=pad_id,
+                    eos_id=eos_id,
+                    return_tokens=False,
+                )
+                total, pred, sigreg = lejepa_loss(
+                    emb,
+                    args.num_global_views,
+                    sigreg_weight=args.sigreg_weight,
+                    global_step=global_step,
+                    num_slices=args.sigreg_slices,
+                    seed=args.sigreg_seed,
+                    axis_name="data",
+                )
+                return total, (pred, sigreg)
+
+            (loss, (pred_loss, sigreg_loss)), grads = eqx.filter_value_and_grad(
+                _loss_fn, has_aux=True
+            )(model_in)
+            grads = jax.lax.pmean(grads, axis_name="data")
+            params_inner = eqx.filter(model_in, eqx.is_array)
+            updates, new_state = optimizer.update(grads, state_in, params_inner)
+            new_model = eqx.apply_updates(model_in, updates)
+            loss = jax.lax.pmean(loss, axis_name="data")
+            pred_loss = jax.lax.pmean(pred_loss, axis_name="data")
+            sigreg_loss = jax.lax.pmean(sigreg_loss, axis_name="data")
+            return new_model, new_state, loss, pred_loss, sigreg_loss
+
+        train_step_pmap = eqx.filter_pmap(
+            train_step,
+            axis_name="data",
+            devices=device_list,
+            donate="all",
+        )  # type: ignore[call-overload]
+
+    if args.masked_probe is True:
+        params_repl = _replicate_tree(params, num_devices)
+        params_repl = jax.device_put(params_repl, device=data_sharding)
+        train_repl = eqx.combine(params_repl, static)
+    else:
+        model_params, model_static = params, static
+        model_params_repl = _replicate_tree(model_params, num_devices)
+        model_params_repl = jax.device_put(model_params_repl, device=data_sharding)
+        train_repl = eqx.combine(model_params_repl, model_static)
     opt_state_repl = _replicate_tree(opt_state, num_devices)
     opt_state_repl = jax.device_put(opt_state_repl, device=data_sharding)
 
@@ -754,6 +1090,8 @@ def main() -> None:
     last_loss_val = 0.0
     last_pred_val = 0.0
     last_sig_val = 0.0
+    last_probe_loss_val = 0.0
+    last_probe_acc_val = 0.0
 
     try:
         train_iter_host = _iter_batches(
@@ -784,14 +1122,32 @@ def main() -> None:
                 device_keys = jax.device_put(device_keys, device=data_sharding)
                 step_id = jnp.full((num_devices,), global_step, dtype=jnp.int32)
 
-                model_repl, opt_state_repl, loss, pred, sigreg = train_step_pmap(
-                    model_repl,
-                    opt_state_repl,
-                    batch_tokens,
-                    batch_mask,
-                    device_keys,
-                    step_id,
-                )
+                if args.masked_probe is True:
+                    (
+                        train_repl,
+                        opt_state_repl,
+                        loss,
+                        pred,
+                        sigreg,
+                        probe_loss,
+                        probe_acc,
+                    ) = train_step_pmap(
+                        train_repl,
+                        opt_state_repl,
+                        batch_tokens,
+                        batch_mask,
+                        device_keys,
+                        step_id,
+                    )
+                else:
+                    train_repl, opt_state_repl, loss, pred, sigreg = train_step_pmap(
+                        train_repl,
+                        opt_state_repl,
+                        batch_tokens,
+                        batch_mask,
+                        device_keys,
+                        step_id,
+                    )
                 if args.profile:
                     jax.block_until_ready(loss)
                 compute_done = time.perf_counter()
@@ -808,13 +1164,29 @@ def main() -> None:
                     writer.add_scalar("train/total_loss", loss_val, global_step)
                     writer.add_scalar("train/pred_loss", pred_val, global_step)
                     writer.add_scalar("train/sigreg_loss", sig_val, global_step)
+                if args.masked_probe is True:
+                    probe_loss_val = float(np.mean(jax.device_get(probe_loss)))
+                    probe_acc_val = float(np.mean(jax.device_get(probe_acc)))
+                    last_probe_loss_val = probe_loss_val
+                    last_probe_acc_val = probe_acc_val
+                    writer.add_scalar("probe/cross_entropy", probe_loss_val, global_step)
+                    writer.add_scalar("probe/accuracy", probe_acc_val, global_step)
 
-                if log_this_step:
-                    pbar.set_postfix(
-                        total=f"{last_loss_val:.4f}",
-                        pred=f"{last_pred_val:.4f}",
-                        sigreg=f"{last_sig_val:.4f}",
-                    )
+                if log_this_step or args.masked_probe is True:
+                    if args.masked_probe is True:
+                        pbar.set_postfix(
+                            total=f"{last_loss_val:.4f}",
+                            pred=f"{last_pred_val:.4f}",
+                            sigreg=f"{last_sig_val:.4f}",
+                            probe_loss=f"{last_probe_loss_val:.4f}",
+                            probe_acc=f"{last_probe_acc_val:.4f}",
+                        )
+                    else:
+                        pbar.set_postfix(
+                            total=f"{last_loss_val:.4f}",
+                            pred=f"{last_pred_val:.4f}",
+                            sigreg=f"{last_sig_val:.4f}",
+                        )
                 pbar.update(1)
                 global_step += 1
                 log_done = time.perf_counter()
@@ -827,13 +1199,28 @@ def main() -> None:
                         perf_log_time += log_done - compute_done
 
                 if global_step % args.checkpoint_every == 0:
-                    model_host = cast(TextTransformer, _unreplicate(model_repl))
                     opt_state_host = cast(MuonWithAdamWFallbackState, _unreplicate(opt_state_repl))
+                    probe_host: MaskedTokenProbe | None = None
+                    if args.masked_probe is True:
+                        bundle_host = cast(TextTrainBundle, _unreplicate(train_repl))
+                        model_host = bundle_host.model
+                        probe_host = bundle_host.probe
+                        if probe_host is None:
+                            raise ValueError("probe missing from train bundle for checkpointing")
+                    else:
+                        model_host = cast(TextTransformer, _unreplicate(train_repl))
                     metadata = {
                         "global_step": global_step,
                         "config": run_config,
                     }
-                    _save_checkpoint(run_dir, global_step, model_host, opt_state_host, metadata)
+                    _save_checkpoint(
+                        run_dir,
+                        global_step,
+                        model_host,
+                        opt_state_host,
+                        probe_host,
+                        metadata,
+                    )
                     writer.flush()
                     if args.profile and perf_steps > 0:
                         total_time = perf_data_time + perf_compute_time + perf_log_time
