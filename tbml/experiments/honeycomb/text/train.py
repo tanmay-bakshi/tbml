@@ -141,6 +141,49 @@ def _build_run_dir(runs_folder: str) -> str:
     return run_dir
 
 
+def _list_jsonl_files(folder: str) -> list[str]:
+    """Collect JSONL file paths from a folder.
+
+    :param folder: Directory containing JSONL files.
+    :returns: Sorted list of JSONL file paths.
+    """
+    if os.path.isdir(folder) is False:
+        raise FileNotFoundError(f"data folder not found: {folder}")
+    paths: list[str] = []
+    for name in sorted(os.listdir(folder)):
+        if name.endswith(".jsonl") is False:
+            continue
+        path = os.path.join(folder, name)
+        if os.path.isfile(path) is False:
+            continue
+        paths.append(path)
+    if len(paths) == 0:
+        raise FileNotFoundError(f"no .jsonl files found in folder: {folder}")
+    return paths
+
+
+def _count_text_samples(folder: str, text_field: str) -> int:
+    """Count valid text samples across JSONL files.
+
+    :param folder: Directory containing JSONL files.
+    :param text_field: JSON field name containing the text.
+    :returns: Number of valid samples.
+    """
+    files = _list_jsonl_files(folder)
+    total = 0
+    for path in files:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                text = record.get(text_field)
+                if isinstance(text, str):
+                    total += 1
+    return total
+
+
 def _flatten_param_names(params: eqx.Module) -> list[str]:
     """Flatten parameter PyTree paths into dotted names.
 
@@ -719,6 +762,7 @@ def main() -> None:
     dtype = _dtype_from_name(args.dtype)
     betas = _parse_betas(args.adamw_betas)
     run_dir = _build_run_dir(args.runs_folder)
+    total_samples = _count_text_samples(args.data_folder, args.text_field)
 
     device_list: list[jax.Device] = _devices_for_platform("gpu")
     if args.num_devices == 0:
@@ -1120,6 +1164,15 @@ def main() -> None:
     last_sig_val = 0.0
     last_probe_loss_val = 0.0
     last_probe_acc_val = 0.0
+    if total_samples <= 0:
+        raise ValueError("no valid samples found in the dataset")
+    epoch_steps = total_samples // global_batch
+    if epoch_steps <= 0:
+        raise ValueError("dataset too small for the configured batch size")
+    if args.max_train_steps > 0:
+        total_steps = min(args.max_train_steps, epoch_steps)
+    else:
+        total_steps = epoch_steps
 
     try:
         train_iter_host = _iter_batches(
@@ -1137,11 +1190,8 @@ def main() -> None:
         )
         train_iter = iter(train_iter)
 
-        total_steps = args.max_train_steps if args.max_train_steps > 0 else None
         with tqdm(total=total_steps, desc="Train") as pbar:
-            while True:
-                if args.max_train_steps > 0 and global_step >= args.max_train_steps:
-                    break
+            for _ in range(total_steps):
                 step_start = time.perf_counter()
                 batch_tokens, batch_mask = next(train_iter)
                 data_done = time.perf_counter()

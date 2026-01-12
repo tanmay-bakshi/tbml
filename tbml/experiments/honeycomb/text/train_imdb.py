@@ -160,7 +160,7 @@ def _skip_deserialise(_handle: BinaryIO, leaf: object) -> object:
     return leaf
 
 
-def _is_d_out_path(path: tuple[jax.tree_util.KeyPathEntry, ...]) -> bool:
+def _is_d_out_path(path: jax.tree_util.KeyPath) -> bool:
     """Check whether a PyTree path points to a SwiGLU d_out field.
 
     :param path: PyTree path entries.
