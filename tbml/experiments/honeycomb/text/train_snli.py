@@ -22,6 +22,7 @@ from tqdm import tqdm  # type: ignore[import-untyped]
 from tbml.experiments.honeycomb.text.dataset import _build_tokenizer
 from tbml.experiments.honeycomb.text.model import TextTransformer, TextTransformerConfig
 from tbml.nn.init import truncated_normal_init
+from tbml.nn import RMSNorm
 from tbml.nn.linear import Linear
 from tbml.nn.swiglu import SwiGLUFeedForward
 from tbml.optimizers import MuonWithAdamWFallback, MuonWithAdamWFallbackState, build_muon_masks
@@ -540,7 +541,9 @@ class SnliClassifier(eqx.Module):
     :ivar hidden_dim: Hidden dimension for SwiGLU layers.
     :ivar num_classes: Number of output classes.
     :ivar mlp1: First SwiGLU layer.
+    :ivar norm1: RMSNorm after the first SwiGLU layer.
     :ivar mlp2: Second SwiGLU layer.
+    :ivar norm2: RMSNorm after the second SwiGLU layer.
     :ivar proj: Projection to logits.
     """
 
@@ -549,7 +552,9 @@ class SnliClassifier(eqx.Module):
     hidden_dim: int
     num_classes: int
     mlp1: SwiGLUFeedForward
+    norm1: RMSNorm
     mlp2: SwiGLUFeedForward
+    norm2: RMSNorm
     proj: Linear
 
     def __init__(
@@ -606,6 +611,7 @@ class SnliClassifier(eqx.Module):
             down_kernel_init=init,
             key=mlp1_key,
         )
+        self.norm1 = RMSNorm(feature_dim, dtype=dtype, param_dtype=param_dtype)
         self.mlp2 = SwiGLUFeedForward(
             d_model=feature_dim,
             hidden_dim=hidden_dim,
@@ -616,6 +622,7 @@ class SnliClassifier(eqx.Module):
             down_kernel_init=init,
             key=mlp2_key,
         )
+        self.norm2 = RMSNorm(feature_dim, dtype=dtype, param_dtype=param_dtype)
         self.proj = Linear(
             in_features=feature_dim,
             out_features=num_classes,
@@ -647,14 +654,14 @@ class SnliClassifier(eqx.Module):
         else:
             mlp1_key, mlp2_key = jax.random.split(key, 2)
 
-        features = jnp.concatenate(
+        x = jnp.concatenate(
             [premise, hypothesis, jnp.abs(premise - hypothesis), premise * hypothesis],
             axis=-1,
         )
-        x = features[:, None, :]
         x = self.mlp1(x, train=train, key=mlp1_key)
+        x = self.norm1(x)
         x = self.mlp2(x, train=train, key=mlp2_key)
-        x = x.squeeze(axis=1)
+        x = self.norm2(x)
         return self.proj(x)
 
 
