@@ -11,6 +11,7 @@ class SwiGLUFeedForward(eqx.Module):
     """SwiGLU MLP: (SiLU(W_gate x) ⊙ (W_up x)) W_down.
 
     :ivar d_model: Model width.
+    :ivar d_out: Output width after the down projection.
     :ivar hidden_dim: Hidden dimension size for the feed-forward expansion.
     :ivar resid_dropout: Residual dropout probability.
     :ivar dtype: Compute dtype.
@@ -22,6 +23,7 @@ class SwiGLUFeedForward(eqx.Module):
     """
 
     d_model: int
+    d_out: int
     hidden_dim: int
     resid_dropout: float
     dtype: jnp.dtype
@@ -35,6 +37,7 @@ class SwiGLUFeedForward(eqx.Module):
         self,
         d_model: int,
         hidden_dim: int,
+        d_out: int | None = None,
         *,
         resid_dropout: float = 0.0,
         dtype: jnp.dtype = jnp.float32,
@@ -47,6 +50,7 @@ class SwiGLUFeedForward(eqx.Module):
 
         :param d_model: Model width.
         :param hidden_dim: Hidden dimension size for the feed-forward expansion.
+        :param d_out: Output width after the down projection.
         :param resid_dropout: Residual dropout probability.
         :param dtype: Compute dtype.
         :param param_dtype: Parameter dtype.
@@ -58,10 +62,15 @@ class SwiGLUFeedForward(eqx.Module):
             raise ValueError("d_model must be > 0")
         if hidden_dim <= 0:
             raise ValueError("hidden_dim must be > 0")
+        if d_out is not None and d_out <= 0:
+            raise ValueError("d_out must be > 0 when set")
+
+        out_dim = d_model if d_out is None else d_out
 
         gate_key, up_key, down_key = jax.random.split(key, 3)
 
         self.d_model = d_model
+        self.d_out = out_dim
         self.hidden_dim = hidden_dim
         self.resid_dropout = resid_dropout
         self.dtype = dtype
@@ -87,7 +96,7 @@ class SwiGLUFeedForward(eqx.Module):
         )
         self.down_proj = Linear(
             in_features=hidden_dim,
-            out_features=d_model,
+            out_features=out_dim,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -102,7 +111,7 @@ class SwiGLUFeedForward(eqx.Module):
         :param x: Input tensor of shape (B, T, d_model).
         :param train: Whether to enable dropout.
         :param key: PRNG key for dropout.
-        :returns: Output tensor of shape (B, T, d_model).
+        :returns: Output tensor of shape (B, T, d_out).
         :raises ValueError: If dropout is enabled without a PRNG key.
         """
         gate_weight = self.gate_proj.weight.astype(self.dtype)

@@ -588,7 +588,7 @@ class SnliClassifier(eqx.Module):
             raise ValueError("num_classes must be > 1")
 
         feature_dim = 4 * d_model
-        hidden_dim = int(feature_dim * mlp_ratio)
+        hidden_dim = int(d_model * mlp_ratio)
         if hidden_dim <= 0:
             raise ValueError("hidden_dim must be > 0")
 
@@ -602,6 +602,7 @@ class SnliClassifier(eqx.Module):
         self.mlp1 = SwiGLUFeedForward(
             d_model=feature_dim,
             hidden_dim=hidden_dim,
+            d_out=d_model,
             resid_dropout=resid_dropout,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -609,9 +610,9 @@ class SnliClassifier(eqx.Module):
             down_kernel_init=init,
             key=mlp1_key,
         )
-        self.norm1 = RMSNorm(feature_dim, dtype=dtype, param_dtype=param_dtype)
+        self.norm1 = RMSNorm(d_model, dtype=dtype, param_dtype=param_dtype)
         self.mlp2 = SwiGLUFeedForward(
-            d_model=feature_dim,
+            d_model=d_model,
             hidden_dim=hidden_dim,
             resid_dropout=resid_dropout,
             dtype=dtype,
@@ -620,9 +621,9 @@ class SnliClassifier(eqx.Module):
             down_kernel_init=init,
             key=mlp2_key,
         )
-        self.norm2 = RMSNorm(feature_dim, dtype=dtype, param_dtype=param_dtype)
+        self.norm2 = RMSNorm(d_model, dtype=dtype, param_dtype=param_dtype)
         self.proj = Linear(
-            in_features=feature_dim,
+            in_features=d_model,
             out_features=num_classes,
             use_bias=True,
             bias_value=0.0,
