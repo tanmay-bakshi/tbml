@@ -723,7 +723,7 @@ def main() -> None:
         mask_token=mask_token,
         max_seq_len=max_seq_len,
         seed=args.seed,
-        shuffle=False,
+        shuffle=args.shuffle,
     )
 
     base_key = jax.random.PRNGKey(args.seed)
@@ -735,8 +735,11 @@ def main() -> None:
         key=model_key,
     )
     if args.from_scratch is False:
+        print("Training from checkpoint.")
         model_path = os.path.join(checkpoint_dir, "model.eqx")
         model = eqx.tree_deserialise_leaves(model_path, model)
+    else:
+        print("Training from scratch.")
 
     probe_key, base_key = jax.random.split(base_key)
     classifier = SentimentProbe(
