@@ -293,6 +293,15 @@ def _unreplicate(tree: T) -> T:
     )
 
 
+def _to_host(tree: T) -> T:
+    """Move a PyTree of arrays to host memory.
+
+    :param tree: PyTree containing JAX arrays.
+    :returns: PyTree with host arrays.
+    """
+    return cast(T, jax.device_get(tree))
+
+
 def _build_sharding(devices: list[jax.Device]) -> tuple[Mesh, NamedSharding, NamedSharding]:
     """Build sharding helpers for data and replicated params.
 
@@ -1199,16 +1208,19 @@ def main() -> None:
                         perf_log_time += log_done - compute_done
 
                 if global_step % args.checkpoint_every == 0:
+                    jax.block_until_ready(loss)
                     opt_state_host = cast(MuonWithAdamWFallbackState, _unreplicate(opt_state_repl))
                     probe_host: MaskedTokenProbe | None = None
                     if args.masked_probe is True:
                         bundle_host = cast(TextTrainBundle, _unreplicate(train_repl))
+                        bundle_host = cast(TextTrainBundle, _to_host(bundle_host))
                         model_host = bundle_host.model
                         probe_host = bundle_host.probe
                         if probe_host is None:
                             raise ValueError("probe missing from train bundle for checkpointing")
                     else:
                         model_host = cast(TextTransformer, _unreplicate(train_repl))
+                        model_host = cast(TextTransformer, _to_host(model_host))
                     metadata = {
                         "global_step": global_step,
                         "config": run_config,
