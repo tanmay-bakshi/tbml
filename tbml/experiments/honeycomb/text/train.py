@@ -40,6 +40,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mask-token", type=str, default="<|mask|>")
     parser.add_argument("--max-seq-len", type=int, default=256)
     parser.add_argument("--shuffle-buffer", type=int, default=1024)
+    parser.add_argument("--full-sample-prob", type=float, default=1.0 / 3.0)
+    parser.add_argument("--token-truncate-prob", type=float, default=1.0 / 3.0)
+    parser.add_argument("--text-truncate-prob", type=float, default=1.0 / 3.0)
     parser.add_argument("--max-train-steps", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--checkpoint-every", type=int, default=1000)
@@ -76,6 +79,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sigreg-weight", type=float, default=0.25)
     parser.add_argument("--sigreg-slices", type=int, default=256)
     parser.add_argument("--sigreg-seed", type=int, default=0)
+    parser.add_argument("--pred-loss", type=str, default="mse", choices=["mse", "cosine"])
 
     parser.add_argument("--muon-lr", type=float, default=1e-3)
     parser.add_argument("--muon-momentum", type=float, default=0.95)
@@ -705,6 +709,12 @@ def main() -> None:
         raise ValueError("local-mask-min must be <= local-mask-max")
     if args.sigreg_weight < 0.0 or args.sigreg_weight > 1.0:
         raise ValueError("sigreg-weight must be in [0, 1]")
+    if args.pred_loss not in ("mse", "cosine"):
+        raise ValueError("pred-loss must be 'mse' or 'cosine'")
+    if args.full_sample_prob < 0.0 or args.token_truncate_prob < 0.0 or args.text_truncate_prob < 0.0:
+        raise ValueError("sample probabilities must be >= 0")
+    if args.full_sample_prob + args.token_truncate_prob + args.text_truncate_prob <= 0.0:
+        raise ValueError("sum of sample probabilities must be > 0")
 
     dtype = _dtype_from_name(args.dtype)
     betas = _parse_betas(args.adamw_betas)
@@ -732,6 +742,9 @@ def main() -> None:
         mask_token=args.mask_token,
         max_seq_len=args.max_seq_len,
         shuffle_buffer=args.shuffle_buffer,
+        full_sample_prob=args.full_sample_prob,
+        token_truncate_prob=args.token_truncate_prob,
+        text_truncate_prob=args.text_truncate_prob,
         num_workers=args.num_workers,
         prefetch=args.prefetch,
         seed=args.seed,
@@ -770,6 +783,9 @@ def main() -> None:
             "mask_token": args.mask_token,
             "max_seq_len": args.max_seq_len,
             "shuffle_buffer": args.shuffle_buffer,
+            "full_sample_prob": args.full_sample_prob,
+            "token_truncate_prob": args.token_truncate_prob,
+            "text_truncate_prob": args.text_truncate_prob,
             "vocab_size": vocab_size,
             "eos_id": eos_id,
             "pad_id": pad_id,
@@ -787,6 +803,7 @@ def main() -> None:
             "sigreg_weight": args.sigreg_weight,
             "sigreg_slices": args.sigreg_slices,
             "sigreg_seed": args.sigreg_seed,
+            "pred_loss": args.pred_loss,
         },
         "probe": {
             "masked_probe": args.masked_probe,
@@ -958,6 +975,7 @@ def main() -> None:
                     emb,
                     args.num_global_views,
                     sigreg_weight=args.sigreg_weight,
+                    pred_loss_type=args.pred_loss,
                     global_step=global_step,
                     num_slices=args.sigreg_slices,
                     seed=args.sigreg_seed,
@@ -1051,6 +1069,7 @@ def main() -> None:
                     emb,
                     args.num_global_views,
                     sigreg_weight=args.sigreg_weight,
+                    pred_loss_type=args.pred_loss,
                     global_step=global_step,
                     num_slices=args.sigreg_slices,
                     seed=args.sigreg_seed,

@@ -6,7 +6,7 @@ import threading
 import time
 from datetime import datetime
 import traceback
-from typing import Iterable, Iterator, TypeVar, cast
+from typing import BinaryIO, Iterable, Iterator, TypeVar, cast
 
 import equinox as eqx
 import jax
@@ -151,6 +151,81 @@ def _load_run_config(checkpoint_dir: str) -> dict[str, object]:
     if isinstance(config, dict) is False:
         raise ValueError("metadata config entry must be a dictionary")
     return config
+
+
+def _skip_deserialise(_handle: BinaryIO, leaf: object) -> object:
+    """Skip deserialising a leaf and keep the default value.
+
+    :param _handle: Binary file handle (unused).
+    :param leaf: Leaf value from the target tree.
+    :returns: The unchanged leaf value.
+    """
+    return leaf
+
+
+def _is_d_out_path(path: tuple[jax.tree_util.KeyPathEntry, ...]) -> bool:
+    """Check whether a PyTree path points to a SwiGLU d_out field.
+
+    :param path: PyTree path entries.
+    :returns: True if the path ends with ``d_out``.
+    """
+    if len(path) == 0:
+        return False
+    last = path[-1]
+    return isinstance(last, jax.tree_util.GetAttrKey) and last.name == "d_out"
+
+
+def _build_legacy_filter_spec(model: eqx.Module) -> object:
+    """Build a deserialisation filter spec for legacy checkpoints.
+
+    :param model: Model instance used as the target tree.
+    :returns: Filter spec PyTree.
+    """
+    paths_and_leaves, tree_def = jax.tree_util.tree_flatten_with_path(model)
+    flat_leaves, _ = jax.tree_util.tree_flatten(model)
+    if len(paths_and_leaves) != len(flat_leaves):
+        raise ValueError("tree flatten mismatch while building legacy filter spec")
+    filter_leaves: list[object] = []
+    for (path, _leaf), leaf in zip(paths_and_leaves, flat_leaves, strict=True):
+        if _is_d_out_path(path):
+            filter_leaves.append(_skip_deserialise)
+        else:
+            filter_leaves.append(eqx.default_deserialise_filter_spec)
+    return jax.tree_util.tree_unflatten(tree_def, filter_leaves)
+
+
+def _load_checkpoint_model(
+    model_path: str,
+    model: TextTransformer,
+    *,
+    patch_dir: str,
+) -> TextTransformer:
+    """Load a model checkpoint with legacy compatibility handling.
+
+    :param model_path: Path to the model checkpoint.
+    :param model: Model instance for shape/dtype reference.
+    :param patch_dir: Directory to write patched checkpoints into.
+    :returns: Loaded model instance.
+    """
+    try:
+        return eqx.tree_deserialise_leaves(model_path, model)
+    except (RuntimeError, ValueError) as exc:
+        print("Detected legacy checkpoint format; patching d_out fields.")
+        filter_spec = _build_legacy_filter_spec(model)
+        try:
+            patched = eqx.tree_deserialise_leaves(
+                model_path,
+                model,
+                filter_spec=filter_spec,
+            )
+        except Exception as inner_exc:
+            stack = traceback.format_exc()
+            raise RuntimeError(
+                f"Failed to load legacy checkpoint: {inner_exc}\\n{stack}"
+            ) from exc
+        patched_path = os.path.join(patch_dir, "model_legacy_patched.eqx")
+        eqx.tree_serialise_leaves(patched_path, patched)
+        return patched
 
 
 def _flatten_param_names(params: eqx.Module) -> list[str]:
@@ -819,7 +894,7 @@ def main() -> None:
     )
     if args.from_scratch is False:
         model_path = os.path.join(checkpoint_dir, "model.eqx")
-        model = eqx.tree_deserialise_leaves(model_path, model)
+        model = _load_checkpoint_model(model_path, model, patch_dir=run_dir)
 
     classifier_key, base_key = jax.random.split(base_key)
     classifier = SnliClassifier(

@@ -167,6 +167,7 @@ def lejepa_loss(
     num_global_views: int,
     *,
     sigreg_weight: float,
+    pred_loss_type: str = "mse",
     global_step: Array,
     num_slices: int = 256,
     seed: int = 0,
@@ -177,6 +178,7 @@ def lejepa_loss(
     :param embeddings: Embeddings of shape (B, V, K).
     :param num_global_views: Number of global views (V_g).
     :param sigreg_weight: Weight for the SIGReg term (lambda).
+    :param pred_loss_type: Reconstruction loss type ("mse" or "cosine").
     :param global_step: Global training step used to sync random directions.
     :param num_slices: Number of random projection directions.
     :param seed: Random seed for direction sampling.
@@ -189,6 +191,8 @@ def lejepa_loss(
         raise ValueError("num_global_views must be > 0")
     if sigreg_weight < 0.0 or sigreg_weight > 1.0:
         raise ValueError("sigreg_weight must be in [0, 1]")
+    if pred_loss_type not in ("mse", "cosine"):
+        raise ValueError("pred_loss_type must be 'mse' or 'cosine'")
 
     batch_size, num_views, dim = embeddings.shape
     if num_global_views > num_views:
@@ -200,8 +204,15 @@ def lejepa_loss(
 
     global_embeddings = embeddings[:, :num_global_views, :]
     centers = jnp.mean(global_embeddings, axis=1)
-    diffs = embeddings - centers[:, None, :]
-    pred_loss = jnp.mean(jnp.square(diffs))
+    if pred_loss_type == "mse":
+        diffs = embeddings - centers[:, None, :]
+        pred_loss = jnp.mean(jnp.square(diffs))
+    else:
+        eps = jnp.asarray(1e-8, dtype=embeddings.dtype)
+        emb_norm = embeddings / (jnp.linalg.norm(embeddings, axis=-1, keepdims=True) + eps)
+        ctr_norm = centers / (jnp.linalg.norm(centers, axis=-1, keepdims=True) + eps)
+        cos_sim = jnp.sum(emb_norm * ctr_norm[:, None, :], axis=-1)
+        pred_loss = jnp.mean(1.0 - cos_sim)
 
     sigreg = sigreg_loss_views(
         embeddings,

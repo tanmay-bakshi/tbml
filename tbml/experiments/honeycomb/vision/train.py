@@ -85,6 +85,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sigreg-weight", type=float, default=0.25)
     parser.add_argument("--sigreg-slices", type=int, default=256)
     parser.add_argument("--sigreg-seed", type=int, default=0)
+    parser.add_argument("--pred-loss", type=str, default="mse", choices=["mse", "cosine"])
 
     parser.add_argument("--muon-lr", type=float, default=1e-3)
     parser.add_argument("--muon-momentum", type=float, default=0.95)
@@ -628,6 +629,8 @@ def main() -> None:
         raise ValueError("prefetch must be > 0")
     if args.sigreg_weight < 0.0 or args.sigreg_weight > 1.0:
         raise ValueError("sigreg_weight must be in [0, 1]")
+    if args.pred_loss not in ("mse", "cosine"):
+        raise ValueError("pred-loss must be 'mse' or 'cosine'")
 
     effective_prefetch = args.prefetch
     if args.num_workers > 0:
@@ -711,6 +714,7 @@ def main() -> None:
             "sigreg_weight": args.sigreg_weight,
             "sigreg_slices": args.sigreg_slices,
             "sigreg_seed": args.sigreg_seed,
+            "pred_loss": args.pred_loss,
         },
         "optimizer": {
             "muon_lr": args.muon_lr,
@@ -832,6 +836,7 @@ def main() -> None:
                 emb,
                 args.num_global_views,
                 sigreg_weight=args.sigreg_weight,
+                pred_loss_type=args.pred_loss,
                 global_step=global_step,
                 num_slices=args.sigreg_slices,
                 seed=args.sigreg_seed,
@@ -876,6 +881,7 @@ def main() -> None:
             emb,
             args.num_global_views,
             sigreg_weight=args.sigreg_weight,
+            pred_loss_type=args.pred_loss,
             global_step=global_step,
             num_slices=args.sigreg_slices,
             seed=args.sigreg_seed,
