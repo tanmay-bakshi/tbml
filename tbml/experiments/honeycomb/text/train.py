@@ -38,8 +38,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mask-token", type=str, default="<|mask|>")
     parser.add_argument("--max-seq-len", type=int, default=256)
     parser.add_argument("--shuffle-buffer", type=int, default=1024)
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--steps-per-epoch", type=int, default=1000)
     parser.add_argument("--max-train-steps", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--checkpoint-every", type=int, default=1000)
@@ -477,8 +475,6 @@ def main() -> None:
     """Run the text training loop."""
     args = _parse_args()
 
-    if args.steps_per_epoch <= 0:
-        raise ValueError("steps-per-epoch must be > 0")
     if args.max_train_steps < 0:
         raise ValueError("max-train-steps must be >= 0")
     if args.log_every <= 0:
@@ -595,8 +591,6 @@ def main() -> None:
             "muon_param_exclusion_patterns": TextTransformer.MUON_PARAM_EXCLUSION_PATTERNS,
         },
         "training": {
-            "epochs": args.epochs,
-            "steps_per_epoch": args.steps_per_epoch,
             "max_train_steps": args.max_train_steps,
             "per_device_batch_size": args.per_device_batch_size,
             "num_devices": num_devices,
@@ -633,6 +627,29 @@ def main() -> None:
         flat_names,
         TextTransformer.MUON_PARAM_EXCLUSION_PATTERNS,
     )
+
+    flat_params, _ = jax.tree_util.tree_flatten(model_params)
+    flat_muon, _ = jax.tree_util.tree_flatten(muon_mask)
+    if len(flat_params) != len(flat_muon):
+        raise ValueError("muon_mask must align with params")
+
+    muon_names = [
+        name
+        for name, param, flag in zip(flat_names, flat_params, flat_muon, strict=True)
+        if isinstance(param, jax.Array) and flag
+    ]
+    adamw_names = [
+        name
+        for name, param, flag in zip(flat_names, flat_params, flat_muon, strict=True)
+        if isinstance(param, jax.Array) and flag is False
+    ]
+    total_params = sum(int(param.size) for param in flat_params if isinstance(param, jax.Array))
+
+    print(f"Total parameters: {total_params}")
+    print("Muon parameters:")
+    print("\n".join(muon_names))
+    print("AdamW parameters:")
+    print("\n".join(adamw_names))
 
     optimizer = MuonWithAdamWFallback(
         muon_learning_rate=args.muon_lr,
@@ -728,10 +745,6 @@ def main() -> None:
     opt_state_repl = jax.device_put(opt_state_repl, device=data_sharding)
 
     global_batch = args.per_device_batch_size * num_devices
-    train_steps = args.steps_per_epoch
-    if args.max_train_steps > 0:
-        train_steps = min(train_steps, args.max_train_steps)
-
     global_step = 0
     perf_steps = 0
     perf_data_time = 0.0
@@ -758,91 +771,91 @@ def main() -> None:
         )
         train_iter = iter(train_iter)
 
-        for epoch in range(1, args.epochs + 1):
-            with tqdm(total=train_steps, desc=f"Train {epoch}/{args.epochs}") as pbar:
-                for _ in range(train_steps):
-                    step_start = time.perf_counter()
-                    batch_tokens, batch_mask = next(train_iter)
-                    data_done = time.perf_counter()
-                    step_key = jax.random.fold_in(base_key, global_step)
-                    device_keys = jax.random.split(step_key, num_devices)
-                    device_keys = jax.device_put(device_keys, device=data_sharding)
-                    step_id = jnp.full((num_devices,), global_step, dtype=jnp.int32)
+        total_steps = args.max_train_steps if args.max_train_steps > 0 else None
+        with tqdm(total=total_steps, desc="Train") as pbar:
+            while True:
+                if args.max_train_steps > 0 and global_step >= args.max_train_steps:
+                    break
+                step_start = time.perf_counter()
+                batch_tokens, batch_mask = next(train_iter)
+                data_done = time.perf_counter()
+                step_key = jax.random.fold_in(base_key, global_step)
+                device_keys = jax.random.split(step_key, num_devices)
+                device_keys = jax.device_put(device_keys, device=data_sharding)
+                step_id = jnp.full((num_devices,), global_step, dtype=jnp.int32)
 
-                    model_repl, opt_state_repl, loss, pred, sigreg = train_step_pmap(
-                        model_repl,
-                        opt_state_repl,
-                        batch_tokens,
-                        batch_mask,
-                        device_keys,
-                        step_id,
+                model_repl, opt_state_repl, loss, pred, sigreg = train_step_pmap(
+                    model_repl,
+                    opt_state_repl,
+                    batch_tokens,
+                    batch_mask,
+                    device_keys,
+                    step_id,
+                )
+                if args.profile:
+                    jax.block_until_ready(loss)
+                compute_done = time.perf_counter()
+
+                log_this_step = (global_step % args.log_every) == 0
+                if log_this_step:
+                    loss_val = float(np.mean(jax.device_get(loss)))
+                    pred_val = float(np.mean(jax.device_get(pred)))
+                    sig_val = float(np.mean(jax.device_get(sigreg)))
+                    last_loss_val = loss_val
+                    last_pred_val = pred_val
+                    last_sig_val = sig_val
+
+                    writer.add_scalar("train/total_loss", loss_val, global_step)
+                    writer.add_scalar("train/pred_loss", pred_val, global_step)
+                    writer.add_scalar("train/sigreg_loss", sig_val, global_step)
+
+                if log_this_step:
+                    pbar.set_postfix(
+                        total=f"{last_loss_val:.4f}",
+                        pred=f"{last_pred_val:.4f}",
+                        sigreg=f"{last_sig_val:.4f}",
                     )
-                    if args.profile:
-                        jax.block_until_ready(loss)
-                    compute_done = time.perf_counter()
+                pbar.update(1)
+                global_step += 1
+                log_done = time.perf_counter()
 
-                    log_this_step = (global_step % args.log_every) == 0
-                    if log_this_step:
-                        loss_val = float(np.mean(jax.device_get(loss)))
-                        pred_val = float(np.mean(jax.device_get(pred)))
-                        sig_val = float(np.mean(jax.device_get(sigreg)))
-                        last_loss_val = loss_val
-                        last_pred_val = pred_val
-                        last_sig_val = sig_val
+                if args.profile:
+                    if perf_steps + perf_warmup < global_step:
+                        perf_steps += 1
+                        perf_data_time += data_done - step_start
+                        perf_compute_time += compute_done - data_done
+                        perf_log_time += log_done - compute_done
 
-                        writer.add_scalar("train/total_loss", loss_val, global_step)
-                        writer.add_scalar("train/pred_loss", pred_val, global_step)
-                        writer.add_scalar("train/sigreg_loss", sig_val, global_step)
-
-                    if log_this_step:
-                        pbar.set_postfix(
-                            total=f"{last_loss_val:.4f}",
-                            pred=f"{last_pred_val:.4f}",
-                            sigreg=f"{last_sig_val:.4f}",
-                        )
-                    pbar.update(1)
-                    global_step += 1
-                    log_done = time.perf_counter()
-
-                    if args.profile:
-                        if perf_steps + perf_warmup < global_step:
-                            perf_steps += 1
-                            perf_data_time += data_done - step_start
-                            perf_compute_time += compute_done - data_done
-                            perf_log_time += log_done - compute_done
-
-                    if global_step % args.checkpoint_every == 0:
-                        model_host = cast(TextTransformer, _unreplicate(model_repl))
-                        opt_state_host = cast(MuonWithAdamWFallbackState, _unreplicate(opt_state_repl))
-                        metadata = {
-                            "epoch": epoch,
-                            "global_step": global_step,
-                            "config": run_config,
-                        }
-                        _save_checkpoint(run_dir, global_step, model_host, opt_state_host, metadata)
-
-            writer.flush()
-            if args.profile and perf_steps > 0:
-                total_time = perf_data_time + perf_compute_time + perf_log_time
-                if total_time > 0.0:
-                    step_time = total_time / perf_steps
-                    steps_per_sec = perf_steps / total_time
-                    data_pct = 100.0 * perf_data_time / total_time
-                    compute_pct = 100.0 * perf_compute_time / total_time
-                    log_pct = 100.0 * perf_log_time / total_time
-                    print(
-                        "Perf summary (train): "
-                        f"steps={perf_steps}, "
-                        f"step_time={step_time:.4f}s, "
-                        f"steps_per_sec={steps_per_sec:.2f}, "
-                        f"data={data_pct:.1f}%, "
-                        f"compute={compute_pct:.1f}%, "
-                        f"log={log_pct:.1f}%"
-                    )
-                perf_steps = 0
-                perf_data_time = 0.0
-                perf_compute_time = 0.0
-                perf_log_time = 0.0
+                if global_step % args.checkpoint_every == 0:
+                    model_host = cast(TextTransformer, _unreplicate(model_repl))
+                    opt_state_host = cast(MuonWithAdamWFallbackState, _unreplicate(opt_state_repl))
+                    metadata = {
+                        "global_step": global_step,
+                        "config": run_config,
+                    }
+                    _save_checkpoint(run_dir, global_step, model_host, opt_state_host, metadata)
+                    writer.flush()
+                    if args.profile and perf_steps > 0:
+                        total_time = perf_data_time + perf_compute_time + perf_log_time
+                        if total_time > 0.0:
+                            step_time = total_time / perf_steps
+                            steps_per_sec = perf_steps / total_time
+                            data_pct = 100.0 * perf_data_time / total_time
+                            compute_pct = 100.0 * perf_compute_time / total_time
+                            log_pct = 100.0 * perf_log_time / total_time
+                            print(
+                                "Perf summary (train): "
+                                f"steps={perf_steps}, "
+                                f"step_time={step_time:.4f}s, "
+                                f"steps_per_sec={steps_per_sec:.2f}, "
+                                f"data={data_pct:.1f}%, "
+                                f"compute={compute_pct:.1f}%, "
+                                f"log={log_pct:.1f}%"
+                            )
+                        perf_steps = 0
+                        perf_data_time = 0.0
+                        perf_compute_time = 0.0
+                        perf_log_time = 0.0
     finally:
         dataset.close()
         writer.close()
