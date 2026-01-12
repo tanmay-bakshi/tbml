@@ -41,8 +41,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--hypothesis-field", type=str, default="hypothesis")
     parser.add_argument("--label-field", type=str, default="label")
     parser.add_argument("--from-scratch", action="store_true")
-    parser.add_argument("--train-backbone", dest="train_backbone", action="store_true")
-    parser.add_argument("--freeze-backbone", dest="train_backbone", action="store_false")
+    parser.add_argument("--train-backbone-after", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--max-train-steps", type=int, default=0)
     parser.add_argument("--max-val-steps", type=int, default=0)
@@ -72,7 +71,6 @@ def _parse_args() -> argparse.Namespace:
 
     parser.set_defaults(
         muon_nesterov=True,
-        train_backbone=True,
         shuffle=True,
     )
     return parser.parse_args()
@@ -713,6 +711,8 @@ def main() -> None:
         raise ValueError("log-every must be > 0")
     if args.profile_warmup_steps < 0:
         raise ValueError("profile-warmup-steps must be >= 0")
+    if args.train_backbone_after is not None and args.train_backbone_after < 0:
+        raise ValueError("train-backbone-after must be >= 0 when set")
 
     checkpoint_dir = _resolve_checkpoint_dir(args.checkpoint)
     base_config = _load_run_config(checkpoint_dir)
@@ -884,10 +884,7 @@ def main() -> None:
     flat_params, tree_def = jax.tree_util.tree_flatten(params)
     trainable_flags: list[bool] = []
     for name, param in zip(flat_names, flat_params, strict=True):
-        if args.train_backbone is True:
-            trainable_flags.append(isinstance(param, jax.Array))
-        else:
-            trainable_flags.append(name.startswith("classifier."))
+        trainable_flags.append(isinstance(param, jax.Array) and name.startswith("classifier."))
     trainable_mask = jax.tree_util.tree_unflatten(tree_def, trainable_flags)
 
     run_config: dict[str, object] = {
@@ -920,7 +917,7 @@ def main() -> None:
         },
         "training": {
             "from_scratch": args.from_scratch,
-            "train_backbone": args.train_backbone,
+            "train_backbone_after": args.train_backbone_after,
             "epochs": args.epochs,
             "max_train_steps": args.max_train_steps,
             "max_val_steps": args.max_val_steps,
@@ -951,6 +948,7 @@ def main() -> None:
         hypothesis_mask: Array,
         labels_in: Array,
         key: Array,
+        train_backbone: bool,
     ) -> tuple[SnliBundle, MuonWithAdamWFallbackState, Array, Array]:
         """Run one fine-tuning step.
 
@@ -962,6 +960,7 @@ def main() -> None:
         :param hypothesis_mask: Hypothesis attention mask of shape (B, T).
         :param labels_in: Label ids of shape (B,).
         :param key: PRNG key for dropout.
+        :param train_backbone: Whether to update the backbone this step.
         :returns: Updated bundle, optimizer state, loss, and accuracy.
         """
 
@@ -973,18 +972,19 @@ def main() -> None:
             """
             model_inner = bundle_inner.model
             classifier_inner = bundle_inner.classifier
-            model_train = args.train_backbone
             if key is None:
                 premise_key = None
                 hypothesis_key = None
                 head_key = None
             else:
                 premise_key, hypothesis_key, head_key = jax.random.split(key, 3)
-            pooled_p = model_inner(premise_tokens, premise_mask, train=model_train, key=premise_key)
-            pooled_h = model_inner(
-                hypothesis_tokens, hypothesis_mask, train=model_train, key=hypothesis_key
+            pooled_p = model_inner(
+                premise_tokens, premise_mask, train=train_backbone, key=premise_key
             )
-            if args.train_backbone is False:
+            pooled_h = model_inner(
+                hypothesis_tokens, hypothesis_mask, train=train_backbone, key=hypothesis_key
+            )
+            if train_backbone is False:
                 pooled_p = jax.lax.stop_gradient(pooled_p)
                 pooled_h = jax.lax.stop_gradient(pooled_h)
             logits = classifier_inner(pooled_p, pooled_h, train=True, key=head_key)
@@ -1000,7 +1000,7 @@ def main() -> None:
         grads = jax.lax.pmean(grads, axis_name="data")
         params_inner = eqx.filter(bundle_in, eqx.is_array)
         updates, new_state = optimizer.update(grads, state_in, params_inner)
-        if args.train_backbone is False:
+        if train_backbone is False:
             updates = jax.tree_util.tree_map(
                 lambda update, flag: update if flag else None,
                 updates,
@@ -1110,6 +1110,12 @@ def main() -> None:
                 step_key = jax.random.fold_in(base_key, global_step)
                 device_keys = jax.random.split(step_key, num_devices)
                 device_keys = jax.device_put(device_keys, device=data_sharding)
+                if args.train_backbone_after is None:
+                    train_backbone = False
+                elif args.train_backbone_after <= 0:
+                    train_backbone = True
+                else:
+                    train_backbone = global_step >= args.train_backbone_after
 
                 bundle_repl, opt_state_repl, loss, acc = train_step_pmap(
                     bundle_repl,
@@ -1120,6 +1126,7 @@ def main() -> None:
                     hypothesis_mask,
                     labels,
                     device_keys,
+                    train_backbone,
                 )
                 if args.profile:
                     jax.block_until_ready(loss)
