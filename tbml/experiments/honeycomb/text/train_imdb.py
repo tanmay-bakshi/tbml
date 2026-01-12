@@ -609,7 +609,7 @@ def main() -> None:
         if checkpoint_dtype is None or isinstance(checkpoint_dtype, str) is False:
             raise ValueError("checkpoint training config missing dtype")
         dtype = _dtype_from_name(checkpoint_dtype)
-    dtype_name = dtype.name
+    dtype_name = jnp.dtype(dtype).name
 
     betas = _parse_betas(args.adamw_betas)
     run_dir = _build_run_dir(args.runs_folder)
