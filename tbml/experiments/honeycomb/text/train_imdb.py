@@ -35,15 +35,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--runs-folder", type=str, required=True)
     parser.add_argument("--data-folder", type=str, default="misc/imdb")
-    parser.add_argument("--split", type=str, default="train", choices=["train", "test"])
     parser.add_argument("--text-field", type=str, default="text")
     parser.add_argument("--label-field", type=str, default="label")
     parser.add_argument("--from-scratch", action="store_true")
     parser.add_argument("--train-backbone", dest="train_backbone", action="store_true")
     parser.add_argument("--freeze-backbone", dest="train_backbone", action="store_false")
+    parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--max-train-steps", type=int, default=0)
+    parser.add_argument("--max-val-steps", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=1)
-    parser.add_argument("--checkpoint-every", type=int, default=1000)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-warmup-steps", type=int, default=1)
     parser.add_argument("--per-device-batch-size", type=int, default=32)
@@ -421,8 +421,15 @@ class ImdbDataset:
         self._seed = seed
         self._shuffle = shuffle
 
+    def __len__(self) -> int:
+        """Return number of samples.
+
+        :returns: Number of samples in the dataset.
+        """
+        return len(self._tokens)
+
     def iter_batches(self, batch_size: int) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        """Iterate over padded batches.
+        """Iterate over padded batches endlessly.
 
         :param batch_size: Batch size per host.
         :returns: Iterator yielding (tokens, attention_mask, labels).
@@ -456,28 +463,65 @@ class ImdbDataset:
 
 
 def _iter_batches(
-    dataset: ImdbDataset,
+    iterator: Iterable[tuple[np.ndarray, np.ndarray, np.ndarray]],
     *,
     batch_size: int,
     max_seq_len: int,
     num_devices: int,
     per_device_batch: int,
 ) -> Iterable[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-    """Yield device-sharded batches from the IMDB dataset.
+    """Yield device-sharded batches from a host iterator.
 
-    :param dataset: IMDB dataset instance.
+    :param iterator: Host iterator yielding (tokens, mask, labels).
     :param batch_size: Global batch size.
     :param max_seq_len: Maximum sequence length.
     :param num_devices: Number of devices.
     :param per_device_batch: Batch size per device.
     :returns: Iterable of sharded (tokens, attention_mask, labels) batches.
     """
-    host_iter = dataset.iter_batches(batch_size)
-    for tokens, mask, labels in host_iter:
+    for tokens, mask, labels in iterator:
         tokens = tokens.reshape((num_devices, per_device_batch, max_seq_len))
         mask = mask.reshape((num_devices, per_device_batch, max_seq_len))
         labels = labels.reshape((num_devices, per_device_batch))
         yield tokens, mask, labels
+
+
+def _iter_epoch_batches(
+    dataset: ImdbDataset,
+    *,
+    batch_size: int,
+    rng: np.random.Generator,
+    shuffle: bool,
+) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Iterate over a single epoch of batches.
+
+    :param dataset: IMDB dataset instance.
+    :param batch_size: Batch size per host.
+    :param rng: Random generator for shuffling.
+    :param shuffle: Whether to shuffle the dataset order.
+    :returns: Iterator yielding (tokens, attention_mask, labels).
+    """
+    num_samples = len(dataset._tokens)
+    if num_samples <= 0:
+        raise ValueError("dataset is empty")
+    indices = np.arange(num_samples)
+    if shuffle is True:
+        rng.shuffle(indices)
+    for start in range(0, num_samples, batch_size):
+        batch_idx = indices[start : start + batch_size]
+        if batch_idx.shape[0] < batch_size:
+            continue
+        tokens = np.full((batch_size, dataset._max_seq_len), dataset._pad_id, dtype=np.int32)
+        attention_mask = np.zeros((batch_size, dataset._max_seq_len), dtype=np.bool_)
+        labels = np.empty((batch_size,), dtype=np.int32)
+        for row, idx in enumerate(batch_idx):
+            sample = dataset._tokens[int(idx)]
+            length = min(len(sample), dataset._max_seq_len)
+            if length > 0:
+                tokens[row, :length] = np.asarray(sample[:length], dtype=np.int32)
+                attention_mask[row, :length] = True
+            labels[row] = int(dataset._labels[int(idx)])
+        yield tokens, attention_mask, labels
 
 
 class SentimentProbe(eqx.Module):
@@ -556,7 +600,7 @@ class SentimentBundle(eqx.Module):
 
 def _save_checkpoint(
     run_dir: str,
-    step: int,
+    epoch: int,
     bundle: SentimentBundle,
     opt_state: eqx.Module,
     metadata: dict[str, object],
@@ -564,12 +608,12 @@ def _save_checkpoint(
     """Save model, classifier, optimizer, and metadata to disk.
 
     :param run_dir: Run directory path.
-    :param step: Global step index.
+    :param epoch: Epoch index.
     :param bundle: Training bundle to serialize.
     :param opt_state: Optimizer state to serialize.
     :param metadata: Metadata to persist.
     """
-    ckpt_dir = os.path.join(run_dir, f"checkpoint_step_{step:08d}")
+    ckpt_dir = os.path.join(run_dir, f"checkpoint_epoch_{epoch:04d}")
     os.makedirs(ckpt_dir, exist_ok=False)
     eqx.tree_serialise_leaves(os.path.join(ckpt_dir, "bundle.eqx"), bundle)
     eqx.tree_serialise_leaves(os.path.join(ckpt_dir, "optimizer.eqx"), opt_state)
@@ -583,10 +627,12 @@ def main() -> None:
 
     if args.max_train_steps < 0:
         raise ValueError("max-train-steps must be >= 0")
+    if args.max_val_steps < 0:
+        raise ValueError("max-val-steps must be >= 0")
+    if args.epochs <= 0:
+        raise ValueError("epochs must be > 0")
     if args.log_every <= 0:
         raise ValueError("log-every must be > 0")
-    if args.checkpoint_every <= 0:
-        raise ValueError("checkpoint-every must be > 0")
     if args.profile_warmup_steps < 0:
         raise ValueError("profile-warmup-steps must be >= 0")
 
@@ -645,15 +691,21 @@ def main() -> None:
     num_devices = len(device_list)
     _mesh, data_sharding, _replicated_sharding = _build_sharding(device_list)
 
-    texts, labels = _load_imdb_table(
+    train_texts, train_labels = _load_imdb_table(
         args.data_folder,
-        split=args.split,
+        split="train",
         text_field=args.text_field,
         label_field=args.label_field,
     )
-    dataset = ImdbDataset(
-        texts,
-        labels,
+    val_texts, val_labels = _load_imdb_table(
+        args.data_folder,
+        split="test",
+        text_field=args.text_field,
+        label_field=args.label_field,
+    )
+    train_dataset = ImdbDataset(
+        train_texts,
+        train_labels,
         tokenizer_name=tokenizer_name,
         eos_token=eos_token,
         pad_token=pad_token,
@@ -661,6 +713,17 @@ def main() -> None:
         max_seq_len=max_seq_len,
         seed=args.seed,
         shuffle=args.shuffle,
+    )
+    val_dataset = ImdbDataset(
+        val_texts,
+        val_labels,
+        tokenizer_name=tokenizer_name,
+        eos_token=eos_token,
+        pad_token=pad_token,
+        mask_token=mask_token,
+        max_seq_len=max_seq_len,
+        seed=args.seed,
+        shuffle=False,
     )
 
     base_key = jax.random.PRNGKey(args.seed)
@@ -747,7 +810,8 @@ def main() -> None:
         "model": model_config.model_dump(),
         "data": {
             "folder": args.data_folder,
-            "split": args.split,
+            "train_split": "train",
+            "val_split": "test",
             "text_field": args.text_field,
             "label_field": args.label_field,
             "tokenizer": tokenizer_name,
@@ -772,13 +836,14 @@ def main() -> None:
         "training": {
             "from_scratch": args.from_scratch,
             "train_backbone": args.train_backbone,
+            "epochs": args.epochs,
             "max_train_steps": args.max_train_steps,
+            "max_val_steps": args.max_val_steps,
             "per_device_batch_size": args.per_device_batch_size,
             "num_devices": num_devices,
             "seed": args.seed,
             "dtype": dtype_name,
             "log_every": args.log_every,
-            "checkpoint_every": args.checkpoint_every,
             "profile": args.profile,
             "profile_warmup_steps": args.profile_warmup_steps,
             "shuffle": args.shuffle,
@@ -854,6 +919,38 @@ def main() -> None:
         donate="all",
     )  # type: ignore[call-overload]
 
+    def val_step(
+        bundle_in: SentimentBundle,
+        batch_tokens: Array,
+        batch_mask: Array,
+        labels_in: Array,
+    ) -> tuple[Array, Array]:
+        """Run one validation step.
+
+        :param bundle_in: Replicated training bundle.
+        :param batch_tokens: Token batch of shape (B, T).
+        :param batch_mask: Attention mask of shape (B, T).
+        :param labels_in: Label ids of shape (B,).
+        :returns: Loss and accuracy.
+        """
+        pooled = bundle_in.model(batch_tokens, batch_mask, train=False, key=None)
+        logits = bundle_in.classifier(pooled)
+        log_probs = jax.nn.log_softmax(logits, axis=-1)
+        labels_b = labels_in.astype(jnp.int32)
+        nll = -jnp.take_along_axis(log_probs, labels_b[:, None], axis=-1).squeeze(-1)
+        loss = jnp.mean(nll)
+        preds = jnp.argmax(logits, axis=-1)
+        acc = jnp.mean(preds == labels_b)
+        loss = jax.lax.pmean(loss, axis_name="data")
+        acc = jax.lax.pmean(acc, axis_name="data")
+        return loss, acc
+
+    val_step_pmap = eqx.filter_pmap(
+        val_step,
+        axis_name="data",
+        devices=device_list,
+    )  # type: ignore[call-overload]
+
     params_repl = _replicate_tree(params, num_devices)
     params_repl = jax.device_put(params_repl, device=data_sharding)
     bundle_repl = eqx.combine(params_repl, static)
@@ -861,7 +958,19 @@ def main() -> None:
     opt_state_repl = jax.device_put(opt_state_repl, device=data_sharding)
 
     global_batch = args.per_device_batch_size * num_devices
+    train_steps = len(train_dataset) // global_batch
+    val_steps = len(val_dataset) // global_batch
+    if train_steps <= 0:
+        raise ValueError("train dataset too small for the given batch size")
+    if val_steps <= 0:
+        raise ValueError("val dataset too small for the given batch size")
+    if args.max_train_steps > 0:
+        train_steps = min(train_steps, args.max_train_steps)
+    if args.max_val_steps > 0:
+        val_steps = min(val_steps, args.max_val_steps)
+
     global_step = 0
+    val_global_step = 0
     perf_steps = 0
     perf_data_time = 0.0
     perf_compute_time = 0.0
@@ -870,97 +979,136 @@ def main() -> None:
     last_loss_val = 0.0
     last_acc_val = 0.0
 
-    train_iter_host = _iter_batches(
-        dataset,
-        batch_size=global_batch,
-        max_seq_len=max_seq_len,
-        num_devices=num_devices,
-        per_device_batch=args.per_device_batch_size,
-    )
-    train_iter = _prefetch_to_device(train_iter_host, size=args.prefetch, sharding=data_sharding)
-    train_iter = iter(train_iter)
+    for epoch in range(1, args.epochs + 1):
+        rng = np.random.default_rng(args.seed + epoch)
+        train_iter_host = _iter_epoch_batches(
+            train_dataset,
+            batch_size=global_batch,
+            rng=rng,
+            shuffle=args.shuffle,
+        )
+        train_iter_host = _iter_batches(
+            train_iter_host,
+            batch_size=global_batch,
+            max_seq_len=max_seq_len,
+            num_devices=num_devices,
+            per_device_batch=args.per_device_batch_size,
+        )
+        train_iter = _prefetch_to_device(train_iter_host, size=args.prefetch, sharding=data_sharding)
+        train_iter = iter(train_iter)
 
-    total_steps = args.max_train_steps if args.max_train_steps > 0 else None
-    with tqdm(total=total_steps, desc="Train IMDB") as pbar:
-        while True:
-            if args.max_train_steps > 0 and global_step >= args.max_train_steps:
-                break
-            step_start = time.perf_counter()
-            batch_tokens, batch_mask, batch_labels = next(train_iter)
-            data_done = time.perf_counter()
-            step_key = jax.random.fold_in(base_key, global_step)
-            device_keys = jax.random.split(step_key, num_devices)
-            device_keys = jax.device_put(device_keys, device=data_sharding)
+        with tqdm(total=train_steps, desc=f"Train {epoch}/{args.epochs}") as pbar:
+            for _ in range(train_steps):
+                step_start = time.perf_counter()
+                batch_tokens, batch_mask, batch_labels = next(train_iter)
+                data_done = time.perf_counter()
+                step_key = jax.random.fold_in(base_key, global_step)
+                device_keys = jax.random.split(step_key, num_devices)
+                device_keys = jax.device_put(device_keys, device=data_sharding)
 
-            bundle_repl, opt_state_repl, loss, acc = train_step_pmap(
-                bundle_repl,
-                opt_state_repl,
-                batch_tokens,
-                batch_mask,
-                batch_labels,
-                device_keys,
-            )
-            if args.profile:
-                jax.block_until_ready(loss)
-            compute_done = time.perf_counter()
+                bundle_repl, opt_state_repl, loss, acc = train_step_pmap(
+                    bundle_repl,
+                    opt_state_repl,
+                    batch_tokens,
+                    batch_mask,
+                    batch_labels,
+                    device_keys,
+                )
+                if args.profile:
+                    jax.block_until_ready(loss)
+                compute_done = time.perf_counter()
 
-            log_this_step = (global_step % args.log_every) == 0
-            if log_this_step:
+                log_this_step = (global_step % args.log_every) == 0
+                if log_this_step:
+                    loss_val = float(np.mean(jax.device_get(loss)))
+                    acc_val = float(np.mean(jax.device_get(acc)))
+                    last_loss_val = loss_val
+                    last_acc_val = acc_val
+                    writer.add_scalar("train/loss", loss_val, global_step)
+                    writer.add_scalar("train/accuracy", acc_val, global_step)
+
+                if log_this_step:
+                    pbar.set_postfix(
+                        loss=f"{last_loss_val:.4f}",
+                        acc=f"{last_acc_val:.4f}",
+                    )
+                pbar.update(1)
+                global_step += 1
+                log_done = time.perf_counter()
+
+                if args.profile:
+                    if perf_steps + perf_warmup < global_step:
+                        perf_steps += 1
+                        perf_data_time += data_done - step_start
+                        perf_compute_time += compute_done - data_done
+                        perf_log_time += log_done - compute_done
+
+        val_rng = np.random.default_rng(args.seed + epoch)
+        val_iter_host = _iter_epoch_batches(
+            val_dataset,
+            batch_size=global_batch,
+            rng=val_rng,
+            shuffle=False,
+        )
+        val_iter_host = _iter_batches(
+            val_iter_host,
+            batch_size=global_batch,
+            max_seq_len=max_seq_len,
+            num_devices=num_devices,
+            per_device_batch=args.per_device_batch_size,
+        )
+        val_iter = _prefetch_to_device(val_iter_host, size=args.prefetch, sharding=data_sharding)
+        val_iter = iter(val_iter)
+
+        with tqdm(total=val_steps, desc=f"Val {epoch}/{args.epochs}") as pbar:
+            for _ in range(val_steps):
+                batch_tokens, batch_mask, batch_labels = next(val_iter)
+                loss, acc = val_step_pmap(
+                    bundle_repl,
+                    batch_tokens,
+                    batch_mask,
+                    batch_labels,
+                )
                 loss_val = float(np.mean(jax.device_get(loss)))
                 acc_val = float(np.mean(jax.device_get(acc)))
-                last_loss_val = loss_val
-                last_acc_val = acc_val
-                writer.add_scalar("train/loss", loss_val, global_step)
-                writer.add_scalar("train/accuracy", acc_val, global_step)
+                writer.add_scalar("val/loss", loss_val, val_global_step)
+                writer.add_scalar("val/accuracy", acc_val, val_global_step)
+                pbar.set_postfix(loss=f"{loss_val:.4f}", acc=f"{acc_val:.4f}")
+                pbar.update(1)
+                val_global_step += 1
 
-            if log_this_step:
-                pbar.set_postfix(
-                    loss=f"{last_loss_val:.4f}",
-                    acc=f"{last_acc_val:.4f}",
+        bundle_host = cast(SentimentBundle, _unreplicate(bundle_repl))
+        bundle_host = cast(SentimentBundle, _to_host(bundle_host))
+        opt_state_host = cast(MuonWithAdamWFallbackState, _unreplicate(opt_state_repl))
+        metadata = {
+            "epoch": epoch,
+            "global_step": global_step,
+            "val_global_step": val_global_step,
+            "config": run_config,
+        }
+        _save_checkpoint(run_dir, epoch, bundle_host, opt_state_host, metadata)
+        writer.flush()
+        if args.profile and perf_steps > 0:
+            total_time = perf_data_time + perf_compute_time + perf_log_time
+            if total_time > 0.0:
+                step_time = total_time / perf_steps
+                steps_per_sec = perf_steps / total_time
+                data_pct = 100.0 * perf_data_time / total_time
+                compute_pct = 100.0 * perf_compute_time / total_time
+                log_pct = 100.0 * perf_log_time / total_time
+                print(
+                    "Perf summary (train): "
+                    f"steps={perf_steps}, "
+                    f"step_time={step_time:.4f}s, "
+                    f"steps_per_sec={steps_per_sec:.2f}, "
+                    f"data={data_pct:.1f}%, "
+                    f"compute={compute_pct:.1f}%, "
+                    f"log={log_pct:.1f}%"
                 )
-            pbar.update(1)
-            global_step += 1
-            log_done = time.perf_counter()
-
-            if args.profile:
-                if perf_steps + perf_warmup < global_step:
-                    perf_steps += 1
-                    perf_data_time += data_done - step_start
-                    perf_compute_time += compute_done - data_done
-                    perf_log_time += log_done - compute_done
-
-            if global_step % args.checkpoint_every == 0:
-                jax.block_until_ready(loss)
-                bundle_host = cast(SentimentBundle, _unreplicate(bundle_repl))
-                bundle_host = cast(SentimentBundle, _to_host(bundle_host))
-                opt_state_host = cast(MuonWithAdamWFallbackState, _unreplicate(opt_state_repl))
-                metadata = {
-                    "global_step": global_step,
-                    "config": run_config,
-                }
-                _save_checkpoint(run_dir, global_step, bundle_host, opt_state_host, metadata)
-                writer.flush()
-                if args.profile and perf_steps > 0:
-                    total_time = perf_data_time + perf_compute_time + perf_log_time
-                    if total_time > 0.0:
-                        step_time = total_time / perf_steps
-                        steps_per_sec = perf_steps / total_time
-                        data_pct = 100.0 * perf_data_time / total_time
-                        compute_pct = 100.0 * perf_compute_time / total_time
-                        log_pct = 100.0 * perf_log_time / total_time
-                        print(
-                            "Perf summary (train): "
-                            f"steps={perf_steps}, "
-                            f"step_time={step_time:.4f}s, "
-                            f"steps_per_sec={steps_per_sec:.2f}, "
-                            f"data={data_pct:.1f}%, "
-                            f"compute={compute_pct:.1f}%, "
-                            f"log={log_pct:.1f}%"
-                        )
-                    perf_steps = 0
-                    perf_data_time = 0.0
-                    perf_compute_time = 0.0
-                    perf_log_time = 0.0
+            perf_steps = 0
+            perf_data_time = 0.0
+            perf_compute_time = 0.0
+            perf_log_time = 0.0
 
     writer.close()
 
