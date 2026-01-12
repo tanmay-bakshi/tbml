@@ -18,9 +18,9 @@ from tensorboardX import SummaryWriter  # type: ignore[import-untyped]
 from tqdm import tqdm  # type: ignore[import-untyped]
 
 from tbml.data import TarredImagesRandomAccessDataset
-from tbml.experiments.honeycomb.dataset import LeJEPADataset
 from tbml.experiments.honeycomb.loss import lejepa_loss
-from tbml.experiments.honeycomb.model import ConViT, ConViTConfig
+from tbml.experiments.honeycomb.vision.dataset import LeJEPADataset
+from tbml.experiments.honeycomb.vision.model import ConViT, ConViTConfig
 from tbml.optimizers import MuonWithAdamWFallback, MuonWithAdamWFallbackState, build_muon_masks
 
 

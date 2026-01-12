@@ -384,17 +384,28 @@ class PoPESelfAttention(eqx.Module):
         self.resid_dropout_layer = eqx.nn.Dropout(resid_dropout)
         self.delta = jnp.zeros((n_heads, head_dim), dtype=param_dtype)
 
-    def __call__(self, x: Array, *, train: bool, key: Array | None) -> Array:
+    def __call__(
+        self,
+        x: Array,
+        *,
+        train: bool,
+        key: Array | None,
+        attention_mask: Array | None = None,
+    ) -> Array:
         """Compute PoPE self-attention.
 
         :param x: Input tensor of shape (B, T, d_model).
         :param train: Whether to enable dropout.
         :param key: PRNG key for dropout.
+        :param attention_mask: Optional mask of shape (B, T) for valid tokens.
         :returns: Output tensor of shape (B, T, d_model).
         :raises ValueError: If dropout is enabled without a PRNG key.
         """
         if train is True and (self.attn_dropout > 0.0 or self.resid_dropout > 0.0) and key is None:
             raise ValueError("dropout key must be provided when training with dropout")
+        if attention_mask is not None:
+            if attention_mask.ndim != 2:
+                raise ValueError("attention_mask must have shape (B, T)")
 
         bsz, seqlen, _ = x.shape
         head_dim = self.d_model // self.n_heads
@@ -439,6 +450,9 @@ class PoPESelfAttention(eqx.Module):
         if self.is_causal is True:
             mask = jnp.triu(jnp.ones((seqlen, seqlen), dtype=bool), k=1)
             att = jnp.where(mask[None, None, :, :], -jnp.inf, att)
+        if attention_mask is not None:
+            mask = attention_mask.astype(bool)
+            att = jnp.where(mask[:, None, None, :], att, -jnp.inf)
 
         att = jax.nn.softmax(att, axis=-1)
         if self.attn_dropout > 0.0 and key is not None:
@@ -446,6 +460,9 @@ class PoPESelfAttention(eqx.Module):
             att = self.attn_dropout_layer(att, key=attn_key, inference=train is False)
 
         y = jnp.matmul(att, vf).astype(q.dtype)
+        if attention_mask is not None:
+            mask = attention_mask.astype(y.dtype)
+            y = y * mask[:, None, :, None]
         y = y.transpose((0, 2, 1, 3)).reshape((bsz, seqlen, self.n_heads * head_dim))
         y = self.o_proj(y)
         if self.resid_dropout > 0.0 and key is not None:

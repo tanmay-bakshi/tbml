@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 from PIL import Image
 
-from tbml.experiments.honeycomb.model import ConViT, ConViTConfig
+from tbml.experiments.honeycomb.vision.model import ConViT, ConViTConfig
 
 
 def _parse_args() -> argparse.Namespace:

@@ -6,6 +6,7 @@ authors = []
 requires-python = ">=3.11"
 dependencies = [
     "equinox",
+    "huggingface-hub",
     "jax",
     "jaxtyping",
     "numpy",
@@ -13,6 +14,7 @@ dependencies = [
     "pillow",
     "pydantic",
     "tensorboardX",
+    "tokenizers",
     "tqdm",
 ]
 
