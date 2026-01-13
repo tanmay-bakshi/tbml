@@ -17,7 +17,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec, Sharding
 from tensorboardX import SummaryWriter  # type: ignore[import-untyped]
 from tqdm import tqdm  # type: ignore[import-untyped]
 
-from tbml.experiments.honeycomb.loss import lejepa_loss
+from tbml.experiments.honeycomb.loss import lejepa_loss, sigreg_loss_views
 from tbml.experiments.honeycomb.text.dataset import (
     StreamingTextDataset,
     _build_tokenizer,
@@ -86,6 +86,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sigreg-slices", type=int, default=256)
     parser.add_argument("--sigreg-seed", type=int, default=0)
     parser.add_argument("--pred-loss", type=str, default="mse", choices=["mse", "cosine"])
+    parser.add_argument("--use-swa-teacher", action="store_true")
 
     parser.add_argument("--muon-lr", type=float, default=1e-3)
     parser.add_argument("--muon-momentum", type=float, default=0.95)
@@ -761,6 +762,209 @@ def _pool_representations(
     return model.final_norm(pooled)
 
 
+def _copy_model(model: TextTransformer) -> TextTransformer:
+    """Create a copy of a model PyTree.
+
+    :param model: Model to copy.
+    :returns: Model copy with distinct array leaves.
+    """
+
+    def _copy(value: object) -> object:
+        if eqx.is_array(value):
+            return jnp.array(value)
+        return value
+
+    return cast(TextTransformer, jax.tree_util.tree_map(_copy, model))
+
+
+def _swa_update(
+    teacher: TextTransformer,
+    student: TextTransformer,
+    count: Array,
+) -> tuple[TextTransformer, Array]:
+    """Update SWA teacher parameters from the student model.
+
+    :param teacher: Current teacher model.
+    :param student: Current student model.
+    :param count: Number of models averaged so far.
+    :returns: Updated teacher and updated count.
+    """
+    if count.ndim != 0:
+        raise ValueError("swa count must be a scalar")
+    count_f = count.astype(jnp.float32)
+
+    def _merge(teacher_leaf: object, student_leaf: object) -> object:
+        if eqx.is_array(teacher_leaf) and eqx.is_array(student_leaf):
+            teacher_f32 = teacher_leaf.astype(jnp.float32)
+            student_f32 = student_leaf.astype(jnp.float32)
+            averaged = (teacher_f32 * count_f + student_f32) / (count_f + 1.0)
+            return averaged.astype(teacher_leaf.dtype)
+        return teacher_leaf
+
+    new_teacher = jax.tree_util.tree_map(_merge, teacher, student)
+    new_count = count_f + 1.0
+    return cast(TextTransformer, new_teacher), new_count
+
+
+def _pred_loss_from_centers(
+    embeddings: Array,
+    centers: Array,
+    pred_loss_type: str,
+) -> Array:
+    """Compute prediction loss against provided centers.
+
+    :param embeddings: Embeddings of shape (B, V, K).
+    :param centers: Center embeddings of shape (B, K).
+    :param pred_loss_type: Prediction loss type ("mse" or "cosine").
+    :returns: Scalar prediction loss.
+    """
+    if embeddings.ndim != 3:
+        raise ValueError("embeddings must have shape (B, V, K)")
+    if centers.ndim != 2:
+        raise ValueError("centers must have shape (B, K)")
+    if embeddings.shape[0] != centers.shape[0]:
+        raise ValueError("centers batch size must match embeddings")
+    if embeddings.shape[-1] != centers.shape[-1]:
+        raise ValueError("centers feature dim must match embeddings")
+    if pred_loss_type not in ("mse", "cosine"):
+        raise ValueError("pred_loss_type must be 'mse' or 'cosine'")
+
+    if pred_loss_type == "mse":
+        diffs = embeddings - centers[:, None, :]
+        return jnp.mean(jnp.square(diffs))
+    eps = jnp.asarray(1e-8, dtype=embeddings.dtype)
+    emb_norm = embeddings / (jnp.linalg.norm(embeddings, axis=-1, keepdims=True) + eps)
+    ctr_norm = centers / (jnp.linalg.norm(centers, axis=-1, keepdims=True) + eps)
+    cos_sim = jnp.sum(emb_norm * ctr_norm[:, None, :], axis=-1)
+    return jnp.mean(1.0 - cos_sim)
+
+
+def _lejepa_loss_with_centers(
+    embeddings: Array,
+    centers: Array,
+    *,
+    sigreg_weight: float,
+    pred_loss_type: str,
+    global_step: Array,
+    num_slices: int,
+    seed: int,
+    axis_name: str | None,
+) -> tuple[Array, Array, Array]:
+    """Compute LeJEPA loss with externally provided centers.
+
+    :param embeddings: Embeddings of shape (B, V, K).
+    :param centers: Center embeddings of shape (B, K).
+    :param sigreg_weight: Weight for the SIGReg term.
+    :param pred_loss_type: Prediction loss type ("mse" or "cosine").
+    :param global_step: Global training step for SIGReg directions.
+    :param num_slices: Number of random projection directions.
+    :param seed: Random seed for SIGReg directions.
+    :param axis_name: Optional pmapped axis name for cross-device aggregation.
+    :returns: Tuple of (total loss, prediction loss, SIGReg loss).
+    """
+    if sigreg_weight < 0.0 or sigreg_weight > 1.0:
+        raise ValueError("sigreg_weight must be in [0, 1]")
+    pred_loss = _pred_loss_from_centers(embeddings, centers, pred_loss_type)
+    sigreg = sigreg_loss_views(
+        embeddings,
+        global_step=global_step,
+        num_slices=num_slices,
+        seed=seed,
+        axis_name=axis_name,
+    )
+    total = (1.0 - sigreg_weight) * pred_loss + sigreg_weight * sigreg
+    return total, pred_loss, sigreg
+
+
+def _build_views(
+    tokens: Array,
+    key: Array,
+    *,
+    num_global_views: int,
+    num_local_views: int,
+    global_mask_min: float,
+    global_mask_max: float,
+    local_mask_min: float,
+    local_mask_max: float,
+    masking_mode: str,
+    mask_id: int,
+    pad_id: int,
+    eos_id: int,
+) -> tuple[Array, Array, Array, Array, Array, Array, Array]:
+    """Build masked views for global and local crops.
+
+    :param tokens: Token ids of shape (B, T).
+    :param key: PRNG key.
+    :param num_global_views: Number of global views.
+    :param num_local_views: Number of local views.
+    :param global_mask_min: Minimum global masking ratio.
+    :param global_mask_max: Maximum global masking ratio.
+    :param local_mask_min: Minimum local masking ratio.
+    :param local_mask_max: Maximum local masking ratio.
+    :param masking_mode: Masking mode ("tokens" or "spans").
+    :param mask_id: Masking token id.
+    :param pad_id: Padding token id.
+    :param eos_id: EOS token id.
+    :returns: Tuple of (model key, global views, global masks, global attn, local views, local masks, local attn).
+    """
+    model_key, global_key, local_key = jax.random.split(key, 3)
+    global_views, global_masks, global_attn = _mask_views(
+        tokens,
+        global_key,
+        num_views=num_global_views,
+        min_ratio=global_mask_min,
+        max_ratio=global_mask_max,
+        masking_mode=masking_mode,
+        mask_id=mask_id,
+        pad_id=pad_id,
+        eos_id=eos_id,
+    )
+    local_views, local_masks, local_attn = _mask_views(
+        tokens,
+        local_key,
+        num_views=num_local_views,
+        min_ratio=local_mask_min,
+        max_ratio=local_mask_max,
+        masking_mode=masking_mode,
+        mask_id=mask_id,
+        pad_id=pad_id,
+        eos_id=eos_id,
+    )
+    return (
+        model_key,
+        global_views,
+        global_masks,
+        global_attn,
+        local_views,
+        local_masks,
+        local_attn,
+    )
+
+
+def _combine_views(
+    global_views: Array,
+    global_masks: Array,
+    global_attn: Array,
+    local_views: Array,
+    local_masks: Array,
+    local_attn: Array,
+) -> tuple[Array, Array, Array]:
+    """Combine global and local views into a single view batch.
+
+    :param global_views: Global view tokens.
+    :param global_masks: Global view mask positions.
+    :param global_attn: Global view attention masks.
+    :param local_views: Local view tokens.
+    :param local_masks: Local view mask positions.
+    :param local_attn: Local view attention masks.
+    :returns: Tuple of (views, mask positions, attention masks).
+    """
+    views = jnp.concatenate([global_views, local_views], axis=1)
+    mask_positions = jnp.concatenate([global_masks, local_masks], axis=1)
+    view_attn = jnp.concatenate([global_attn, local_attn], axis=1)
+    return views, mask_positions, view_attn
+
+
 def _encode_views(
     model: TextTransformer,
     tokens: Array,
@@ -803,53 +1007,144 @@ def _encode_views(
     if num_global_views + num_local_views <= 0:
         raise ValueError("at least one view must be requested")
 
-    key, global_key, local_key = jax.random.split(key, 3)
-    global_views, global_masks, global_attn = _mask_views(
+    (
+        model_key,
+        global_views,
+        global_masks,
+        global_attn,
+        local_views,
+        local_masks,
+        local_attn,
+    ) = _build_views(
         tokens,
-        global_key,
-        num_views=num_global_views,
-        min_ratio=global_mask_min,
-        max_ratio=global_mask_max,
+        key,
+        num_global_views=num_global_views,
+        num_local_views=num_local_views,
+        global_mask_min=global_mask_min,
+        global_mask_max=global_mask_max,
+        local_mask_min=local_mask_min,
+        local_mask_max=local_mask_max,
         masking_mode=masking_mode,
         mask_id=mask_id,
         pad_id=pad_id,
         eos_id=eos_id,
     )
-    local_views, local_masks, local_attn = _mask_views(
-        tokens,
-        local_key,
-        num_views=num_local_views,
-        min_ratio=local_mask_min,
-        max_ratio=local_mask_max,
-        masking_mode=masking_mode,
-        mask_id=mask_id,
-        pad_id=pad_id,
-        eos_id=eos_id,
+    views, mask_positions, view_attn = _combine_views(
+        global_views,
+        global_masks,
+        global_attn,
+        local_views,
+        local_masks,
+        local_attn,
     )
-    if num_local_views > 0 and num_global_views > 0:
-        views = jnp.concatenate([global_views, local_views], axis=1)
-        mask_positions = jnp.concatenate([global_masks, local_masks], axis=1)
-        view_attn = jnp.concatenate([global_attn, local_attn], axis=1)
-    elif num_global_views > 0:
-        views = global_views
-        mask_positions = global_masks
-        view_attn = global_attn
-    else:
-        views = local_views
-        mask_positions = local_masks
-        view_attn = local_attn
 
     bsz, num_views, seq_len = views.shape
     flat_views = views.reshape((bsz * num_views, seq_len))
     flat_mask = view_attn.reshape((bsz * num_views, seq_len))
     if return_tokens is True:
-        token_reps = model.encode_tokens(flat_views, flat_mask, train=train, key=key)
+        token_reps = model.encode_tokens(flat_views, flat_mask, train=train, key=model_key)
         pooled = _pool_representations(model, token_reps, flat_mask)
         pooled = pooled.reshape((bsz, num_views, pooled.shape[-1]))
         token_reps = token_reps.reshape((bsz, num_views, seq_len, token_reps.shape[-1]))
         return pooled, token_reps, mask_positions
-    pooled = model(flat_views, flat_mask, train=train, key=key)
+    pooled = model(flat_views, flat_mask, train=train, key=model_key)
     return pooled.reshape((bsz, num_views, pooled.shape[-1])), None, None
+
+
+def _encode_views_with_teacher(
+    model: TextTransformer,
+    teacher: TextTransformer,
+    tokens: Array,
+    attention_mask: Array,
+    *,
+    train: bool,
+    key: Array,
+    num_global_views: int,
+    num_local_views: int,
+    global_mask_min: float,
+    global_mask_max: float,
+    local_mask_min: float,
+    local_mask_max: float,
+    masking_mode: str,
+    mask_id: int,
+    pad_id: int,
+    eos_id: int,
+    return_tokens: bool = False,
+) -> tuple[Array, Array, Array | None, Array | None]:
+    """Encode masked views and compute teacher centers.
+
+    :param model: Text transformer encoder.
+    :param teacher: SWA teacher encoder.
+    :param tokens: Token ids of shape (B, T).
+    :param attention_mask: Attention mask of shape (B, T).
+    :param train: Whether to enable dropout.
+    :param key: PRNG key.
+    :param num_global_views: Number of global views.
+    :param num_local_views: Number of local views.
+    :param global_mask_min: Minimum global masking ratio.
+    :param global_mask_max: Maximum global masking ratio.
+    :param local_mask_min: Minimum local masking ratio.
+    :param local_mask_max: Maximum local masking ratio.
+    :param masking_mode: Masking mode ("tokens" or "spans").
+    :param mask_id: Masking token id.
+    :param pad_id: Padding token id.
+    :param eos_id: EOS token id.
+    :param return_tokens: Whether to return token representations and masks.
+    :returns: Tuple of (pooled embeddings, centers, token reps, mask positions).
+    """
+    if num_global_views <= 0:
+        raise ValueError("num_global_views must be > 0 when using SWA teacher")
+
+    (
+        model_key,
+        global_views,
+        global_masks,
+        global_attn,
+        local_views,
+        local_masks,
+        local_attn,
+    ) = _build_views(
+        tokens,
+        key,
+        num_global_views=num_global_views,
+        num_local_views=num_local_views,
+        global_mask_min=global_mask_min,
+        global_mask_max=global_mask_max,
+        local_mask_min=local_mask_min,
+        local_mask_max=local_mask_max,
+        masking_mode=masking_mode,
+        mask_id=mask_id,
+        pad_id=pad_id,
+        eos_id=eos_id,
+    )
+    views, mask_positions, view_attn = _combine_views(
+        global_views,
+        global_masks,
+        global_attn,
+        local_views,
+        local_masks,
+        local_attn,
+    )
+
+    bsz, num_views, seq_len = views.shape
+    flat_views = views.reshape((bsz * num_views, seq_len))
+    flat_mask = view_attn.reshape((bsz * num_views, seq_len))
+    if return_tokens is True:
+        token_reps = model.encode_tokens(flat_views, flat_mask, train=train, key=model_key)
+        pooled = _pool_representations(model, token_reps, flat_mask)
+        token_reps = token_reps.reshape((bsz, num_views, seq_len, token_reps.shape[-1]))
+    else:
+        token_reps = None
+        pooled = model(flat_views, flat_mask, train=train, key=model_key)
+    pooled = pooled.reshape((bsz, num_views, pooled.shape[-1]))
+
+    global_flat = global_views.reshape((bsz * num_global_views, seq_len))
+    global_attn_flat = global_attn.reshape((bsz * num_global_views, seq_len))
+    teacher_pooled = teacher(global_flat, global_attn_flat, train=False, key=None)
+    teacher_pooled = jax.lax.stop_gradient(teacher_pooled)
+    centers = teacher_pooled.reshape((bsz, num_global_views, teacher_pooled.shape[-1]))
+    centers = jnp.mean(centers, axis=1)
+    return pooled, centers, token_reps, mask_positions
 
 
 def _masked_probe_metrics(
@@ -974,6 +1269,8 @@ def main() -> None:
         raise ValueError("sigreg-weight must be in [0, 1]")
     if args.pred_loss not in ("mse", "cosine"):
         raise ValueError("pred-loss must be 'mse' or 'cosine'")
+    if args.use_swa_teacher is True and args.num_global_views <= 0:
+        raise ValueError("use-swa-teacher requires at least one global view")
     if args.full_sample_prob < 0.0 or args.token_truncate_prob < 0.0 or args.text_truncate_prob < 0.0:
         raise ValueError("sample probabilities must be >= 0")
     if args.full_sample_prob + args.token_truncate_prob + args.text_truncate_prob <= 0.0:
@@ -1134,6 +1431,7 @@ def main() -> None:
             "sigreg_slices": args.sigreg_slices,
             "sigreg_seed": args.sigreg_seed,
             "pred_loss": args.pred_loss,
+            "use_swa_teacher": args.use_swa_teacher,
         },
         "probe": {
             "masked_probe": args.masked_probe,
@@ -1180,6 +1478,11 @@ def main() -> None:
         param_dtype=dtype,
         key=model_key,
     )
+    teacher: TextTransformer | None = None
+    swa_count: Array | None = None
+    if args.use_swa_teacher is True:
+        teacher = _copy_model(model)
+        swa_count = jnp.asarray(1.0, dtype=jnp.float32)
     probe: MaskedTokenProbe | None = None
     train_bundle: TextTrainBundle | None = None
     if args.masked_probe is True:
@@ -1244,189 +1547,413 @@ def main() -> None:
     opt_state: MuonWithAdamWFallbackState = optimizer.init(params)
 
     if args.masked_probe is True:
-        def train_step(
-            bundle_in: TextTrainBundle,
-            state_in: MuonWithAdamWFallbackState,
-            batch_tokens: Array,
-            batch_mask: Array,
-            key: Array,
-            global_step: Array,
-        ) -> tuple[
-            TextTrainBundle,
-            MuonWithAdamWFallbackState,
-            Array,
-            Array,
-            Array,
-            Array,
-            Array,
-        ]:
-            """Run one training step with the masked-token probe.
+        if args.use_swa_teacher is True:
+            def train_step(
+                bundle_in: TextTrainBundle,
+                teacher_in: TextTransformer,
+                swa_count_in: Array,
+                state_in: MuonWithAdamWFallbackState,
+                batch_tokens: Array,
+                batch_mask: Array,
+                key: Array,
+                global_step: Array,
+            ) -> tuple[
+                TextTrainBundle,
+                TextTransformer,
+                Array,
+                MuonWithAdamWFallbackState,
+                Array,
+                Array,
+                Array,
+                Array,
+                Array,
+            ]:
+                """Run one training step with the masked-token probe and SWA teacher.
 
-            :param bundle_in: Replicated model and probe bundle.
-            :param state_in: Replicated optimizer state.
-            :param batch_tokens: Token batch of shape (B, T).
-            :param batch_mask: Attention mask of shape (B, T).
-            :param key: PRNG key for view masking.
-            :param global_step: Global step index for loss scheduling.
-            :returns: Updated bundle, optimizer state, and metrics.
-            """
-
-            def _loss_fn(
-                bundle_inner: TextTrainBundle,
-            ) -> tuple[Array, tuple[Array, Array, Array, Array, Array]]:
-                """Compute LeJEPA losses and probe metrics.
-
-                :param bundle_inner: Bundle containing model and probe.
-                :returns: Tuple of (total loss, (model loss, pred, sigreg, probe loss, probe acc)).
+                :param bundle_in: Replicated model and probe bundle.
+                :param teacher_in: SWA teacher model.
+                :param swa_count_in: SWA averaging count.
+                :param state_in: Replicated optimizer state.
+                :param batch_tokens: Token batch of shape (B, T).
+                :param batch_mask: Attention mask of shape (B, T).
+                :param key: PRNG key for view masking.
+                :param global_step: Global step index for loss scheduling.
+                :returns: Updated bundle, teacher, optimizer state, and metrics.
                 """
-                model_inner = bundle_inner.model
-                if bundle_inner.probe is None:
-                    raise ValueError("probe must be present when masked_probe is enabled")
-                emb, token_reps, mask_positions = _encode_views(
-                    model_inner,
-                    batch_tokens,
-                    batch_mask,
-                    train=True,
-                    key=key,
-                    num_global_views=args.num_global_views,
-                    num_local_views=args.num_local_views,
-                    global_mask_min=args.global_mask_min,
-                    global_mask_max=args.global_mask_max,
-                    local_mask_min=args.local_mask_min,
-                    local_mask_max=args.local_mask_max,
-                    masking_mode=args.masking_mode,
-                    mask_id=mask_id,
-                    pad_id=pad_id,
-                    eos_id=eos_id,
-                    return_tokens=True,
-                )
-                if token_reps is None or mask_positions is None:
-                    raise ValueError("token_reps and mask_positions must be returned for probe training")
-                model_loss, pred, sigreg = lejepa_loss(
-                    emb,
-                    args.num_global_views,
-                    sigreg_weight=args.sigreg_weight,
-                    pred_loss_type=args.pred_loss,
-                    global_step=global_step,
-                    num_slices=args.sigreg_slices,
-                    seed=args.sigreg_seed,
-                    axis_name="data",
-                )
-                probe_loss, probe_acc = _masked_probe_metrics(
-                    bundle_inner.probe,
-                    token_reps,
-                    mask_positions,
-                    batch_tokens,
-                )
-                total = model_loss + probe_loss
-                return total, (model_loss, pred, sigreg, probe_loss, probe_acc)
 
-            (
-                total_loss,
-                (loss, pred_loss, sigreg_loss, probe_loss, probe_acc),
-            ), grads = eqx.filter_value_and_grad(
-                _loss_fn, has_aux=True
-            )(bundle_in)
-            grads = jax.lax.pmean(grads, axis_name="data")
-            params_inner = eqx.filter(bundle_in, eqx.is_array)
-            updates, new_state = optimizer.update(grads, state_in, params_inner)
-            new_bundle = eqx.apply_updates(bundle_in, updates)
-            _ = total_loss
-            loss = jax.lax.pmean(loss, axis_name="data")
-            pred_loss = jax.lax.pmean(pred_loss, axis_name="data")
-            sigreg_loss = jax.lax.pmean(sigreg_loss, axis_name="data")
-            probe_loss = jax.lax.pmean(probe_loss, axis_name="data")
-            probe_acc = jax.lax.pmean(probe_acc, axis_name="data")
-            return (
-                new_bundle,
-                new_state,
-                loss,
-                pred_loss,
-                sigreg_loss,
-                probe_loss,
-                probe_acc,
-            )
+                def _loss_fn(
+                    bundle_teacher: tuple[TextTrainBundle, TextTransformer],
+                ) -> tuple[Array, tuple[Array, Array, Array, Array, Array]]:
+                    """Compute LeJEPA losses and probe metrics.
 
-        train_step_pmap = eqx.filter_pmap(
-            train_step,
-            axis_name="data",
-            devices=device_list,
-            donate="all",
-        )  # type: ignore[call-overload]
+                    :param bundle_teacher: Tuple of (bundle, teacher model).
+                    :returns: Tuple of (total loss, (model loss, pred, sigreg, probe loss, probe acc)).
+                    """
+                    bundle_inner, teacher_inner = bundle_teacher
+                    model_inner = bundle_inner.model
+                    if bundle_inner.probe is None:
+                        raise ValueError("probe must be present when masked_probe is enabled")
+                    emb, centers, token_reps, mask_positions = _encode_views_with_teacher(
+                        model_inner,
+                        teacher_inner,
+                        batch_tokens,
+                        batch_mask,
+                        train=True,
+                        key=key,
+                        num_global_views=args.num_global_views,
+                        num_local_views=args.num_local_views,
+                        global_mask_min=args.global_mask_min,
+                        global_mask_max=args.global_mask_max,
+                        local_mask_min=args.local_mask_min,
+                        local_mask_max=args.local_mask_max,
+                        masking_mode=args.masking_mode,
+                        mask_id=mask_id,
+                        pad_id=pad_id,
+                        eos_id=eos_id,
+                        return_tokens=True,
+                    )
+                    if token_reps is None or mask_positions is None:
+                        raise ValueError("token_reps and mask_positions must be returned for probe training")
+                    model_loss, pred, sigreg = _lejepa_loss_with_centers(
+                        emb,
+                        centers,
+                        sigreg_weight=args.sigreg_weight,
+                        pred_loss_type=args.pred_loss,
+                        global_step=global_step,
+                        num_slices=args.sigreg_slices,
+                        seed=args.sigreg_seed,
+                        axis_name="data",
+                    )
+                    probe_loss, probe_acc = _masked_probe_metrics(
+                        bundle_inner.probe,
+                        token_reps,
+                        mask_positions,
+                        batch_tokens,
+                    )
+                    total = model_loss + probe_loss
+                    return total, (model_loss, pred, sigreg, probe_loss, probe_acc)
+
+                (
+                    total_loss,
+                    (loss, pred_loss, sigreg_loss, probe_loss, probe_acc),
+                ), grads = eqx.filter_value_and_grad(
+                    _loss_fn, has_aux=True
+                )((bundle_in, teacher_in))
+                grads = jax.lax.pmean(grads, axis_name="data")
+                bundle_grads, _teacher_grads = grads
+                params_inner = eqx.filter(bundle_in, eqx.is_array)
+                updates, new_state = optimizer.update(bundle_grads, state_in, params_inner)
+                new_bundle = eqx.apply_updates(bundle_in, updates)
+                new_teacher, new_swa_count = _swa_update(
+                    teacher_in,
+                    new_bundle.model,
+                    swa_count_in,
+                )
+                _ = total_loss
+                loss = jax.lax.pmean(loss, axis_name="data")
+                pred_loss = jax.lax.pmean(pred_loss, axis_name="data")
+                sigreg_loss = jax.lax.pmean(sigreg_loss, axis_name="data")
+                probe_loss = jax.lax.pmean(probe_loss, axis_name="data")
+                probe_acc = jax.lax.pmean(probe_acc, axis_name="data")
+                return (
+                    new_bundle,
+                    new_teacher,
+                    new_swa_count,
+                    new_state,
+                    loss,
+                    pred_loss,
+                    sigreg_loss,
+                    probe_loss,
+                    probe_acc,
+                )
+
+            train_step_pmap = eqx.filter_pmap(
+                train_step,
+                axis_name="data",
+                devices=device_list,
+                donate="all",
+            )  # type: ignore[call-overload]
+        else:
+            def train_step(
+                bundle_in: TextTrainBundle,
+                state_in: MuonWithAdamWFallbackState,
+                batch_tokens: Array,
+                batch_mask: Array,
+                key: Array,
+                global_step: Array,
+            ) -> tuple[
+                TextTrainBundle,
+                MuonWithAdamWFallbackState,
+                Array,
+                Array,
+                Array,
+                Array,
+                Array,
+            ]:
+                """Run one training step with the masked-token probe.
+
+                :param bundle_in: Replicated model and probe bundle.
+                :param state_in: Replicated optimizer state.
+                :param batch_tokens: Token batch of shape (B, T).
+                :param batch_mask: Attention mask of shape (B, T).
+                :param key: PRNG key for view masking.
+                :param global_step: Global step index for loss scheduling.
+                :returns: Updated bundle, optimizer state, and metrics.
+                """
+
+                def _loss_fn(
+                    bundle_inner: TextTrainBundle,
+                ) -> tuple[Array, tuple[Array, Array, Array, Array, Array]]:
+                    """Compute LeJEPA losses and probe metrics.
+
+                    :param bundle_inner: Bundle containing model and probe.
+                    :returns: Tuple of (total loss, (model loss, pred, sigreg, probe loss, probe acc)).
+                    """
+                    model_inner = bundle_inner.model
+                    if bundle_inner.probe is None:
+                        raise ValueError("probe must be present when masked_probe is enabled")
+                    emb, token_reps, mask_positions = _encode_views(
+                        model_inner,
+                        batch_tokens,
+                        batch_mask,
+                        train=True,
+                        key=key,
+                        num_global_views=args.num_global_views,
+                        num_local_views=args.num_local_views,
+                        global_mask_min=args.global_mask_min,
+                        global_mask_max=args.global_mask_max,
+                        local_mask_min=args.local_mask_min,
+                        local_mask_max=args.local_mask_max,
+                        masking_mode=args.masking_mode,
+                        mask_id=mask_id,
+                        pad_id=pad_id,
+                        eos_id=eos_id,
+                        return_tokens=True,
+                    )
+                    if token_reps is None or mask_positions is None:
+                        raise ValueError("token_reps and mask_positions must be returned for probe training")
+                    model_loss, pred, sigreg = lejepa_loss(
+                        emb,
+                        args.num_global_views,
+                        sigreg_weight=args.sigreg_weight,
+                        pred_loss_type=args.pred_loss,
+                        global_step=global_step,
+                        num_slices=args.sigreg_slices,
+                        seed=args.sigreg_seed,
+                        axis_name="data",
+                    )
+                    probe_loss, probe_acc = _masked_probe_metrics(
+                        bundle_inner.probe,
+                        token_reps,
+                        mask_positions,
+                        batch_tokens,
+                    )
+                    total = model_loss + probe_loss
+                    return total, (model_loss, pred, sigreg, probe_loss, probe_acc)
+
+                (
+                    total_loss,
+                    (loss, pred_loss, sigreg_loss, probe_loss, probe_acc),
+                ), grads = eqx.filter_value_and_grad(
+                    _loss_fn, has_aux=True
+                )(bundle_in)
+                grads = jax.lax.pmean(grads, axis_name="data")
+                params_inner = eqx.filter(bundle_in, eqx.is_array)
+                updates, new_state = optimizer.update(grads, state_in, params_inner)
+                new_bundle = eqx.apply_updates(bundle_in, updates)
+                _ = total_loss
+                loss = jax.lax.pmean(loss, axis_name="data")
+                pred_loss = jax.lax.pmean(pred_loss, axis_name="data")
+                sigreg_loss = jax.lax.pmean(sigreg_loss, axis_name="data")
+                probe_loss = jax.lax.pmean(probe_loss, axis_name="data")
+                probe_acc = jax.lax.pmean(probe_acc, axis_name="data")
+                return (
+                    new_bundle,
+                    new_state,
+                    loss,
+                    pred_loss,
+                    sigreg_loss,
+                    probe_loss,
+                    probe_acc,
+                )
+
+            train_step_pmap = eqx.filter_pmap(
+                train_step,
+                axis_name="data",
+                devices=device_list,
+                donate="all",
+            )  # type: ignore[call-overload]
     else:
-        def train_step(
-            model_in: TextTransformer,
-            state_in: MuonWithAdamWFallbackState,
-            batch_tokens: Array,
-            batch_mask: Array,
-            key: Array,
-            global_step: Array,
-        ) -> tuple[TextTransformer, MuonWithAdamWFallbackState, Array, Array, Array]:
-            """Run one training step.
+        if args.use_swa_teacher is True:
+            def train_step(
+                model_in: TextTransformer,
+                teacher_in: TextTransformer,
+                swa_count_in: Array,
+                state_in: MuonWithAdamWFallbackState,
+                batch_tokens: Array,
+                batch_mask: Array,
+                key: Array,
+                global_step: Array,
+            ) -> tuple[
+                TextTransformer,
+                TextTransformer,
+                Array,
+                MuonWithAdamWFallbackState,
+                Array,
+                Array,
+                Array,
+            ]:
+                """Run one training step with an SWA teacher.
 
-            :param model_in: Replicated model.
-            :param state_in: Replicated optimizer state.
-            :param batch_tokens: Token batch of shape (B, T).
-            :param batch_mask: Attention mask of shape (B, T).
-            :param key: PRNG key for view masking.
-            :param global_step: Global step index for loss scheduling.
-            :returns: Updated model, optimizer state, and losses.
-            """
-
-            def _loss_fn(model_inner: TextTransformer) -> tuple[Array, tuple[Array, Array]]:
-                """Compute the total loss and its components.
-
-                :param model_inner: Model replica used for the loss computation.
-                :returns: Tuple of (total loss, (prediction loss, sigreg loss)).
+                :param model_in: Replicated model.
+                :param teacher_in: SWA teacher model.
+                :param swa_count_in: SWA averaging count.
+                :param state_in: Replicated optimizer state.
+                :param batch_tokens: Token batch of shape (B, T).
+                :param batch_mask: Attention mask of shape (B, T).
+                :param key: PRNG key for view masking.
+                :param global_step: Global step index for loss scheduling.
+                :returns: Updated model, teacher, optimizer state, and losses.
                 """
-                emb, _token_reps, _mask_positions = _encode_views(
-                    model_inner,
-                    batch_tokens,
-                    batch_mask,
-                    train=True,
-                    key=key,
-                    num_global_views=args.num_global_views,
-                    num_local_views=args.num_local_views,
-                    global_mask_min=args.global_mask_min,
-                    global_mask_max=args.global_mask_max,
-                    local_mask_min=args.local_mask_min,
-                    local_mask_max=args.local_mask_max,
-                    masking_mode=args.masking_mode,
-                    mask_id=mask_id,
-                    pad_id=pad_id,
-                    eos_id=eos_id,
-                    return_tokens=False,
-                )
-                total, pred, sigreg = lejepa_loss(
-                    emb,
-                    args.num_global_views,
-                    sigreg_weight=args.sigreg_weight,
-                    pred_loss_type=args.pred_loss,
-                    global_step=global_step,
-                    num_slices=args.sigreg_slices,
-                    seed=args.sigreg_seed,
-                    axis_name="data",
-                )
-                return total, (pred, sigreg)
 
-            (loss, (pred_loss, sigreg_loss)), grads = eqx.filter_value_and_grad(
-                _loss_fn, has_aux=True
-            )(model_in)
-            grads = jax.lax.pmean(grads, axis_name="data")
-            params_inner = eqx.filter(model_in, eqx.is_array)
-            updates, new_state = optimizer.update(grads, state_in, params_inner)
-            new_model = eqx.apply_updates(model_in, updates)
-            loss = jax.lax.pmean(loss, axis_name="data")
-            pred_loss = jax.lax.pmean(pred_loss, axis_name="data")
-            sigreg_loss = jax.lax.pmean(sigreg_loss, axis_name="data")
-            return new_model, new_state, loss, pred_loss, sigreg_loss
+                def _loss_fn(
+                    model_teacher: tuple[TextTransformer, TextTransformer],
+                ) -> tuple[Array, tuple[Array, Array]]:
+                    """Compute the total loss and its components.
 
-        train_step_pmap = eqx.filter_pmap(
-            train_step,
-            axis_name="data",
-            devices=device_list,
-            donate="all",
-        )  # type: ignore[call-overload]
+                    :param model_teacher: Tuple of (model, teacher model).
+                    :returns: Tuple of (total loss, (prediction loss, sigreg loss)).
+                    """
+                    model_inner, teacher_inner = model_teacher
+                    emb, centers, _token_reps, _mask_positions = _encode_views_with_teacher(
+                        model_inner,
+                        teacher_inner,
+                        batch_tokens,
+                        batch_mask,
+                        train=True,
+                        key=key,
+                        num_global_views=args.num_global_views,
+                        num_local_views=args.num_local_views,
+                        global_mask_min=args.global_mask_min,
+                        global_mask_max=args.global_mask_max,
+                        local_mask_min=args.local_mask_min,
+                        local_mask_max=args.local_mask_max,
+                        masking_mode=args.masking_mode,
+                        mask_id=mask_id,
+                        pad_id=pad_id,
+                        eos_id=eos_id,
+                        return_tokens=False,
+                    )
+                    total, pred, sigreg = _lejepa_loss_with_centers(
+                        emb,
+                        centers,
+                        sigreg_weight=args.sigreg_weight,
+                        pred_loss_type=args.pred_loss,
+                        global_step=global_step,
+                        num_slices=args.sigreg_slices,
+                        seed=args.sigreg_seed,
+                        axis_name="data",
+                    )
+                    return total, (pred, sigreg)
+
+                (loss, (pred_loss, sigreg_loss)), grads = eqx.filter_value_and_grad(
+                    _loss_fn, has_aux=True
+                )((model_in, teacher_in))
+                grads = jax.lax.pmean(grads, axis_name="data")
+                model_grads, _teacher_grads = grads
+                params_inner = eqx.filter(model_in, eqx.is_array)
+                updates, new_state = optimizer.update(model_grads, state_in, params_inner)
+                new_model = eqx.apply_updates(model_in, updates)
+                new_teacher, new_swa_count = _swa_update(
+                    teacher_in,
+                    new_model,
+                    swa_count_in,
+                )
+                loss = jax.lax.pmean(loss, axis_name="data")
+                pred_loss = jax.lax.pmean(pred_loss, axis_name="data")
+                sigreg_loss = jax.lax.pmean(sigreg_loss, axis_name="data")
+                return new_model, new_teacher, new_swa_count, new_state, loss, pred_loss, sigreg_loss
+
+            train_step_pmap = eqx.filter_pmap(
+                train_step,
+                axis_name="data",
+                devices=device_list,
+                donate="all",
+            )  # type: ignore[call-overload]
+        else:
+            def train_step(
+                model_in: TextTransformer,
+                state_in: MuonWithAdamWFallbackState,
+                batch_tokens: Array,
+                batch_mask: Array,
+                key: Array,
+                global_step: Array,
+            ) -> tuple[TextTransformer, MuonWithAdamWFallbackState, Array, Array, Array]:
+                """Run one training step.
+
+                :param model_in: Replicated model.
+                :param state_in: Replicated optimizer state.
+                :param batch_tokens: Token batch of shape (B, T).
+                :param batch_mask: Attention mask of shape (B, T).
+                :param key: PRNG key for view masking.
+                :param global_step: Global step index for loss scheduling.
+                :returns: Updated model, optimizer state, and losses.
+                """
+
+                def _loss_fn(model_inner: TextTransformer) -> tuple[Array, tuple[Array, Array]]:
+                    """Compute the total loss and its components.
+
+                    :param model_inner: Model replica used for the loss computation.
+                    :returns: Tuple of (total loss, (prediction loss, sigreg loss)).
+                    """
+                    emb, _token_reps, _mask_positions = _encode_views(
+                        model_inner,
+                        batch_tokens,
+                        batch_mask,
+                        train=True,
+                        key=key,
+                        num_global_views=args.num_global_views,
+                        num_local_views=args.num_local_views,
+                        global_mask_min=args.global_mask_min,
+                        global_mask_max=args.global_mask_max,
+                        local_mask_min=args.local_mask_min,
+                        local_mask_max=args.local_mask_max,
+                        masking_mode=args.masking_mode,
+                        mask_id=mask_id,
+                        pad_id=pad_id,
+                        eos_id=eos_id,
+                        return_tokens=False,
+                    )
+                    total, pred, sigreg = lejepa_loss(
+                        emb,
+                        args.num_global_views,
+                        sigreg_weight=args.sigreg_weight,
+                        pred_loss_type=args.pred_loss,
+                        global_step=global_step,
+                        num_slices=args.sigreg_slices,
+                        seed=args.sigreg_seed,
+                        axis_name="data",
+                    )
+                    return total, (pred, sigreg)
+
+                (loss, (pred_loss, sigreg_loss)), grads = eqx.filter_value_and_grad(
+                    _loss_fn, has_aux=True
+                )(model_in)
+                grads = jax.lax.pmean(grads, axis_name="data")
+                params_inner = eqx.filter(model_in, eqx.is_array)
+                updates, new_state = optimizer.update(grads, state_in, params_inner)
+                new_model = eqx.apply_updates(model_in, updates)
+                loss = jax.lax.pmean(loss, axis_name="data")
+                pred_loss = jax.lax.pmean(pred_loss, axis_name="data")
+                sigreg_loss = jax.lax.pmean(sigreg_loss, axis_name="data")
+                return new_model, new_state, loss, pred_loss, sigreg_loss
+
+            train_step_pmap = eqx.filter_pmap(
+                train_step,
+                axis_name="data",
+                devices=device_list,
+                donate="all",
+            )  # type: ignore[call-overload]
 
     if args.masked_probe is True:
         params_repl = _replicate_tree(params, num_devices)
@@ -1439,6 +1966,17 @@ def main() -> None:
         train_repl = eqx.combine(model_params_repl, model_static)
     opt_state_repl = _replicate_tree(opt_state, num_devices)
     opt_state_repl = jax.device_put(opt_state_repl, device=data_sharding)
+    teacher_repl: TextTransformer | None = None
+    swa_count_repl: Array | None = None
+    if args.use_swa_teacher is True:
+        if teacher is None or swa_count is None:
+            raise ValueError("teacher state must be initialized when use-swa-teacher is enabled")
+        teacher_params, teacher_static = eqx.partition(teacher, eqx.is_array)
+        teacher_params_repl = _replicate_tree(teacher_params, num_devices)
+        teacher_params_repl = jax.device_put(teacher_params_repl, device=data_sharding)
+        teacher_repl = eqx.combine(teacher_params_repl, teacher_static)
+        swa_count_repl = _replicate_tree(swa_count, num_devices)
+        swa_count_repl = jax.device_put(swa_count_repl, device=data_sharding)
 
     global_batch = args.per_device_batch_size * num_devices
     global_step = 0
@@ -1489,31 +2027,77 @@ def main() -> None:
                 step_id = jnp.full((num_devices,), global_step, dtype=jnp.int32)
 
                 if args.masked_probe is True:
-                    (
-                        train_repl,
-                        opt_state_repl,
-                        loss,
-                        pred,
-                        sigreg,
-                        probe_loss,
-                        probe_acc,
-                    ) = train_step_pmap(
-                        train_repl,
-                        opt_state_repl,
-                        batch_tokens,
-                        batch_mask,
-                        device_keys,
-                        step_id,
-                    )
+                    if args.use_swa_teacher is True:
+                        if teacher_repl is None or swa_count_repl is None:
+                            raise ValueError("teacher state must be initialized when use-swa-teacher is enabled")
+                        (
+                            train_repl,
+                            teacher_repl,
+                            swa_count_repl,
+                            opt_state_repl,
+                            loss,
+                            pred,
+                            sigreg,
+                            probe_loss,
+                            probe_acc,
+                        ) = train_step_pmap(
+                            train_repl,
+                            teacher_repl,
+                            swa_count_repl,
+                            opt_state_repl,
+                            batch_tokens,
+                            batch_mask,
+                            device_keys,
+                            step_id,
+                        )
+                    else:
+                        (
+                            train_repl,
+                            opt_state_repl,
+                            loss,
+                            pred,
+                            sigreg,
+                            probe_loss,
+                            probe_acc,
+                        ) = train_step_pmap(
+                            train_repl,
+                            opt_state_repl,
+                            batch_tokens,
+                            batch_mask,
+                            device_keys,
+                            step_id,
+                        )
                 else:
-                    train_repl, opt_state_repl, loss, pred, sigreg = train_step_pmap(
-                        train_repl,
-                        opt_state_repl,
-                        batch_tokens,
-                        batch_mask,
-                        device_keys,
-                        step_id,
-                    )
+                    if args.use_swa_teacher is True:
+                        if teacher_repl is None or swa_count_repl is None:
+                            raise ValueError("teacher state must be initialized when use-swa-teacher is enabled")
+                        (
+                            train_repl,
+                            teacher_repl,
+                            swa_count_repl,
+                            opt_state_repl,
+                            loss,
+                            pred,
+                            sigreg,
+                        ) = train_step_pmap(
+                            train_repl,
+                            teacher_repl,
+                            swa_count_repl,
+                            opt_state_repl,
+                            batch_tokens,
+                            batch_mask,
+                            device_keys,
+                            step_id,
+                        )
+                    else:
+                        train_repl, opt_state_repl, loss, pred, sigreg = train_step_pmap(
+                            train_repl,
+                            opt_state_repl,
+                            batch_tokens,
+                            batch_mask,
+                            device_keys,
+                            step_id,
+                        )
                 if args.profile:
                     jax.block_until_ready(loss)
                 compute_done = time.perf_counter()
