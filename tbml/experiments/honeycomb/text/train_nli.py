@@ -31,7 +31,7 @@ def _parse_args() -> argparse.Namespace:
 
     :returns: Parsed arguments namespace.
     """
-    parser = argparse.ArgumentParser(description="Fine-tune a text model on SNLI.")
+    parser = argparse.ArgumentParser(description="Fine-tune a text model on NLI.")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--runs-folder", type=str, required=True)
     parser.add_argument("--data-folder", type=str, default="misc/snli")
@@ -397,7 +397,7 @@ def _collect_parquet_paths(folder: str, split: str) -> list[str]:
     return paths
 
 
-def _load_snli_table(
+def _load_nli_table(
     folder: str,
     *,
     split: str,
@@ -405,7 +405,7 @@ def _load_snli_table(
     hypothesis_field: str,
     label_field: str,
 ) -> tuple[list[str], list[str], np.ndarray]:
-    """Load SNLI samples from parquet files.
+    """Load NLI samples from parquet files.
 
     :param folder: Dataset folder path.
     :param split: Dataset split name.
@@ -453,8 +453,8 @@ def _load_snli_table(
     return premises, hypotheses, labels
 
 
-class SnliDataset:
-    """In-memory SNLI dataset for entailment classification."""
+class NliDataset:
+    """In-memory NLI dataset for entailment classification."""
 
     _premise_tokens: list[list[int]]
     _hypothesis_tokens: list[list[int]]
@@ -478,7 +478,7 @@ class SnliDataset:
         seed: int,
         shuffle: bool,
     ) -> None:
-        """Initialize the SNLI dataset.
+        """Initialize the NLI dataset.
 
         :param premises: List of premise texts.
         :param hypotheses: List of hypothesis texts.
@@ -560,7 +560,7 @@ def _iter_batches(
 
 
 def _iter_epoch_batches(
-    dataset: SnliDataset,
+    dataset: NliDataset,
     *,
     batch_size: int,
     rng: np.random.Generator,
@@ -568,7 +568,7 @@ def _iter_epoch_batches(
 ) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
     """Iterate over a single epoch of batches.
 
-    :param dataset: SNLI dataset instance.
+    :param dataset: NLI dataset instance.
     :param batch_size: Batch size per host.
     :param rng: Random generator for shuffling.
     :param shuffle: Whether to shuffle the dataset order.
@@ -604,14 +604,14 @@ def _iter_epoch_batches(
         yield tokens_p, mask_p, tokens_h, mask_h, labels
 
 
-class SnliClassifier(eqx.Module):
-    """Classifier head for SNLI.
+class NliClassifier(eqx.Module):
+    """Classifier head for NLI.
 
     :ivar d_model: Base model width.
     :ivar feature_dim: Concatenated feature dimension.
     :ivar num_classes: Number of output classes.
-    :ivar proj1: SNLI output head projection 1.
-    :ivar proj2: SNLI output head projection 2 (logits).
+    :ivar proj1: NLI output head projection 1.
+    :ivar proj2: NLI output head projection 2 (logits).
     """
 
     d_model: int
@@ -676,7 +676,7 @@ class SnliClassifier(eqx.Module):
         )
 
     def __call__(self, premise: Array, hypothesis: Array, *, train: bool, key: Array | None) -> Array:
-        """Compute logits for SNLI.
+        """Compute logits for NLI.
 
         :param premise: Premise pooled representations of shape (B, d_model).
         :param hypothesis: Hypothesis pooled representations of shape (B, d_model).
@@ -698,21 +698,21 @@ class SnliClassifier(eqx.Module):
         return x
 
 
-class SnliBundle(eqx.Module):
+class NliBundle(eqx.Module):
     """Bundle of model and classifier.
 
     :ivar model: Text transformer model.
-    :ivar classifier: SNLI classifier head.
+    :ivar classifier: NLI classifier head.
     """
 
     model: TextTransformer
-    classifier: SnliClassifier
+    classifier: NliClassifier
 
 
 def _save_checkpoint(
     run_dir: str,
     epoch: int,
-    bundle: SnliBundle,
+    bundle: NliBundle,
     opt_state: eqx.Module,
     metadata: dict[str, object],
 ) -> None:
@@ -733,7 +733,7 @@ def _save_checkpoint(
 
 
 def main() -> None:
-    """Run SNLI fine-tuning."""
+    """Run NLI fine-tuning."""
     args = _parse_args()
 
     if args.max_train_steps < 0:
@@ -804,21 +804,21 @@ def main() -> None:
     num_devices = len(device_list)
     _mesh, data_sharding, _replicated_sharding = _build_sharding(device_list)
 
-    train_premise, train_hypothesis, train_labels = _load_snli_table(
+    train_premise, train_hypothesis, train_labels = _load_nli_table(
         args.data_folder,
         split="train",
         premise_field=args.premise_field,
         hypothesis_field=args.hypothesis_field,
         label_field=args.label_field,
     )
-    val_premise, val_hypothesis, val_labels = _load_snli_table(
+    val_premise, val_hypothesis, val_labels = _load_nli_table(
         args.data_folder,
         split="validation",
         premise_field=args.premise_field,
         hypothesis_field=args.hypothesis_field,
         label_field=args.label_field,
     )
-    train_dataset = SnliDataset(
+    train_dataset = NliDataset(
         train_premise,
         train_hypothesis,
         train_labels,
@@ -830,7 +830,7 @@ def main() -> None:
         seed=args.seed,
         shuffle=args.shuffle,
     )
-    val_dataset = SnliDataset(
+    val_dataset = NliDataset(
         val_premise,
         val_hypothesis,
         val_labels,
@@ -856,7 +856,7 @@ def main() -> None:
         model = _load_checkpoint_model(model_path, model, patch_dir=run_dir)
 
     classifier_key, base_key = jax.random.split(base_key)
-    classifier = SnliClassifier(
+    classifier = NliClassifier(
         d_model=model_config.d_model,
         init_std=model_config.init_std,
         num_classes=3,
@@ -864,7 +864,7 @@ def main() -> None:
         param_dtype=dtype,
         key=classifier_key,
     )
-    bundle = SnliBundle(model=model, classifier=classifier)
+    bundle = NliBundle(model=model, classifier=classifier)
 
     exclusion_patterns = _prefix_patterns(
         list(TextTransformer.MUON_PARAM_EXCLUSION_PATTERNS), "model"
@@ -973,7 +973,7 @@ def main() -> None:
     writer.add_text("config", json.dumps(run_config, indent=2))
 
     def train_step(
-        bundle_in: SnliBundle,
+        bundle_in: NliBundle,
         state_in: MuonWithAdamWFallbackState,
         premise_tokens: Array,
         premise_mask: Array,
@@ -982,7 +982,7 @@ def main() -> None:
         labels_in: Array,
         key: Array,
         train_backbone: bool,
-    ) -> tuple[SnliBundle, MuonWithAdamWFallbackState, Array, Array]:
+    ) -> tuple[NliBundle, MuonWithAdamWFallbackState, Array, Array]:
         """Run one fine-tuning step.
 
         :param bundle_in: Replicated training bundle.
@@ -997,7 +997,7 @@ def main() -> None:
         :returns: Updated bundle, optimizer state, loss, and accuracy.
         """
 
-        def _loss_fn(bundle_inner: SnliBundle) -> tuple[Array, Array]:
+        def _loss_fn(bundle_inner: NliBundle) -> tuple[Array, Array]:
             """Compute cross-entropy loss and accuracy.
 
             :param bundle_inner: Bundle containing model and classifier.
@@ -1052,7 +1052,7 @@ def main() -> None:
     )  # type: ignore[call-overload]
 
     def val_step(
-        bundle_in: SnliBundle,
+        bundle_in: NliBundle,
         premise_tokens: Array,
         premise_mask: Array,
         hypothesis_tokens: Array,
@@ -1227,8 +1227,8 @@ def main() -> None:
                 pbar.update(1)
                 val_global_step += 1
 
-        bundle_host = cast(SnliBundle, _unreplicate(bundle_repl))
-        bundle_host = cast(SnliBundle, _to_host(bundle_host))
+        bundle_host = cast(NliBundle, _unreplicate(bundle_repl))
+        bundle_host = cast(NliBundle, _to_host(bundle_host))
         opt_state_host = cast(MuonWithAdamWFallbackState, _unreplicate(opt_state_repl))
         metadata = {
             "epoch": epoch,
