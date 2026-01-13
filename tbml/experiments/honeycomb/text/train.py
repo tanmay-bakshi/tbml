@@ -829,27 +829,17 @@ def _maybe_swa_update(
 
     updated_teacher, updated_count = _swa_update(teacher, student, count)
     teacher_params, teacher_static = eqx.partition(teacher, eqx.is_array)
+    student_params, _ = eqx.partition(student, eqx.is_array)
     updated_params, _ = eqx.partition(updated_teacher, eqx.is_array)
-
-    def _do_update(
-        args: tuple[eqx.Module, eqx.Module, Array, Array],
-    ) -> tuple[eqx.Module, Array]:
-        _teacher_params, _updated_params, _count, _updated_count = args
-        return _updated_params, _updated_count
-
-    def _skip_update(
-        args: tuple[eqx.Module, eqx.Module, Array, Array],
-    ) -> tuple[eqx.Module, Array]:
-        _teacher_params, _updated_params, _count, _updated_count = args
-        return _teacher_params, _count
-
     do_update = global_step >= start_step
-    new_params, new_count = jax.lax.cond(
-        do_update,
-        _do_update,
-        _skip_update,
-        (teacher_params, updated_params, count, updated_count),
-    )
+
+    def _select_param(updated: object, student_param: object) -> object:
+        if eqx.is_array(updated) and eqx.is_array(student_param):
+            return jnp.where(do_update, updated, student_param)
+        return updated
+
+    new_params = jax.tree_util.tree_map(_select_param, updated_params, student_params)
+    new_count = jnp.where(do_update, updated_count, count)
     new_teacher = eqx.combine(new_params, teacher_static)
     return cast(TextTransformer, new_teacher), new_count
 
