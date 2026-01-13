@@ -18,7 +18,11 @@ from tensorboardX import SummaryWriter  # type: ignore[import-untyped]
 from tqdm import tqdm  # type: ignore[import-untyped]
 
 from tbml.experiments.honeycomb.loss import lejepa_loss
-from tbml.experiments.honeycomb.text.dataset import StreamingTextDataset, iter_text_batches
+from tbml.experiments.honeycomb.text.dataset import (
+    StreamingTextDataset,
+    _build_tokenizer,
+    iter_text_batches,
+)
 from tbml.experiments.honeycomb.text.model import TextTransformer, TextTransformerConfig
 from tbml.nn.init import truncated_normal_init
 from tbml.nn.linear import Linear
@@ -478,7 +482,7 @@ def _mask_tokens(
     mask_id: int,
     pad_id: int,
     eos_id: int,
-) -> tuple[Array, Array]:
+) -> tuple[Array, Array, Array]:
     """Apply random masking to tokens.
 
     :param tokens: Token ids of shape (B, T).
@@ -521,8 +525,10 @@ def _mask_spans(
     pad_id: int,
     eos_id: int,
     poisson_lambda: float = 3.0,
-) -> tuple[Array, Array]:
+) -> tuple[Array, Array, Array]:
     """Apply span masking to tokens using BART-style text infilling.
+
+    Spans are replaced by a single mask token and the sequence is compacted.
 
     :param tokens: Token ids of shape (B, T).
     :param key: PRNG key.
@@ -532,7 +538,7 @@ def _mask_spans(
     :param pad_id: Padding token id.
     :param eos_id: EOS token id.
     :param poisson_lambda: Poisson lambda for span lengths.
-    :returns: Tuple of (masked token ids, mask positions).
+    :returns: Tuple of (masked token ids, mask positions, attention mask).
     """
     if min_ratio < 0.0 or min_ratio > 1.0:
         raise ValueError("min_ratio must be in [0, 1]")
@@ -560,13 +566,13 @@ def _mask_spans(
         sample_tokens: Array,
         ratio: Array,
         sample_key: Array,
-    ) -> tuple[Array, Array]:
+    ) -> tuple[Array, Array, Array]:
         """Mask spans for a single sequence.
 
         :param sample_tokens: Token ids of shape (T,).
         :param ratio: Masking ratio scalar.
         :param sample_key: PRNG key.
-        :returns: Tuple of (masked tokens, mask positions).
+        :returns: Tuple of (masked tokens, mask positions, attention mask).
         """
         key_len, key_start = jax.random.split(sample_key)
         eligible = jnp.logical_and(sample_tokens != pad_id, sample_tokens != eos_id)
@@ -576,8 +582,8 @@ def _mask_spans(
         span_lengths = jnp.maximum(span_lengths, 1)
         start_scores = jax.random.uniform(key_start, shape=(seq_len, seq_len), minval=0.0, maxval=1.0)
 
-        def _body(i: int, state: tuple[Array, Array]) -> tuple[Array, Array]:
-            mask, masked_count = state
+        def _body(i: int, state: tuple[Array, Array, Array]) -> tuple[Array, Array, Array]:
+            mask, start_mask, masked_count = state
             remaining = target - masked_count
             use = remaining > 0
             span_len = jnp.minimum(span_lengths[i], remaining)
@@ -598,23 +604,57 @@ def _mask_spans(
             scores = jnp.where(possible, start_scores[i], -jnp.inf)
             start = jnp.argmax(scores)
             span_positions = jnp.logical_and(idx >= start, idx < start + span_len)
+            start_positions = idx == start
             apply = jnp.logical_and(use, any_possible)
             new_mask = jnp.where(apply, jnp.logical_or(mask, span_positions), mask)
+            new_start = jnp.where(apply, jnp.logical_or(start_mask, start_positions), start_mask)
             new_count = jnp.where(apply, masked_count + span_len, masked_count)
-            return new_mask, new_count
+            return new_mask, new_start, new_count
 
         init_mask = jnp.zeros((seq_len,), dtype=jnp.bool_)
+        init_start = jnp.zeros((seq_len,), dtype=jnp.bool_)
         init_count = jnp.asarray(0, dtype=jnp.int32)
-        final_mask, _final_count = jax.lax.fori_loop(
-            0, seq_len, _body, (init_mask, init_count)
+        final_mask, final_start, _final_count = jax.lax.fori_loop(
+            0, seq_len, _body, (init_mask, init_start, init_count)
         )
-        masked_tokens = jnp.where(
-            final_mask, jnp.asarray(mask_id, dtype=sample_tokens.dtype), sample_tokens
-        )
-        return masked_tokens, final_mask
 
-    masked, mask = jax.vmap(_one_sample)(tokens, ratios, keys)
-    return masked, mask
+        def _compact(
+            idx: int,
+            state: tuple[Array, Array, Array, Array],
+        ) -> tuple[Array, Array, Array, Array]:
+            output_tokens, output_positions, write_idx, last_was_mask = state
+            keep = jnp.logical_or(final_start[idx], jnp.logical_not(final_mask[idx]))
+            keep = jnp.logical_and(keep, sample_tokens[idx] != pad_id)
+            is_mask = final_start[idx]
+            should_write = jnp.logical_and(
+                keep,
+                jnp.logical_or(jnp.logical_not(is_mask), jnp.logical_not(last_was_mask)),
+            )
+            value = jnp.where(is_mask, mask_id, sample_tokens[idx])
+            output_tokens = jnp.where(
+                should_write,
+                output_tokens.at[write_idx].set(value),
+                output_tokens,
+            )
+            output_positions = jnp.where(
+                should_write,
+                output_positions.at[write_idx].set(is_mask),
+                output_positions,
+            )
+            write_idx = jnp.where(should_write, write_idx + 1, write_idx)
+            last_was_mask = jnp.where(should_write, is_mask, last_was_mask)
+            return output_tokens, output_positions, write_idx, last_was_mask
+
+        output_tokens = jnp.full((seq_len,), pad_id, dtype=sample_tokens.dtype)
+        output_positions = jnp.zeros((seq_len,), dtype=jnp.bool_)
+        output_tokens, output_positions, final_len, _last_was_mask = jax.lax.fori_loop(
+            0, seq_len, _compact, (output_tokens, output_positions, 0, jnp.asarray(False))
+        )
+        output_mask = jnp.arange(seq_len, dtype=jnp.int32) < final_len
+        return output_tokens, output_positions, output_mask
+
+    masked, positions, attn_mask = jax.vmap(_one_sample)(tokens, ratios, keys)
+    return masked, positions, attn_mask
 
 
 def _mask_views(
@@ -628,7 +668,7 @@ def _mask_views(
     mask_id: int,
     pad_id: int,
     eos_id: int,
-) -> tuple[Array, Array]:
+) -> tuple[Array, Array, Array]:
     """Generate multiple masked views of the token batch.
 
     :param tokens: Token ids of shape (B, T).
@@ -640,23 +680,24 @@ def _mask_views(
     :param mask_id: Masking token id.
     :param pad_id: Padding token id.
     :param eos_id: EOS token id.
-    :returns: Tuple of (masked views, mask positions), each of shape (B, V, T).
+    :returns: Tuple of (masked views, mask positions, attention masks).
     """
     if num_views == 0:
         empty_views = jnp.zeros((tokens.shape[0], 0, tokens.shape[1]), dtype=tokens.dtype)
         empty_mask = jnp.zeros((tokens.shape[0], 0, tokens.shape[1]), dtype=jnp.bool_)
-        return empty_views, empty_mask
+        empty_attn = jnp.zeros((tokens.shape[0], 0, tokens.shape[1]), dtype=jnp.bool_)
+        return empty_views, empty_mask, empty_attn
 
     keys = jax.random.split(key, num_views)
 
-    def _one_view(view_key: Array) -> tuple[Array, Array]:
+    def _one_view(view_key: Array) -> tuple[Array, Array, Array]:
         """Mask tokens using the provided view key.
 
         :param view_key: PRNG key for masking.
         :returns: Tuple of (masked token ids, mask positions).
         """
         if masking_mode == "tokens":
-            return _mask_tokens(
+            masked_tokens, mask_positions = _mask_tokens(
                 tokens,
                 view_key,
                 min_ratio=min_ratio,
@@ -665,6 +706,8 @@ def _mask_views(
                 pad_id=pad_id,
                 eos_id=eos_id,
             )
+            attn_mask = tokens != pad_id
+            return masked_tokens, mask_positions, attn_mask
         if masking_mode == "spans":
             return _mask_spans(
                 tokens,
@@ -677,8 +720,12 @@ def _mask_views(
             )
         raise ValueError("masking_mode must be 'tokens' or 'spans'")
 
-    views, masks = jax.vmap(_one_view)(keys)
-    return jnp.transpose(views, (1, 0, 2)), jnp.transpose(masks, (1, 0, 2))
+    views, masks, attn_masks = jax.vmap(_one_view)(keys)
+    return (
+        jnp.transpose(views, (1, 0, 2)),
+        jnp.transpose(masks, (1, 0, 2)),
+        jnp.transpose(attn_masks, (1, 0, 2)),
+    )
 
 
 def _pool_representations(
@@ -757,7 +804,7 @@ def _encode_views(
         raise ValueError("at least one view must be requested")
 
     key, global_key, local_key = jax.random.split(key, 3)
-    global_views, global_masks = _mask_views(
+    global_views, global_masks, global_attn = _mask_views(
         tokens,
         global_key,
         num_views=num_global_views,
@@ -768,7 +815,7 @@ def _encode_views(
         pad_id=pad_id,
         eos_id=eos_id,
     )
-    local_views, local_masks = _mask_views(
+    local_views, local_masks, local_attn = _mask_views(
         tokens,
         local_key,
         num_views=num_local_views,
@@ -782,16 +829,19 @@ def _encode_views(
     if num_local_views > 0 and num_global_views > 0:
         views = jnp.concatenate([global_views, local_views], axis=1)
         mask_positions = jnp.concatenate([global_masks, local_masks], axis=1)
+        view_attn = jnp.concatenate([global_attn, local_attn], axis=1)
     elif num_global_views > 0:
         views = global_views
         mask_positions = global_masks
+        view_attn = global_attn
     else:
         views = local_views
         mask_positions = local_masks
+        view_attn = local_attn
 
     bsz, num_views, seq_len = views.shape
     flat_views = views.reshape((bsz * num_views, seq_len))
-    flat_mask = jnp.repeat(attention_mask, repeats=num_views, axis=0)
+    flat_mask = view_attn.reshape((bsz * num_views, seq_len))
     if return_tokens is True:
         token_reps = model.encode_tokens(flat_views, flat_mask, train=train, key=key)
         pooled = _pool_representations(model, token_reps, flat_mask)
@@ -928,6 +978,8 @@ def main() -> None:
         raise ValueError("sample probabilities must be >= 0")
     if args.full_sample_prob + args.token_truncate_prob + args.text_truncate_prob <= 0.0:
         raise ValueError("sum of sample probabilities must be > 0")
+    if args.masked_probe is True and args.masking_mode == "spans":
+        raise ValueError("masked-probe is only supported with masking-mode 'tokens'")
 
     dtype = _dtype_from_name(args.dtype)
     betas = _parse_betas(args.adamw_betas)
@@ -982,7 +1034,7 @@ def main() -> None:
         del batch_mask
         key = jax.random.PRNGKey(args.seed)
         key, global_key, local_key = jax.random.split(key, 3)
-        global_views, _global_masks = _mask_views(
+        global_views, _global_masks, _global_attn = _mask_views(
             jnp.asarray(batch_tokens),
             global_key,
             num_views=args.num_global_views,
@@ -993,7 +1045,7 @@ def main() -> None:
             pad_id=pad_id,
             eos_id=eos_id,
         )
-        local_views, _local_masks = _mask_views(
+        local_views, _local_masks, _local_attn = _mask_views(
             jnp.asarray(batch_tokens),
             local_key,
             num_views=args.num_local_views,
