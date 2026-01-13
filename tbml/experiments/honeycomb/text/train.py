@@ -74,6 +74,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--use-cls-token", dest="use_cls_token", action="store_true")
     parser.add_argument("--no-use-cls-token", dest="use_cls_token", action="store_false")
     parser.add_argument("--attn-type", type=str, default="pope", choices=["pope", "rope"])
+    parser.add_argument("--use-final-norm", dest="use_final_norm", action="store_true")
+    parser.add_argument("--no-use-final-norm", dest="use_final_norm", action="store_false")
 
     parser.add_argument("--num-global-views", type=int, default=2)
     parser.add_argument("--num-local-views", type=int, default=6)
@@ -107,6 +109,7 @@ def _parse_args() -> argparse.Namespace:
         muon_nesterov=True,
         use_cls_token=False,
         masked_probe=False,
+        use_final_norm=True,
     )
     return parser.parse_args()
 
@@ -761,7 +764,9 @@ def _pool_representations(
         masked = reps * mask[:, :, None]
         denom = jnp.maximum(lengths, 1.0)
         pooled = jnp.sum(masked, axis=1) / denom[:, None]
-    return model.final_norm(pooled)
+    if model.config.use_final_norm is True:
+        return model.final_norm(pooled)
+    return pooled
 
 
 def _copy_model(model: TextTransformer) -> TextTransformer:
@@ -1432,6 +1437,7 @@ def main() -> None:
         init_std=args.init_std,
         use_cls_token=args.use_cls_token,
         attn_type=args.attn_type,
+        use_final_norm=args.use_final_norm,
     )
     if args.masked_probe is True:
         exclusion_patterns = _prefix_patterns(

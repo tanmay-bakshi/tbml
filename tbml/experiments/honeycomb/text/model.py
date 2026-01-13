@@ -26,6 +26,7 @@ class TextTransformerConfig(BaseModel):
     :ivar init_std: Standard deviation for truncated normal initialization.
     :ivar use_cls_token: Whether to pool using the EOS token representation.
     :ivar attn_type: Attention type ("pope" or "rope").
+    :ivar use_final_norm: Whether to apply the final RMSNorm.
     """
 
     vocab_size: int = Field(default=50257)
@@ -41,6 +42,7 @@ class TextTransformerConfig(BaseModel):
     init_std: float = Field(default=0.02)
     use_cls_token: bool = Field(default=False)
     attn_type: str = Field(default="pope")
+    use_final_norm: bool = Field(default=True)
 
 
 class TokenEmbedding(eqx.Module):
@@ -396,7 +398,9 @@ class TextTransformer(eqx.Module):
             masked = reps * mask[:, :, None]
             denom = jnp.maximum(lengths, 1.0)
             pooled = jnp.sum(masked, axis=1) / denom[:, None]
-        return self.final_norm(pooled)
+        if self.config.use_final_norm is True:
+            return self.final_norm(pooled)
+        return pooled
 
 
 def _build_drop_rates(drop_path_rate: float, total_layers: int) -> list[float]:
