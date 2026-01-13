@@ -56,6 +56,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "bfloat16", "float16"])
     parser.add_argument("--masked-probe", dest="masked_probe", action="store_true")
     parser.add_argument("--no-masked-probe", dest="masked_probe", action="store_false")
+    parser.add_argument("--preview-views", action="store_true")
 
     parser.add_argument("--d-model", type=int, default=768)
     parser.add_argument("--n-heads", type=int, default=12)
@@ -140,6 +141,30 @@ def _build_run_dir(runs_folder: str) -> str:
     run_dir = os.path.join(runs_folder, f"run_{timestamp}")
     os.makedirs(run_dir, exist_ok=False)
     return run_dir
+
+
+def _decode_tokens(
+    tokenizer: "Tokenizer",
+    token_ids: np.ndarray,
+    *,
+    pad_id: int,
+) -> str:
+    """Decode a token sequence, trimming padding.
+
+    :param tokenizer: Tokenizer instance.
+    :param token_ids: Token ids of shape (T,).
+    :param pad_id: Padding token id.
+    :returns: Decoded string.
+    """
+    if token_ids.ndim != 1:
+        raise ValueError("token_ids must be 1D")
+    pad_positions = np.where(token_ids == pad_id)[0]
+    if pad_positions.shape[0] > 0:
+        limit = int(pad_positions[0])
+        trimmed = token_ids[:limit]
+    else:
+        trimmed = token_ids
+    return tokenizer.decode(trimmed.tolist(), skip_special_tokens=False)
 
 
 def _list_jsonl_files(folder: str) -> list[str]:
@@ -906,7 +931,6 @@ def main() -> None:
 
     dtype = _dtype_from_name(args.dtype)
     betas = _parse_betas(args.adamw_betas)
-    run_dir = _build_run_dir(args.runs_folder)
     total_samples = _count_text_samples(args.data_folder, args.text_field)
 
     device_list: list[jax.Device] = _devices_for_platform("gpu")
@@ -939,6 +963,70 @@ def main() -> None:
         seed=args.seed,
     )
     vocab_size, eos_id, pad_id, mask_id = dataset.tokenizer_info()
+
+    if args.preview_views is True:
+        tokenizer, _eos_id, _pad_id, _mask_id = _build_tokenizer(
+            args.tokenizer,
+            eos_token=args.eos_token,
+            pad_token=args.pad_token,
+            mask_token=args.mask_token,
+        )
+        global_batch = args.per_device_batch_size * num_devices
+        preview_iter = iter_text_batches(
+            dataset,
+            batch_size=global_batch,
+            max_seq_len=args.max_seq_len,
+            pad_id=pad_id,
+        )
+        batch_tokens, batch_mask = next(iter(preview_iter))
+        del batch_mask
+        key = jax.random.PRNGKey(args.seed)
+        key, global_key, local_key = jax.random.split(key, 3)
+        global_views, _global_masks = _mask_views(
+            jnp.asarray(batch_tokens),
+            global_key,
+            num_views=args.num_global_views,
+            min_ratio=args.global_mask_min,
+            max_ratio=args.global_mask_max,
+            masking_mode=args.masking_mode,
+            mask_id=mask_id,
+            pad_id=pad_id,
+            eos_id=eos_id,
+        )
+        local_views, _local_masks = _mask_views(
+            jnp.asarray(batch_tokens),
+            local_key,
+            num_views=args.num_local_views,
+            min_ratio=args.local_mask_min,
+            max_ratio=args.local_mask_max,
+            masking_mode=args.masking_mode,
+            mask_id=mask_id,
+            pad_id=pad_id,
+            eos_id=eos_id,
+        )
+
+        print(f"Masking mode: {args.masking_mode}")
+        for idx in range(batch_tokens.shape[0]):
+            original = _decode_tokens(tokenizer, batch_tokens[idx], pad_id=pad_id)
+            print(f"\nSample {idx + 1}")
+            print("Original:")
+            print(original)
+            if args.num_global_views > 0:
+                print("Global views:")
+                for view_idx in range(args.num_global_views):
+                    view_tokens = np.asarray(global_views[idx, view_idx])
+                    decoded = _decode_tokens(tokenizer, view_tokens, pad_id=pad_id)
+                    print(f"  G{view_idx + 1}: {decoded}")
+            if args.num_local_views > 0:
+                print("Local views:")
+                for view_idx in range(args.num_local_views):
+                    view_tokens = np.asarray(local_views[idx, view_idx])
+                    decoded = _decode_tokens(tokenizer, view_tokens, pad_id=pad_id)
+                    print(f"  L{view_idx + 1}: {decoded}")
+        dataset.close()
+        return
+
+    run_dir = _build_run_dir(args.runs_folder)
 
     model_config = TextTransformerConfig(
         vocab_size=vocab_size,
