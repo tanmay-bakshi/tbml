@@ -71,10 +71,11 @@ def _parse_args() -> argparse.Namespace:
 
     parser.add_argument("--num-global-views", type=int, default=2)
     parser.add_argument("--num-local-views", type=int, default=6)
-    parser.add_argument("--global-mask-min", type=float, default=0.2)
-    parser.add_argument("--global-mask-max", type=float, default=0.4)
-    parser.add_argument("--local-mask-min", type=float, default=0.6)
-    parser.add_argument("--local-mask-max", type=float, default=0.7)
+    parser.add_argument("--global-mask-min", type=float, default=None)
+    parser.add_argument("--global-mask-max", type=float, default=None)
+    parser.add_argument("--local-mask-min", type=float, default=None)
+    parser.add_argument("--local-mask-max", type=float, default=None)
+    parser.add_argument("--masking-mode", type=str, default="tokens", choices=["tokens", "spans"])
 
     parser.add_argument("--sigreg-weight", type=float, default=0.25)
     parser.add_argument("--sigreg-slices", type=int, default=256)
@@ -485,6 +486,112 @@ def _mask_tokens(
     return masked_tokens, mask
 
 
+def _mask_spans(
+    tokens: Array,
+    key: Array,
+    *,
+    min_ratio: float,
+    max_ratio: float,
+    mask_id: int,
+    pad_id: int,
+    eos_id: int,
+    poisson_lambda: float = 3.0,
+) -> tuple[Array, Array]:
+    """Apply span masking to tokens using BART-style text infilling.
+
+    :param tokens: Token ids of shape (B, T).
+    :param key: PRNG key.
+    :param min_ratio: Minimum masking ratio.
+    :param max_ratio: Maximum masking ratio.
+    :param mask_id: Masking token id.
+    :param pad_id: Padding token id.
+    :param eos_id: EOS token id.
+    :param poisson_lambda: Poisson lambda for span lengths.
+    :returns: Tuple of (masked token ids, mask positions).
+    """
+    if min_ratio < 0.0 or min_ratio > 1.0:
+        raise ValueError("min_ratio must be in [0, 1]")
+    if max_ratio < 0.0 or max_ratio > 1.0:
+        raise ValueError("max_ratio must be in [0, 1]")
+    if min_ratio > max_ratio:
+        raise ValueError("min_ratio must be <= max_ratio")
+    if poisson_lambda <= 0.0:
+        raise ValueError("poisson_lambda must be > 0")
+
+    key_ratio, key_spans = jax.random.split(key)
+    ratios = jax.random.uniform(
+        key_ratio,
+        shape=(tokens.shape[0],),
+        minval=min_ratio,
+        maxval=max_ratio,
+    )
+    keys = jax.random.split(key_spans, tokens.shape[0])
+    seq_len = tokens.shape[1]
+    idx = jnp.arange(seq_len, dtype=jnp.int32)
+    idx_row = idx[None, :]
+    all_lengths = jnp.arange(1, seq_len + 1, dtype=jnp.int32)[:, None]
+
+    def _one_sample(
+        sample_tokens: Array,
+        ratio: Array,
+        sample_key: Array,
+    ) -> tuple[Array, Array]:
+        """Mask spans for a single sequence.
+
+        :param sample_tokens: Token ids of shape (T,).
+        :param ratio: Masking ratio scalar.
+        :param sample_key: PRNG key.
+        :returns: Tuple of (masked tokens, mask positions).
+        """
+        key_len, key_start = jax.random.split(sample_key)
+        eligible = jnp.logical_and(sample_tokens != pad_id, sample_tokens != eos_id)
+        valid_len = jnp.sum(eligible).astype(jnp.int32)
+        target = jnp.floor(ratio * valid_len).astype(jnp.int32)
+        span_lengths = jax.random.poisson(key_len, poisson_lambda, shape=(seq_len,))
+        span_lengths = jnp.maximum(span_lengths, 1)
+        start_scores = jax.random.uniform(key_start, shape=(seq_len, seq_len), minval=0.0, maxval=1.0)
+
+        def _body(i: int, state: tuple[Array, Array]) -> tuple[Array, Array]:
+            mask, masked_count = state
+            remaining = target - masked_count
+            use = remaining > 0
+            span_len = jnp.minimum(span_lengths[i], remaining)
+            span_len = jnp.maximum(span_len, 1)
+            valid = jnp.logical_and(eligible, jnp.logical_not(mask))
+            valid_int = valid.astype(jnp.int32)
+            prefix = jnp.concatenate(
+                [jnp.zeros((1,), dtype=jnp.int32), jnp.cumsum(valid_int)]
+            )
+            end = idx_row + all_lengths
+            valid_window = end <= seq_len
+            prefix_end = jnp.take(prefix, end, mode="clip")
+            prefix_start = prefix[idx_row]
+            window_sum = jnp.where(valid_window, prefix_end - prefix_start, 0)
+            length_index = jnp.maximum(span_len - 1, 0)
+            possible = jnp.take(window_sum, length_index, axis=0) == span_len
+            any_possible = jnp.any(possible)
+            scores = jnp.where(possible, start_scores[i], -jnp.inf)
+            start = jnp.argmax(scores)
+            span_positions = jnp.logical_and(idx >= start, idx < start + span_len)
+            apply = jnp.logical_and(use, any_possible)
+            new_mask = jnp.where(apply, jnp.logical_or(mask, span_positions), mask)
+            new_count = jnp.where(apply, masked_count + span_len, masked_count)
+            return new_mask, new_count
+
+        init_mask = jnp.zeros((seq_len,), dtype=jnp.bool_)
+        init_count = jnp.asarray(0, dtype=jnp.int32)
+        final_mask, _final_count = jax.lax.fori_loop(
+            0, seq_len, _body, (init_mask, init_count)
+        )
+        masked_tokens = jnp.where(
+            final_mask, jnp.asarray(mask_id, dtype=sample_tokens.dtype), sample_tokens
+        )
+        return masked_tokens, final_mask
+
+    masked, mask = jax.vmap(_one_sample)(tokens, ratios, keys)
+    return masked, mask
+
+
 def _mask_views(
     tokens: Array,
     key: Array,
@@ -492,6 +599,7 @@ def _mask_views(
     num_views: int,
     min_ratio: float,
     max_ratio: float,
+    masking_mode: str,
     mask_id: int,
     pad_id: int,
     eos_id: int,
@@ -503,6 +611,7 @@ def _mask_views(
     :param num_views: Number of views to generate.
     :param min_ratio: Minimum masking ratio.
     :param max_ratio: Maximum masking ratio.
+    :param masking_mode: Masking mode ("tokens" or "spans").
     :param mask_id: Masking token id.
     :param pad_id: Padding token id.
     :param eos_id: EOS token id.
@@ -521,15 +630,27 @@ def _mask_views(
         :param view_key: PRNG key for masking.
         :returns: Tuple of (masked token ids, mask positions).
         """
-        return _mask_tokens(
-            tokens,
-            view_key,
-            min_ratio=min_ratio,
-            max_ratio=max_ratio,
-            mask_id=mask_id,
-            pad_id=pad_id,
-            eos_id=eos_id,
-        )
+        if masking_mode == "tokens":
+            return _mask_tokens(
+                tokens,
+                view_key,
+                min_ratio=min_ratio,
+                max_ratio=max_ratio,
+                mask_id=mask_id,
+                pad_id=pad_id,
+                eos_id=eos_id,
+            )
+        if masking_mode == "spans":
+            return _mask_spans(
+                tokens,
+                view_key,
+                min_ratio=min_ratio,
+                max_ratio=max_ratio,
+                mask_id=mask_id,
+                pad_id=pad_id,
+                eos_id=eos_id,
+            )
+        raise ValueError("masking_mode must be 'tokens' or 'spans'")
 
     views, masks = jax.vmap(_one_view)(keys)
     return jnp.transpose(views, (1, 0, 2)), jnp.transpose(masks, (1, 0, 2))
@@ -581,6 +702,7 @@ def _encode_views(
     global_mask_max: float,
     local_mask_min: float,
     local_mask_max: float,
+    masking_mode: str,
     mask_id: int,
     pad_id: int,
     eos_id: int,
@@ -599,6 +721,7 @@ def _encode_views(
     :param global_mask_max: Maximum global masking ratio.
     :param local_mask_min: Minimum local masking ratio.
     :param local_mask_max: Maximum local masking ratio.
+    :param masking_mode: Masking mode ("tokens" or "spans").
     :param mask_id: Masking token id.
     :param pad_id: Padding token id.
     :param eos_id: EOS token id.
@@ -615,6 +738,7 @@ def _encode_views(
         num_views=num_global_views,
         min_ratio=global_mask_min,
         max_ratio=global_mask_max,
+        masking_mode=masking_mode,
         mask_id=mask_id,
         pad_id=pad_id,
         eos_id=eos_id,
@@ -625,6 +749,7 @@ def _encode_views(
         num_views=num_local_views,
         min_ratio=local_mask_min,
         max_ratio=local_mask_max,
+        masking_mode=masking_mode,
         mask_id=mask_id,
         pad_id=pad_id,
         eos_id=eos_id,
@@ -738,6 +863,26 @@ def main() -> None:
         raise ValueError("num-global-views must be >= 0")
     if args.num_local_views < 0:
         raise ValueError("num-local-views must be >= 0")
+    if args.masking_mode == "spans":
+        default_global_min = 0.25
+        default_global_max = 0.30
+        default_local_min = 0.40
+        default_local_max = 0.45
+    else:
+        default_global_min = 0.20
+        default_global_max = 0.40
+        default_local_min = 0.60
+        default_local_max = 0.70
+
+    if args.global_mask_min is None:
+        args.global_mask_min = default_global_min
+    if args.global_mask_max is None:
+        args.global_mask_max = default_global_max
+    if args.local_mask_min is None:
+        args.local_mask_min = default_local_min
+    if args.local_mask_max is None:
+        args.local_mask_max = default_local_max
+
     if args.global_mask_min < 0.0 or args.global_mask_min > 1.0:
         raise ValueError("global-mask-min must be in [0, 1]")
     if args.global_mask_max < 0.0 or args.global_mask_max > 1.0:
@@ -842,6 +987,7 @@ def main() -> None:
             "global_mask_max": args.global_mask_max,
             "local_mask_min": args.local_mask_min,
             "local_mask_max": args.local_mask_max,
+            "masking_mode": args.masking_mode,
         },
         "loss": {
             "sigreg_weight": args.sigreg_weight,
@@ -1008,6 +1154,7 @@ def main() -> None:
                     global_mask_max=args.global_mask_max,
                     local_mask_min=args.local_mask_min,
                     local_mask_max=args.local_mask_max,
+                    masking_mode=args.masking_mode,
                     mask_id=mask_id,
                     pad_id=pad_id,
                     eos_id=eos_id,
@@ -1104,6 +1251,7 @@ def main() -> None:
                     global_mask_max=args.global_mask_max,
                     local_mask_min=args.local_mask_min,
                     local_mask_max=args.local_mask_max,
+                    masking_mode=args.masking_mode,
                     mask_id=mask_id,
                     pad_id=pad_id,
                     eos_id=eos_id,
