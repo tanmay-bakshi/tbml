@@ -387,6 +387,20 @@ def _to_host(tree: T) -> T:
     return cast(T, jax.device_get(tree))
 
 
+def _block_until_ready(tree: T) -> None:
+    """Block until all arrays in a PyTree are ready.
+
+    :param tree: PyTree containing JAX arrays.
+    """
+
+    def _block(value: object) -> None:
+        if isinstance(value, jax.Array):
+            value.block_until_ready()
+        return None
+
+    jax.tree_util.tree_map(_block, tree)
+
+
 def _add_trees(tree_a: T, tree_b: T) -> T:
     """Add two PyTrees with optional None leaves.
 
@@ -2281,6 +2295,8 @@ def main() -> None:
                             grad_accum,
                         )
                 compute_time += time.perf_counter() - compute_start
+                grad_accum = None
+                grads = None
 
                 if args.profile:
                     jax.block_until_ready(loss)
@@ -2334,6 +2350,8 @@ def main() -> None:
 
                 if global_step % args.checkpoint_every == 0:
                     jax.block_until_ready(loss)
+                    _block_until_ready(train_repl)
+                    _block_until_ready(opt_state_repl)
                     opt_state_host = cast(MuonWithAdamWFallbackState, _unreplicate(opt_state_repl))
                     probe_host: MaskedTokenProbe | None = None
                     if args.masked_probe is True:
