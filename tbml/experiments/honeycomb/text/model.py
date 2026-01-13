@@ -6,7 +6,7 @@ import jax.numpy as jnp
 from jaxtyping import Array
 from pydantic import BaseModel, Field
 
-from tbml.nn import DropPath, PoPESelfAttention, RMSNorm, SwiGLUFeedForward
+from tbml.nn import DropPath, PoPESelfAttention, RMSNorm, RoPESelfAttention, SwiGLUFeedForward
 from tbml.nn.init import Initializer, truncated_normal_init
 
 
@@ -22,9 +22,10 @@ class TextTransformerConfig(BaseModel):
     :ivar attn_dropout: Attention dropout probability.
     :ivar resid_dropout: Residual dropout probability.
     :ivar drop_path_rate: Stochastic depth rate at the final block.
-    :ivar pope_base: Base for PoPE frequency schedule.
+    :ivar pope_base: Base for PoPE/RoPE frequency schedule.
     :ivar init_std: Standard deviation for truncated normal initialization.
     :ivar use_cls_token: Whether to pool using the EOS token representation.
+    :ivar attn_type: Attention type ("pope" or "rope").
     """
 
     vocab_size: int = Field(default=50257)
@@ -39,6 +40,7 @@ class TextTransformerConfig(BaseModel):
     pope_base: float = Field(default=10000.0)
     init_std: float = Field(default=0.02)
     use_cls_token: bool = Field(default=False)
+    attn_type: str = Field(default="pope")
 
 
 class TokenEmbedding(eqx.Module):
@@ -101,18 +103,10 @@ class TokenEmbedding(eqx.Module):
 
 
 class TextTransformerBlock(eqx.Module):
-    """Transformer block with RMSNorm, PoPE attention, and SwiGLU MLP.
-
-    :ivar norm1: RMSNorm before attention.
-    :ivar attn: PoPE self-attention.
-    :ivar drop_path1: DropPath for attention residual.
-    :ivar norm2: RMSNorm before the MLP.
-    :ivar mlp: SwiGLU feed-forward network.
-    :ivar drop_path2: DropPath for MLP residual.
-    """
+    """Transformer block with RMSNorm, positional attention, and SwiGLU MLP."""
 
     norm1: RMSNorm
-    attn: PoPESelfAttention
+    attn: PoPESelfAttention | RoPESelfAttention
     drop_path1: DropPath
     norm2: RMSNorm
     mlp: SwiGLUFeedForward
@@ -128,6 +122,7 @@ class TextTransformerBlock(eqx.Module):
         resid_dropout: float,
         drop_path_prob: float,
         pope_base: float,
+        attn_type: str,
         dtype: jnp.dtype,
         param_dtype: jnp.dtype,
         qkv_kernel_init: Initializer,
@@ -143,7 +138,8 @@ class TextTransformerBlock(eqx.Module):
         :param attn_dropout: Attention dropout probability.
         :param resid_dropout: Residual dropout probability.
         :param drop_path_prob: DropPath probability for this block.
-        :param pope_base: Base for PoPE frequencies.
+        :param pope_base: Base for PoPE/RoPE frequencies.
+        :param attn_type: Attention type ("pope" or "rope").
         :param dtype: Compute dtype.
         :param param_dtype: Parameter dtype.
         :param qkv_kernel_init: Initializer for Q/K/V projections.
@@ -154,20 +150,38 @@ class TextTransformerBlock(eqx.Module):
         norm1_key, norm2_key, attn_key, mlp_key = jax.random.split(key, 4)
 
         self.norm1 = RMSNorm(d_model, dtype=dtype, param_dtype=param_dtype)
-        self.attn = PoPESelfAttention(
-            d_model=d_model,
-            n_heads=n_heads,
-            n_kv_heads=n_heads,
-            attn_dropout=attn_dropout,
-            resid_dropout=resid_dropout,
-            is_causal=False,
-            base=pope_base,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            qkv_kernel_init=qkv_kernel_init,
-            o_kernel_init=o_kernel_init,
-            key=attn_key,
-        )
+        if attn_type == "pope":
+            self.attn = PoPESelfAttention(
+                d_model=d_model,
+                n_heads=n_heads,
+                n_kv_heads=n_heads,
+                attn_dropout=attn_dropout,
+                resid_dropout=resid_dropout,
+                is_causal=False,
+                base=pope_base,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                qkv_kernel_init=qkv_kernel_init,
+                o_kernel_init=o_kernel_init,
+                key=attn_key,
+            )
+        elif attn_type == "rope":
+            self.attn = RoPESelfAttention(
+                d_model=d_model,
+                n_heads=n_heads,
+                n_kv_heads=n_heads,
+                attn_dropout=attn_dropout,
+                resid_dropout=resid_dropout,
+                is_causal=False,
+                base=pope_base,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                qkv_kernel_init=qkv_kernel_init,
+                o_kernel_init=o_kernel_init,
+                key=attn_key,
+            )
+        else:
+            raise ValueError("attn_type must be 'pope' or 'rope'")
         self.drop_path1 = DropPath(drop_path_prob)
         self.norm2 = RMSNorm(d_model, dtype=dtype, param_dtype=param_dtype)
         self.mlp = SwiGLUFeedForward(
@@ -216,7 +230,7 @@ class TextTransformerBlock(eqx.Module):
 
 
 class TextTransformer(eqx.Module):
-    """Text encoder for LeJEPA with PoPE attention."""
+    """Text encoder for LeJEPA with positional attention."""
 
     MUON_PARAM_EXCLUSION_PATTERNS: ClassVar[list[str]] = [
         r"^token_embed\..*$",
@@ -269,6 +283,8 @@ class TextTransformer(eqx.Module):
             raise ValueError("init_std must be > 0")
         if config.pope_base <= 1.0:
             raise ValueError("pope_base must be > 1.0")
+        if config.attn_type not in ("pope", "rope"):
+            raise ValueError("attn_type must be 'pope' or 'rope'")
 
         init = truncated_normal_init(config.init_std)
         keys = jax.random.split(key, 2 + config.n_layers)
@@ -302,6 +318,7 @@ class TextTransformer(eqx.Module):
                     resid_dropout=config.resid_dropout,
                     drop_path_prob=drop_rates[idx],
                     pope_base=config.pope_base,
+                    attn_type=config.attn_type,
                     dtype=dtype,
                     param_dtype=param_dtype,
                     qkv_kernel_init=init,

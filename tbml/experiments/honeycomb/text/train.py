@@ -73,6 +73,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--init-std", type=float, default=0.02)
     parser.add_argument("--use-cls-token", dest="use_cls_token", action="store_true")
     parser.add_argument("--no-use-cls-token", dest="use_cls_token", action="store_false")
+    parser.add_argument("--attn-type", type=str, default="pope", choices=["pope", "rope"])
 
     parser.add_argument("--num-global-views", type=int, default=2)
     parser.add_argument("--num-local-views", type=int, default=6)
@@ -1430,6 +1431,7 @@ def main() -> None:
         pope_base=args.pope_base,
         init_std=args.init_std,
         use_cls_token=args.use_cls_token,
+        attn_type=args.attn_type,
     )
     if args.masked_probe is True:
         exclusion_patterns = _prefix_patterns(
