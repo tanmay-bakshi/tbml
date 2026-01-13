@@ -1661,6 +1661,8 @@ def main() -> None:
                         eos_id=eos_id,
                         return_tokens=True,
                     )
+                    emb = emb.astype(jnp.float32)
+                    centers = centers.astype(jnp.float32)
                     if token_reps is None or mask_positions is None:
                         raise ValueError("token_reps and mask_positions must be returned for probe training")
                     model_loss, pred, sigreg = _lejepa_loss_with_centers(
@@ -1781,6 +1783,7 @@ def main() -> None:
                         eos_id=eos_id,
                         return_tokens=True,
                     )
+                    emb = emb.astype(jnp.float32)
                     if token_reps is None or mask_positions is None:
                         raise ValueError("token_reps and mask_positions must be returned for probe training")
                     model_loss, pred, sigreg = lejepa_loss(
@@ -1895,6 +1898,8 @@ def main() -> None:
                         eos_id=eos_id,
                         return_tokens=False,
                     )
+                    emb = emb.astype(jnp.float32)
+                    centers = centers.astype(jnp.float32)
                     total, pred, sigreg = _lejepa_loss_with_centers(
                         emb,
                         centers,
@@ -1977,6 +1982,7 @@ def main() -> None:
                         eos_id=eos_id,
                         return_tokens=False,
                     )
+                    emb = emb.astype(jnp.float32)
                     total, pred, sigreg = lejepa_loss(
                         emb,
                         args.num_global_views,
