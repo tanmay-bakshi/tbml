@@ -87,6 +87,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sigreg-seed", type=int, default=0)
     parser.add_argument("--pred-loss", type=str, default="mse", choices=["mse", "cosine"])
     parser.add_argument("--use-swa-teacher", action="store_true")
+    parser.add_argument("--swa-start-step", type=int, default=0)
 
     parser.add_argument("--muon-lr", type=float, default=1e-3)
     parser.add_argument("--muon-momentum", type=float, default=0.95)
@@ -806,6 +807,53 @@ def _swa_update(
     return cast(TextTransformer, new_teacher), new_count
 
 
+def _maybe_swa_update(
+    teacher: TextTransformer,
+    student: TextTransformer,
+    count: Array,
+    *,
+    global_step: Array,
+    start_step: int,
+) -> tuple[TextTransformer, Array]:
+    """Conditionally update the SWA teacher after a warmup.
+
+    :param teacher: Current teacher model.
+    :param student: Current student model.
+    :param count: Number of models averaged so far.
+    :param global_step: Current training step.
+    :param start_step: Step to begin SWA updates.
+    :returns: Updated teacher and count.
+    """
+    if start_step < 0:
+        raise ValueError("swa start step must be >= 0")
+
+    updated_teacher, updated_count = _swa_update(teacher, student, count)
+    teacher_params, teacher_static = eqx.partition(teacher, eqx.is_array)
+    updated_params, _ = eqx.partition(updated_teacher, eqx.is_array)
+
+    def _do_update(
+        args: tuple[eqx.Module, eqx.Module, Array, Array],
+    ) -> tuple[eqx.Module, Array]:
+        _teacher_params, _updated_params, _count, _updated_count = args
+        return _updated_params, _updated_count
+
+    def _skip_update(
+        args: tuple[eqx.Module, eqx.Module, Array, Array],
+    ) -> tuple[eqx.Module, Array]:
+        _teacher_params, _updated_params, _count, _updated_count = args
+        return _teacher_params, _count
+
+    do_update = global_step >= start_step
+    new_params, new_count = jax.lax.cond(
+        do_update,
+        _do_update,
+        _skip_update,
+        (teacher_params, updated_params, count, updated_count),
+    )
+    new_teacher = eqx.combine(new_params, teacher_static)
+    return cast(TextTransformer, new_teacher), new_count
+
+
 def _pred_loss_from_centers(
     embeddings: Array,
     centers: Array,
@@ -1269,6 +1317,8 @@ def main() -> None:
         raise ValueError("sigreg-weight must be in [0, 1]")
     if args.pred_loss not in ("mse", "cosine"):
         raise ValueError("pred-loss must be 'mse' or 'cosine'")
+    if args.swa_start_step < 0:
+        raise ValueError("swa-start-step must be >= 0")
     if args.use_swa_teacher is True and args.num_global_views <= 0:
         raise ValueError("use-swa-teacher requires at least one global view")
     if args.full_sample_prob < 0.0 or args.token_truncate_prob < 0.0 or args.text_truncate_prob < 0.0:
@@ -1432,6 +1482,7 @@ def main() -> None:
             "sigreg_seed": args.sigreg_seed,
             "pred_loss": args.pred_loss,
             "use_swa_teacher": args.use_swa_teacher,
+            "swa_start_step": args.swa_start_step,
         },
         "probe": {
             "masked_probe": args.masked_probe,
@@ -1482,7 +1533,7 @@ def main() -> None:
     swa_count: Array | None = None
     if args.use_swa_teacher is True:
         teacher = _copy_model(model)
-        swa_count = jnp.asarray(1.0, dtype=jnp.float32)
+        swa_count = jnp.asarray(0.0, dtype=jnp.float32)
     probe: MaskedTokenProbe | None = None
     train_bundle: TextTrainBundle | None = None
     if args.masked_probe is True:
@@ -1644,10 +1695,12 @@ def main() -> None:
                 params_inner = eqx.filter(bundle_in, eqx.is_array)
                 updates, new_state = optimizer.update(bundle_grads, state_in, params_inner)
                 new_bundle = eqx.apply_updates(bundle_in, updates)
-                new_teacher, new_swa_count = _swa_update(
+                new_teacher, new_swa_count = _maybe_swa_update(
                     teacher_in,
                     new_bundle.model,
                     swa_count_in,
+                    global_step=global_step,
+                    start_step=args.swa_start_step,
                 )
                 _ = total_loss
                 loss = jax.lax.pmean(loss, axis_name="data")
@@ -1864,10 +1917,12 @@ def main() -> None:
                 params_inner = eqx.filter(model_in, eqx.is_array)
                 updates, new_state = optimizer.update(model_grads, state_in, params_inner)
                 new_model = eqx.apply_updates(model_in, updates)
-                new_teacher, new_swa_count = _swa_update(
+                new_teacher, new_swa_count = _maybe_swa_update(
                     teacher_in,
                     new_model,
                     swa_count_in,
+                    global_step=global_step,
+                    start_step=args.swa_start_step,
                 )
                 loss = jax.lax.pmean(loss, axis_name="data")
                 pred_loss = jax.lax.pmean(pred_loss, axis_name="data")
