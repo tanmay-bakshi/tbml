@@ -1,4 +1,5 @@
 import argparse
+import math
 import json
 import os
 import queue
@@ -48,6 +49,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--token-truncate-prob", type=float, default=1.0 / 3.0)
     parser.add_argument("--text-truncate-prob", type=float, default=1.0 / 3.0)
     parser.add_argument("--max-train-steps", type=int, default=0)
+    parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--checkpoint-every", type=int, default=1000)
     parser.add_argument("--profile", action="store_true")
@@ -383,6 +385,43 @@ def _to_host(tree: T) -> T:
     :returns: PyTree with host arrays.
     """
     return cast(T, jax.device_get(tree))
+
+
+def _add_trees(tree_a: T, tree_b: T) -> T:
+    """Add two PyTrees with optional None leaves.
+
+    :param tree_a: First PyTree.
+    :param tree_b: Second PyTree.
+    :returns: PyTree containing summed leaves.
+    """
+
+    def _add(a: object, b: object) -> object:
+        if a is None and b is None:
+            return None
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return a + b
+
+    return cast(T, jax.tree_util.tree_map(_add, tree_a, tree_b))
+
+
+def _scale_tree(tree: T, scale: int) -> T:
+    """Scale all array leaves in a PyTree by a scalar.
+
+    :param tree: PyTree containing arrays.
+    :param scale: Scalar divisor.
+    :returns: PyTree with scaled array leaves.
+    """
+    scale_f = jnp.asarray(scale, dtype=jnp.float32)
+    return cast(
+        T,
+        jax.tree_util.tree_map(
+            lambda value: value / scale_f if value is not None else None,
+            tree,
+        ),
+    )
 
 
 def _build_sharding(devices: list[jax.Device]) -> tuple[Mesh, NamedSharding, NamedSharding]:
@@ -1267,6 +1306,8 @@ def main() -> None:
 
     if args.max_train_steps < 0:
         raise ValueError("max-train-steps must be >= 0")
+    if args.grad_accum_steps <= 0:
+        raise ValueError("grad-accum-steps must be > 0")
     if args.log_every <= 0:
         raise ValueError("log-every must be > 0")
     if args.checkpoint_every <= 0:
@@ -1500,6 +1541,7 @@ def main() -> None:
         },
         "training": {
             "max_train_steps": args.max_train_steps,
+            "grad_accum_steps": args.grad_accum_steps,
             "per_device_batch_size": args.per_device_batch_size,
             "num_devices": num_devices,
             "seed": args.seed,
@@ -1595,39 +1637,27 @@ def main() -> None:
 
     opt_state: MuonWithAdamWFallbackState = optimizer.init(params)
 
+    opt_state: MuonWithAdamWFallbackState = optimizer.init(params)
+
     if args.masked_probe is True:
         if args.use_swa_teacher is True:
-            def train_step(
+            def grad_step(
                 bundle_in: TextTrainBundle,
                 teacher_in: TextTransformer,
-                swa_count_in: Array,
-                state_in: MuonWithAdamWFallbackState,
                 batch_tokens: Array,
                 batch_mask: Array,
                 key: Array,
                 global_step: Array,
-            ) -> tuple[
-                TextTrainBundle,
-                TextTransformer,
-                Array,
-                MuonWithAdamWFallbackState,
-                Array,
-                Array,
-                Array,
-                Array,
-                Array,
-            ]:
-                """Run one training step with the masked-token probe and SWA teacher.
+            ) -> tuple[eqx.Module, Array, Array, Array, Array, Array]:
+                """Compute gradients and metrics with the masked-token probe and SWA teacher.
 
                 :param bundle_in: Replicated model and probe bundle.
                 :param teacher_in: SWA teacher model.
-                :param swa_count_in: SWA averaging count.
-                :param state_in: Replicated optimizer state.
                 :param batch_tokens: Token batch of shape (B, T).
                 :param batch_mask: Attention mask of shape (B, T).
                 :param key: PRNG key for view masking.
                 :param global_step: Global step index for loss scheduling.
-                :returns: Updated bundle, teacher, optimizer state, and metrics.
+                :returns: Tuple of (grads, model loss, pred loss, sigreg loss, probe loss, probe acc).
                 """
 
                 def _loss_fn(
@@ -1684,16 +1714,38 @@ def main() -> None:
                     total = model_loss + probe_loss
                     return total, (model_loss, pred, sigreg, probe_loss, probe_acc)
 
-                (
-                    total_loss,
-                    (loss, pred_loss, sigreg_loss, probe_loss, probe_acc),
-                ), grads = eqx.filter_value_and_grad(
+                (_, (model_loss, pred_loss, sigreg_loss, probe_loss, probe_acc)), grads = eqx.filter_value_and_grad(
                     _loss_fn, has_aux=True
                 )((bundle_in, teacher_in))
                 grads = jax.lax.pmean(grads, axis_name="data")
                 bundle_grads, _teacher_grads = grads
+                model_loss = jax.lax.pmean(model_loss, axis_name="data")
+                pred_loss = jax.lax.pmean(pred_loss, axis_name="data")
+                sigreg_loss = jax.lax.pmean(sigreg_loss, axis_name="data")
+                probe_loss = jax.lax.pmean(probe_loss, axis_name="data")
+                probe_acc = jax.lax.pmean(probe_acc, axis_name="data")
+                return bundle_grads, model_loss, pred_loss, sigreg_loss, probe_loss, probe_acc
+
+            def apply_step(
+                bundle_in: TextTrainBundle,
+                teacher_in: TextTransformer,
+                swa_count_in: Array,
+                state_in: MuonWithAdamWFallbackState,
+                grads: eqx.Module,
+                global_step: Array,
+            ) -> tuple[TextTrainBundle, TextTransformer, Array, MuonWithAdamWFallbackState]:
+                """Apply gradients and update the SWA teacher.
+
+                :param bundle_in: Replicated model and probe bundle.
+                :param teacher_in: SWA teacher model.
+                :param swa_count_in: SWA averaging count.
+                :param state_in: Replicated optimizer state.
+                :param grads: Gradient PyTree for the bundle.
+                :param global_step: Global step index for SWA scheduling.
+                :returns: Updated bundle, teacher, SWA count, and optimizer state.
+                """
                 params_inner = eqx.filter(bundle_in, eqx.is_array)
-                updates, new_state = optimizer.update(bundle_grads, state_in, params_inner)
+                updates, new_state = optimizer.update(grads, state_in, params_inner)
                 new_bundle = eqx.apply_updates(bundle_in, updates)
                 new_teacher, new_swa_count = _maybe_swa_update(
                     teacher_in,
@@ -1702,56 +1754,35 @@ def main() -> None:
                     global_step=global_step,
                     start_step=args.swa_start_step,
                 )
-                _ = total_loss
-                loss = jax.lax.pmean(loss, axis_name="data")
-                pred_loss = jax.lax.pmean(pred_loss, axis_name="data")
-                sigreg_loss = jax.lax.pmean(sigreg_loss, axis_name="data")
-                probe_loss = jax.lax.pmean(probe_loss, axis_name="data")
-                probe_acc = jax.lax.pmean(probe_acc, axis_name="data")
-                return (
-                    new_bundle,
-                    new_teacher,
-                    new_swa_count,
-                    new_state,
-                    loss,
-                    pred_loss,
-                    sigreg_loss,
-                    probe_loss,
-                    probe_acc,
-                )
+                return new_bundle, new_teacher, new_swa_count, new_state
 
-            train_step_pmap = eqx.filter_pmap(
-                train_step,
+            grad_step_pmap = eqx.filter_pmap(
+                grad_step,
+                axis_name="data",
+                devices=device_list,
+            )  # type: ignore[call-overload]
+            apply_step_pmap = eqx.filter_pmap(
+                apply_step,
                 axis_name="data",
                 devices=device_list,
                 donate="all",
             )  # type: ignore[call-overload]
         else:
-            def train_step(
+            def grad_step(
                 bundle_in: TextTrainBundle,
-                state_in: MuonWithAdamWFallbackState,
                 batch_tokens: Array,
                 batch_mask: Array,
                 key: Array,
                 global_step: Array,
-            ) -> tuple[
-                TextTrainBundle,
-                MuonWithAdamWFallbackState,
-                Array,
-                Array,
-                Array,
-                Array,
-                Array,
-            ]:
-                """Run one training step with the masked-token probe.
+            ) -> tuple[eqx.Module, Array, Array, Array, Array, Array]:
+                """Compute gradients and metrics with the masked-token probe.
 
                 :param bundle_in: Replicated model and probe bundle.
-                :param state_in: Replicated optimizer state.
                 :param batch_tokens: Token batch of shape (B, T).
                 :param batch_mask: Attention mask of shape (B, T).
                 :param key: PRNG key for view masking.
                 :param global_step: Global step index for loss scheduling.
-                :returns: Updated bundle, optimizer state, and metrics.
+                :returns: Tuple of (grads, model loss, pred loss, sigreg loss, probe loss, probe acc).
                 """
 
                 def _loss_fn(
@@ -1805,69 +1836,64 @@ def main() -> None:
                     total = model_loss + probe_loss
                     return total, (model_loss, pred, sigreg, probe_loss, probe_acc)
 
-                (
-                    total_loss,
-                    (loss, pred_loss, sigreg_loss, probe_loss, probe_acc),
-                ), grads = eqx.filter_value_and_grad(
+                (_, (model_loss, pred_loss, sigreg_loss, probe_loss, probe_acc)), grads = eqx.filter_value_and_grad(
                     _loss_fn, has_aux=True
                 )(bundle_in)
                 grads = jax.lax.pmean(grads, axis_name="data")
-                params_inner = eqx.filter(bundle_in, eqx.is_array)
-                updates, new_state = optimizer.update(grads, state_in, params_inner)
-                new_bundle = eqx.apply_updates(bundle_in, updates)
-                _ = total_loss
-                loss = jax.lax.pmean(loss, axis_name="data")
+                model_loss = jax.lax.pmean(model_loss, axis_name="data")
                 pred_loss = jax.lax.pmean(pred_loss, axis_name="data")
                 sigreg_loss = jax.lax.pmean(sigreg_loss, axis_name="data")
                 probe_loss = jax.lax.pmean(probe_loss, axis_name="data")
                 probe_acc = jax.lax.pmean(probe_acc, axis_name="data")
-                return (
-                    new_bundle,
-                    new_state,
-                    loss,
-                    pred_loss,
-                    sigreg_loss,
-                    probe_loss,
-                    probe_acc,
-                )
+                return grads, model_loss, pred_loss, sigreg_loss, probe_loss, probe_acc
 
-            train_step_pmap = eqx.filter_pmap(
-                train_step,
+            def apply_step(
+                bundle_in: TextTrainBundle,
+                state_in: MuonWithAdamWFallbackState,
+                grads: eqx.Module,
+            ) -> tuple[TextTrainBundle, MuonWithAdamWFallbackState]:
+                """Apply gradients to the bundle.
+
+                :param bundle_in: Replicated model and probe bundle.
+                :param state_in: Replicated optimizer state.
+                :param grads: Gradient PyTree for the bundle.
+                :returns: Updated bundle and optimizer state.
+                """
+                params_inner = eqx.filter(bundle_in, eqx.is_array)
+                updates, new_state = optimizer.update(grads, state_in, params_inner)
+                new_bundle = eqx.apply_updates(bundle_in, updates)
+                return new_bundle, new_state
+
+            grad_step_pmap = eqx.filter_pmap(
+                grad_step,
+                axis_name="data",
+                devices=device_list,
+            )  # type: ignore[call-overload]
+            apply_step_pmap = eqx.filter_pmap(
+                apply_step,
                 axis_name="data",
                 devices=device_list,
                 donate="all",
             )  # type: ignore[call-overload]
     else:
         if args.use_swa_teacher is True:
-            def train_step(
+            def grad_step(
                 model_in: TextTransformer,
                 teacher_in: TextTransformer,
-                swa_count_in: Array,
-                state_in: MuonWithAdamWFallbackState,
                 batch_tokens: Array,
                 batch_mask: Array,
                 key: Array,
                 global_step: Array,
-            ) -> tuple[
-                TextTransformer,
-                TextTransformer,
-                Array,
-                MuonWithAdamWFallbackState,
-                Array,
-                Array,
-                Array,
-            ]:
-                """Run one training step with an SWA teacher.
+            ) -> tuple[eqx.Module, Array, Array, Array]:
+                """Compute gradients and metrics with an SWA teacher.
 
                 :param model_in: Replicated model.
                 :param teacher_in: SWA teacher model.
-                :param swa_count_in: SWA averaging count.
-                :param state_in: Replicated optimizer state.
                 :param batch_tokens: Token batch of shape (B, T).
                 :param batch_mask: Attention mask of shape (B, T).
                 :param key: PRNG key for view masking.
                 :param global_step: Global step index for loss scheduling.
-                :returns: Updated model, teacher, optimizer state, and losses.
+                :returns: Tuple of (grads, model loss, pred loss, sigreg loss).
                 """
 
                 def _loss_fn(
@@ -1917,8 +1943,31 @@ def main() -> None:
                 )((model_in, teacher_in))
                 grads = jax.lax.pmean(grads, axis_name="data")
                 model_grads, _teacher_grads = grads
+                loss = jax.lax.pmean(loss, axis_name="data")
+                pred_loss = jax.lax.pmean(pred_loss, axis_name="data")
+                sigreg_loss = jax.lax.pmean(sigreg_loss, axis_name="data")
+                return model_grads, loss, pred_loss, sigreg_loss
+
+            def apply_step(
+                model_in: TextTransformer,
+                teacher_in: TextTransformer,
+                swa_count_in: Array,
+                state_in: MuonWithAdamWFallbackState,
+                grads: eqx.Module,
+                global_step: Array,
+            ) -> tuple[TextTransformer, TextTransformer, Array, MuonWithAdamWFallbackState]:
+                """Apply gradients and update the SWA teacher.
+
+                :param model_in: Replicated model.
+                :param teacher_in: SWA teacher model.
+                :param swa_count_in: SWA averaging count.
+                :param state_in: Replicated optimizer state.
+                :param grads: Gradient PyTree for the model.
+                :param global_step: Global step index for SWA scheduling.
+                :returns: Updated model, teacher, SWA count, and optimizer state.
+                """
                 params_inner = eqx.filter(model_in, eqx.is_array)
-                updates, new_state = optimizer.update(model_grads, state_in, params_inner)
+                updates, new_state = optimizer.update(grads, state_in, params_inner)
                 new_model = eqx.apply_updates(model_in, updates)
                 new_teacher, new_swa_count = _maybe_swa_update(
                     teacher_in,
@@ -1927,35 +1976,35 @@ def main() -> None:
                     global_step=global_step,
                     start_step=args.swa_start_step,
                 )
-                loss = jax.lax.pmean(loss, axis_name="data")
-                pred_loss = jax.lax.pmean(pred_loss, axis_name="data")
-                sigreg_loss = jax.lax.pmean(sigreg_loss, axis_name="data")
-                return new_model, new_teacher, new_swa_count, new_state, loss, pred_loss, sigreg_loss
+                return new_model, new_teacher, new_swa_count, new_state
 
-            train_step_pmap = eqx.filter_pmap(
-                train_step,
+            grad_step_pmap = eqx.filter_pmap(
+                grad_step,
+                axis_name="data",
+                devices=device_list,
+            )  # type: ignore[call-overload]
+            apply_step_pmap = eqx.filter_pmap(
+                apply_step,
                 axis_name="data",
                 devices=device_list,
                 donate="all",
             )  # type: ignore[call-overload]
         else:
-            def train_step(
+            def grad_step(
                 model_in: TextTransformer,
-                state_in: MuonWithAdamWFallbackState,
                 batch_tokens: Array,
                 batch_mask: Array,
                 key: Array,
                 global_step: Array,
-            ) -> tuple[TextTransformer, MuonWithAdamWFallbackState, Array, Array, Array]:
-                """Run one training step.
+            ) -> tuple[eqx.Module, Array, Array, Array]:
+                """Compute gradients and metrics.
 
                 :param model_in: Replicated model.
-                :param state_in: Replicated optimizer state.
                 :param batch_tokens: Token batch of shape (B, T).
                 :param batch_mask: Attention mask of shape (B, T).
                 :param key: PRNG key for view masking.
                 :param global_step: Global step index for loss scheduling.
-                :returns: Updated model, optimizer state, and losses.
+                :returns: Tuple of (grads, model loss, pred loss, sigreg loss).
                 """
 
                 def _loss_fn(model_inner: TextTransformer) -> tuple[Array, tuple[Array, Array]]:
@@ -1999,16 +2048,35 @@ def main() -> None:
                     _loss_fn, has_aux=True
                 )(model_in)
                 grads = jax.lax.pmean(grads, axis_name="data")
-                params_inner = eqx.filter(model_in, eqx.is_array)
-                updates, new_state = optimizer.update(grads, state_in, params_inner)
-                new_model = eqx.apply_updates(model_in, updates)
                 loss = jax.lax.pmean(loss, axis_name="data")
                 pred_loss = jax.lax.pmean(pred_loss, axis_name="data")
                 sigreg_loss = jax.lax.pmean(sigreg_loss, axis_name="data")
-                return new_model, new_state, loss, pred_loss, sigreg_loss
+                return grads, loss, pred_loss, sigreg_loss
 
-            train_step_pmap = eqx.filter_pmap(
-                train_step,
+            def apply_step(
+                model_in: TextTransformer,
+                state_in: MuonWithAdamWFallbackState,
+                grads: eqx.Module,
+            ) -> tuple[TextTransformer, MuonWithAdamWFallbackState]:
+                """Apply gradients to the model.
+
+                :param model_in: Replicated model.
+                :param state_in: Replicated optimizer state.
+                :param grads: Gradient PyTree for the model.
+                :returns: Updated model and optimizer state.
+                """
+                params_inner = eqx.filter(model_in, eqx.is_array)
+                updates, new_state = optimizer.update(grads, state_in, params_inner)
+                new_model = eqx.apply_updates(model_in, updates)
+                return new_model, new_state
+
+            grad_step_pmap = eqx.filter_pmap(
+                grad_step,
+                axis_name="data",
+                devices=device_list,
+            )  # type: ignore[call-overload]
+            apply_step_pmap = eqx.filter_pmap(
+                apply_step,
                 axis_name="data",
                 devices=device_list,
                 donate="all",
@@ -2055,9 +2123,10 @@ def main() -> None:
     if epoch_steps <= 0:
         raise ValueError("dataset too small for the configured batch size")
     if args.max_train_steps > 0:
-        total_steps = min(args.max_train_steps, epoch_steps)
+        total_micro_steps = min(epoch_steps, args.max_train_steps * args.grad_accum_steps)
     else:
-        total_steps = epoch_steps
+        total_micro_steps = epoch_steps
+    total_steps = int(math.ceil(total_micro_steps / args.grad_accum_steps))
 
     try:
         train_iter_host = _iter_batches(
@@ -2075,92 +2144,148 @@ def main() -> None:
         )
         train_iter = iter(train_iter)
 
+        micro_step = 0
         with tqdm(total=total_steps, desc="Train") as pbar:
             for _ in range(total_steps):
+                if micro_step >= total_micro_steps:
+                    break
+                micro_steps = min(args.grad_accum_steps, total_micro_steps - micro_step)
+                if micro_steps <= 0:
+                    break
                 step_start = time.perf_counter()
-                batch_tokens, batch_mask = next(train_iter)
-                data_done = time.perf_counter()
+                data_time = 0.0
+                compute_time = 0.0
+                grad_accum = None
+                loss_sum = None
+                pred_sum = None
+                sigreg_sum = None
+                probe_loss_sum = None
+                probe_acc_sum = None
                 step_key = jax.random.fold_in(base_key, global_step)
-                device_keys = jax.random.split(step_key, num_devices)
-                device_keys = jax.device_put(device_keys, device=data_sharding)
                 step_id = jnp.full((num_devices,), global_step, dtype=jnp.int32)
 
+                for _micro_idx in range(micro_steps):
+                    fetch_start = time.perf_counter()
+                    batch_tokens, batch_mask = next(train_iter)
+                    data_time += time.perf_counter() - fetch_start
+                    micro_key = jax.random.fold_in(step_key, micro_step)
+                    device_keys = jax.random.split(micro_key, num_devices)
+                    device_keys = jax.device_put(device_keys, device=data_sharding)
+
+                    compute_start = time.perf_counter()
+                    if args.masked_probe is True:
+                        if args.use_swa_teacher is True:
+                            if teacher_repl is None:
+                                raise ValueError("teacher state must be initialized when use-swa-teacher is enabled")
+                            grads, loss, pred, sigreg, probe_loss, probe_acc = grad_step_pmap(
+                                train_repl,
+                                teacher_repl,
+                                batch_tokens,
+                                batch_mask,
+                                device_keys,
+                                step_id,
+                            )
+                        else:
+                            grads, loss, pred, sigreg, probe_loss, probe_acc = grad_step_pmap(
+                                train_repl,
+                                batch_tokens,
+                                batch_mask,
+                                device_keys,
+                                step_id,
+                            )
+                    else:
+                        if args.use_swa_teacher is True:
+                            if teacher_repl is None:
+                                raise ValueError("teacher state must be initialized when use-swa-teacher is enabled")
+                            grads, loss, pred, sigreg = grad_step_pmap(
+                                train_repl,
+                                teacher_repl,
+                                batch_tokens,
+                                batch_mask,
+                                device_keys,
+                                step_id,
+                            )
+                        else:
+                            grads, loss, pred, sigreg = grad_step_pmap(
+                                train_repl,
+                                batch_tokens,
+                                batch_mask,
+                                device_keys,
+                                step_id,
+                            )
+                    compute_time += time.perf_counter() - compute_start
+
+                    if grad_accum is None:
+                        grad_accum = grads
+                    else:
+                        grad_accum = _add_trees(grad_accum, grads)
+
+                    loss_sum = loss if loss_sum is None else loss_sum + loss
+                    pred_sum = pred if pred_sum is None else pred_sum + pred
+                    sigreg_sum = sigreg if sigreg_sum is None else sigreg_sum + sigreg
+                    if args.masked_probe is True:
+                        probe_loss_sum = probe_loss if probe_loss_sum is None else probe_loss_sum + probe_loss
+                        probe_acc_sum = probe_acc if probe_acc_sum is None else probe_acc_sum + probe_acc
+
+                    micro_step += 1
+
+                if grad_accum is None or loss_sum is None or pred_sum is None or sigreg_sum is None:
+                    break
+
+                grad_accum = _scale_tree(grad_accum, micro_steps)
+                scale = jnp.asarray(micro_steps, dtype=jnp.float32)
+                loss = loss_sum / scale
+                pred = pred_sum / scale
+                sigreg = sigreg_sum / scale
+                if args.masked_probe is True:
+                    if probe_loss_sum is None or probe_acc_sum is None:
+                        raise ValueError("probe metrics were not accumulated")
+                    probe_loss = probe_loss_sum / scale
+                    probe_acc = probe_acc_sum / scale
+
+                compute_start = time.perf_counter()
                 if args.masked_probe is True:
                     if args.use_swa_teacher is True:
                         if teacher_repl is None or swa_count_repl is None:
                             raise ValueError("teacher state must be initialized when use-swa-teacher is enabled")
-                        (
+                        train_repl, teacher_repl, swa_count_repl, opt_state_repl = apply_step_pmap(
                             train_repl,
                             teacher_repl,
                             swa_count_repl,
                             opt_state_repl,
-                            loss,
-                            pred,
-                            sigreg,
-                            probe_loss,
-                            probe_acc,
-                        ) = train_step_pmap(
-                            train_repl,
-                            teacher_repl,
-                            swa_count_repl,
-                            opt_state_repl,
-                            batch_tokens,
-                            batch_mask,
-                            device_keys,
+                            grad_accum,
                             step_id,
                         )
                     else:
-                        (
+                        train_repl, opt_state_repl = apply_step_pmap(
                             train_repl,
                             opt_state_repl,
-                            loss,
-                            pred,
-                            sigreg,
-                            probe_loss,
-                            probe_acc,
-                        ) = train_step_pmap(
-                            train_repl,
-                            opt_state_repl,
-                            batch_tokens,
-                            batch_mask,
-                            device_keys,
-                            step_id,
+                            grad_accum,
                         )
                 else:
                     if args.use_swa_teacher is True:
                         if teacher_repl is None or swa_count_repl is None:
                             raise ValueError("teacher state must be initialized when use-swa-teacher is enabled")
-                        (
+                        train_repl, teacher_repl, swa_count_repl, opt_state_repl = apply_step_pmap(
                             train_repl,
                             teacher_repl,
                             swa_count_repl,
                             opt_state_repl,
-                            loss,
-                            pred,
-                            sigreg,
-                        ) = train_step_pmap(
-                            train_repl,
-                            teacher_repl,
-                            swa_count_repl,
-                            opt_state_repl,
-                            batch_tokens,
-                            batch_mask,
-                            device_keys,
+                            grad_accum,
                             step_id,
                         )
                     else:
-                        train_repl, opt_state_repl, loss, pred, sigreg = train_step_pmap(
+                        train_repl, opt_state_repl = apply_step_pmap(
                             train_repl,
                             opt_state_repl,
-                            batch_tokens,
-                            batch_mask,
-                            device_keys,
-                            step_id,
+                            grad_accum,
                         )
+                compute_time += time.perf_counter() - compute_start
+
                 if args.profile:
                     jax.block_until_ready(loss)
-                compute_done = time.perf_counter()
 
+                log_start = time.perf_counter()
                 log_this_step = (global_step % args.log_every) == 0
                 if log_this_step:
                     loss_val = float(np.mean(jax.device_get(loss)))
@@ -2203,9 +2328,9 @@ def main() -> None:
                 if args.profile:
                     if perf_steps + perf_warmup < global_step:
                         perf_steps += 1
-                        perf_data_time += data_done - step_start
-                        perf_compute_time += compute_done - data_done
-                        perf_log_time += log_done - compute_done
+                        perf_data_time += data_time
+                        perf_compute_time += compute_time
+                        perf_log_time += log_done - log_start
 
                 if global_step % args.checkpoint_every == 0:
                     jax.block_until_ready(loss)
