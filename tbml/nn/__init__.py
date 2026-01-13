@@ -1,4 +1,4 @@
-from .attention import GatedPositionalSelfAttention, PoPESelfAttention, SelfAttention
+from .attention import GatedPositionalSelfAttention, PoPESelfAttention, RoPESelfAttention, SelfAttention
 from .droppath import DropPath
 from .gelu import GELUFeedForward
 from .identity import Identity
@@ -13,6 +13,7 @@ __all__ = [
     "GELUFeedForward",
     "GatedPositionalSelfAttention",
     "PoPESelfAttention",
+    "RoPESelfAttention",
     "SelfAttention",
     "Identity",
     "Linear",
