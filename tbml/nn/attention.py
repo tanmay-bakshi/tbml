@@ -431,7 +431,13 @@ class PoPESelfAttention(eqx.Module):
         )
         self.attn_dropout_layer = eqx.nn.Dropout(attn_dropout)
         self.resid_dropout_layer = eqx.nn.Dropout(resid_dropout)
-        self.delta = jnp.zeros((n_heads, head_dim), dtype=param_dtype)
+        self.delta = jax.random.uniform(
+            delta_key,
+            (n_heads, head_dim),
+            minval=-2.0 * math.pi,
+            maxval=0.0,
+            dtype=param_dtype,
+        )
 
     def __call__(
         self,
