@@ -20,7 +20,7 @@ from tqdm import tqdm  # type: ignore[import-untyped]
 
 from tbml.experiments.honeycomb.loss import lejepa_loss, sigreg_loss_views
 from tbml.experiments.honeycomb.text.dataset import (
-    StreamingTextDataset,
+    MMapTokenDataset,
     _build_tokenizer,
     iter_text_batches,
 )
@@ -36,12 +36,6 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a text encoder with LeJEPA.")
     parser.add_argument("--runs-folder", type=str, required=True)
     parser.add_argument("--data-folder", type=str, required=True)
-    parser.add_argument("--text-field", type=str, default="text")
-    parser.add_argument("--tokenizer", type=str, default="gpt2")
-    parser.add_argument("--eos-token", type=str, default="<|endoftext|>")
-    parser.add_argument("--pad-token", type=str, default="<|pad|>")
-    parser.add_argument("--mask-token", type=str, default="<|mask|>")
-    parser.add_argument("--max-seq-len", type=int, default=256)
     parser.add_argument("--shuffle-buffer", type=int, default=1024)
     parser.add_argument("--max-train-steps", type=int, default=0)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
@@ -51,7 +45,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--profile-warmup-steps", type=int, default=1)
     parser.add_argument("--per-device-batch-size", type=int, default=32)
     parser.add_argument("--num-devices", type=int, default=0)
-    parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--prefetch", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "bfloat16", "float16"])
@@ -167,49 +160,6 @@ def _decode_tokens(
     else:
         trimmed = token_ids
     return tokenizer.decode(trimmed.tolist(), skip_special_tokens=False)
-
-
-def _list_jsonl_files(folder: str) -> list[str]:
-    """Collect JSONL file paths from a folder.
-
-    :param folder: Directory containing JSONL files.
-    :returns: Sorted list of JSONL file paths.
-    """
-    if os.path.isdir(folder) is False:
-        raise FileNotFoundError(f"data folder not found: {folder}")
-    paths: list[str] = []
-    for name in sorted(os.listdir(folder)):
-        if name.endswith(".jsonl") is False:
-            continue
-        path = os.path.join(folder, name)
-        if os.path.isfile(path) is False:
-            continue
-        paths.append(path)
-    if len(paths) == 0:
-        raise FileNotFoundError(f"no .jsonl files found in folder: {folder}")
-    return paths
-
-
-def _count_text_samples(folder: str, text_field: str) -> int:
-    """Count valid text samples across JSONL files.
-
-    :param folder: Directory containing JSONL files.
-    :param text_field: JSON field name containing the text.
-    :returns: Number of valid samples.
-    """
-    files = _list_jsonl_files(folder)
-    total = 0
-    for path in files:
-        with open(path, "r", encoding="utf-8") as handle:
-            for line in handle:
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                text = record.get(text_field)
-                if isinstance(text, str):
-                    total += 1
-    return total
 
 
 def _flatten_param_names(params: eqx.Module) -> list[str]:
@@ -411,20 +361,22 @@ def _prefetch_to_device(
 
 
 def _iter_batches(
-    dataset: StreamingTextDataset,
+    dataset: MMapTokenDataset,
     *,
     batch_size: int,
     max_seq_len: int,
-    pad_id: int,
+    shuffle_buffer: int,
+    seed: int,
     num_devices: int,
     per_device_batch: int,
 ) -> Iterable[np.ndarray]:
-    """Yield device-sharded batches from the streaming dataset.
+    """Yield device-sharded batches from the dataset.
 
-    :param dataset: Streaming dataset instance.
+    :param dataset: Dataset instance.
     :param batch_size: Global batch size.
     :param max_seq_len: Maximum sequence length.
-    :param pad_id: Padding token id.
+    :param shuffle_buffer: Shuffle buffer for sample order.
+    :param seed: Random seed for shuffle order.
     :param num_devices: Number of devices.
     :param per_device_batch: Batch size per device.
     :returns: Iterable of sharded token batches.
@@ -432,8 +384,8 @@ def _iter_batches(
     host_iter = iter_text_batches(
         dataset,
         batch_size=batch_size,
-        max_seq_len=max_seq_len,
-        pad_id=pad_id,
+        shuffle_buffer=shuffle_buffer,
+        seed=seed,
     )
     for tokens in host_iter:
         tokens = tokens.reshape((num_devices, per_device_batch, max_seq_len))
@@ -981,7 +933,6 @@ def main() -> None:
     else:
         param_dtype = dtype
     betas = _parse_betas(args.adamw_betas)
-    total_samples = _count_text_samples(args.data_folder, args.text_field)
 
     device_list: list[jax.Device] = _devices_for_platform("gpu")
     if args.num_devices == 0:
@@ -996,34 +947,37 @@ def main() -> None:
     num_devices = len(device_list)
     _mesh, data_sharding, _replicated_sharding = _build_sharding(device_list)
 
-    dataset = StreamingTextDataset(
-        args.data_folder,
-        text_field=args.text_field,
-        tokenizer_name=args.tokenizer,
-        eos_token=args.eos_token,
-        pad_token=args.pad_token,
-        mask_token=args.mask_token,
-        max_seq_len=args.max_seq_len,
-        shuffle_buffer=args.shuffle_buffer,
-        num_workers=args.num_workers,
-        prefetch=args.prefetch,
-        seed=args.seed,
-    )
+    dataset = MMapTokenDataset(args.data_folder)
+    metadata = dataset.metadata()
+    tokenizer_name = metadata.get("tokenizer")
+    eos_token = metadata.get("eos_token")
+    pad_token = metadata.get("pad_token")
+    mask_token = metadata.get("mask_token")
+    if isinstance(tokenizer_name, str) is False:
+        raise ValueError("metadata missing tokenizer")
+    if isinstance(eos_token, str) is False:
+        raise ValueError("metadata missing eos_token")
+    if isinstance(pad_token, str) is False:
+        raise ValueError("metadata missing pad_token")
+    if isinstance(mask_token, str) is False:
+        raise ValueError("metadata missing mask_token")
+    max_seq_len = dataset.max_seq_len
     vocab_size, eos_id, pad_id, mask_id = dataset.tokenizer_info()
+    total_samples = len(dataset)
 
     if args.preview_views is True:
         tokenizer, _eos_id, _pad_id, _mask_id = _build_tokenizer(
-            args.tokenizer,
-            eos_token=args.eos_token,
-            pad_token=args.pad_token,
-            mask_token=args.mask_token,
+            tokenizer_name,
+            eos_token=eos_token,
+            pad_token=pad_token,
+            mask_token=mask_token,
         )
         global_batch = args.per_device_batch_size * num_devices
         preview_iter = iter_text_batches(
             dataset,
             batch_size=global_batch,
-            max_seq_len=args.max_seq_len,
-            pad_id=pad_id,
+            shuffle_buffer=args.shuffle_buffer,
+            seed=args.seed,
         )
         batch_tokens = next(iter(preview_iter))
         key = jax.random.PRNGKey(args.seed)
@@ -1076,7 +1030,7 @@ def main() -> None:
 
     model_config = TextTransformerConfig(
         vocab_size=vocab_size,
-        max_seq_len=args.max_seq_len,
+        max_seq_len=max_seq_len,
         d_model=args.d_model,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
@@ -1095,17 +1049,18 @@ def main() -> None:
     run_config: dict[str, object] = {
         "model": model_config.model_dump(),
         "data": {
-            "text_field": args.text_field,
-            "tokenizer": args.tokenizer,
-            "eos_token": args.eos_token,
-            "pad_token": args.pad_token,
-            "mask_token": args.mask_token,
-            "max_seq_len": args.max_seq_len,
+            "dataset_folder": args.data_folder,
+            "tokenizer": tokenizer_name,
+            "eos_token": eos_token,
+            "pad_token": pad_token,
+            "mask_token": mask_token,
+            "max_seq_len": max_seq_len,
             "shuffle_buffer": args.shuffle_buffer,
             "vocab_size": vocab_size,
             "eos_id": eos_id,
             "pad_id": pad_id,
             "mask_id": mask_id,
+            "num_samples": total_samples,
         },
         "views": {
             "num_global_views": args.num_global_views,
@@ -1146,7 +1101,6 @@ def main() -> None:
             "checkpoint_every": args.checkpoint_every,
             "profile": args.profile,
             "profile_warmup_steps": args.profile_warmup_steps,
-            "num_workers": args.num_workers,
             "prefetch": args.prefetch,
         },
     }
@@ -1330,8 +1284,9 @@ def main() -> None:
         train_iter_host = _iter_batches(
             dataset,
             batch_size=global_batch,
-            max_seq_len=args.max_seq_len,
-            pad_id=pad_id,
+            max_seq_len=max_seq_len,
+            shuffle_buffer=args.shuffle_buffer,
+            seed=args.seed,
             num_devices=num_devices,
             per_device_batch=args.per_device_batch_size,
         )
