@@ -2,13 +2,10 @@ import json
 import multiprocessing as mp
 import os
 import queue
-import threading
 from typing import Iterable, Iterator
 
 import numpy as np
 from tokenizers import Tokenizer
-
-_CUTOFF_PUNCTUATION = (".", "!", "?", ";", ":", ",")
 
 
 def _list_jsonl_files(folder: str) -> list[str]:
@@ -83,9 +80,6 @@ def _worker_loop(
     mask_token: str,
     max_seq_len: int,
     shuffle_buffer: int,
-    full_sample_prob: float,
-    token_truncate_prob: float,
-    text_truncate_prob: float,
     seed: int,
     output_queue: mp.Queue,
     stop_event: mp.Event,
@@ -101,9 +95,6 @@ def _worker_loop(
     :param mask_token: Masking token string.
     :param max_seq_len: Maximum sequence length (including EOS).
     :param shuffle_buffer: Buffer size for streaming shuffle.
-    :param full_sample_prob: Probability of using the full sample.
-    :param token_truncate_prob: Probability of truncating tokens after tokenization.
-    :param text_truncate_prob: Probability of truncating text before tokenization.
     :param seed: Random seed for deterministic shuffling.
     :param output_queue: Multiprocessing queue for emitted samples.
     :param stop_event: Event used to signal worker shutdown.
@@ -117,37 +108,6 @@ def _worker_loop(
     rng = np.random.default_rng(seed)
     buffer: list[list[int]] = []
     file_order = list(files)
-    prob_sum = full_sample_prob + token_truncate_prob + text_truncate_prob
-    if prob_sum <= 0.0:
-        raise ValueError("sum of truncation probabilities must be > 0")
-    full_prob = full_sample_prob / prob_sum
-    token_prob = token_truncate_prob / prob_sum
-
-    def _select_cutoff(text: str) -> int | None:
-        """Select a cutoff point based on punctuation followed by whitespace.
-
-        :param text: Input text.
-        :returns: Cutoff index or None if not found.
-        """
-        cutoffs: list[int] = []
-        for idx, char in enumerate(text):
-            if char not in _CUTOFF_PUNCTUATION:
-                continue
-            next_ws = None
-            for jdx in range(idx + 1, len(text)):
-                if text[jdx].isspace():
-                    next_ws = jdx
-                    break
-            if next_ws is None or next_ws <= 0:
-                continue
-            cutoffs.append(next_ws)
-        if len(cutoffs) == 0:
-            return None
-        unique = sorted(set(cutoffs))
-        weights = np.linspace(float(len(unique)), 1.0, len(unique))
-        weights = weights / np.sum(weights)
-        choice = int(rng.choice(len(unique), p=weights))
-        return unique[choice]
 
     def _emit(item: list[int]) -> None:
         """Emit a tokenized sequence into the output queue.
@@ -180,31 +140,10 @@ def _worker_loop(
                     text = record.get(text_field)
                     if isinstance(text, str) is False:
                         continue
-                    selector = float(rng.random())
-                    if selector < full_prob:
-                        text_to_encode = text
-                        mode = "full"
-                    elif selector < full_prob + token_prob:
-                        text_to_encode = text
-                        mode = "token_truncate"
-                    else:
-                        cutoff = _select_cutoff(text)
-                        if cutoff is None:
-                            text_to_encode = text
-                        else:
-                            text_to_encode = text[:cutoff]
-                        mode = "text_truncate"
-
-                    encoding = tokenizer.encode(text_to_encode, add_special_tokens=False)
+                    encoding = tokenizer.encode(text, add_special_tokens=False)
                     token_ids = list(encoding.ids)
-                    if mode == "token_truncate":
-                        max_trunc = min(len(token_ids), max_seq_len - 2)
-                        if max_trunc > 0:
-                            trunc_len = int(rng.integers(1, max_trunc + 1))
-                            token_ids = token_ids[:trunc_len]
-                    else:
-                        if len(token_ids) > max_seq_len - 1:
-                            token_ids = token_ids[: max_seq_len - 1]
+                    if len(token_ids) > max_seq_len - 1:
+                        token_ids = token_ids[: max_seq_len - 1]
                     token_ids.append(eos_id)
 
                     if shuffle_buffer > 0:
@@ -234,9 +173,6 @@ class StreamingTextDataset:
     _mask_token: str
     _max_seq_len: int
     _shuffle_buffer: int
-    _full_sample_prob: float
-    _token_truncate_prob: float
-    _text_truncate_prob: float
     _num_workers: int
     _prefetch: int
     _seed: int
@@ -256,9 +192,6 @@ class StreamingTextDataset:
         mask_token: str,
         max_seq_len: int,
         shuffle_buffer: int,
-        full_sample_prob: float,
-        token_truncate_prob: float,
-        text_truncate_prob: float,
         num_workers: int,
         prefetch: int,
         seed: int,
@@ -273,9 +206,6 @@ class StreamingTextDataset:
         :param mask_token: Masking token string.
         :param max_seq_len: Maximum sequence length (including EOS).
         :param shuffle_buffer: Buffer size for streaming shuffle.
-        :param full_sample_prob: Probability of using the full sample.
-        :param token_truncate_prob: Probability of truncating tokens after tokenization.
-        :param text_truncate_prob: Probability of truncating text before tokenization.
         :param num_workers: Number of worker processes.
         :param prefetch: Prefetch depth per worker.
         :param seed: Random seed for deterministic streaming order.
@@ -288,10 +218,6 @@ class StreamingTextDataset:
             raise ValueError("num_workers must be > 0")
         if prefetch <= 0:
             raise ValueError("prefetch must be > 0")
-        if full_sample_prob < 0.0 or token_truncate_prob < 0.0 or text_truncate_prob < 0.0:
-            raise ValueError("truncation probabilities must be >= 0")
-        if full_sample_prob + token_truncate_prob + text_truncate_prob <= 0.0:
-            raise ValueError("sum of truncation probabilities must be > 0")
 
         files = _list_jsonl_files(folder)
         effective_workers = min(num_workers, len(files))
@@ -306,9 +232,6 @@ class StreamingTextDataset:
         self._mask_token = mask_token
         self._max_seq_len = max_seq_len
         self._shuffle_buffer = shuffle_buffer
-        self._full_sample_prob = full_sample_prob
-        self._token_truncate_prob = token_truncate_prob
-        self._text_truncate_prob = text_truncate_prob
         self._num_workers = effective_workers
         self._prefetch = prefetch
         self._seed = seed
@@ -397,9 +320,6 @@ class StreamingTextDataset:
                     "mask_token": self._mask_token,
                     "max_seq_len": self._max_seq_len,
                     "shuffle_buffer": self._shuffle_buffer,
-                    "full_sample_prob": self._full_sample_prob,
-                    "token_truncate_prob": self._token_truncate_prob,
-                    "text_truncate_prob": self._text_truncate_prob,
                     "seed": worker_seed,
                     "output_queue": queues[idx],
                     "stop_event": self._stop_event,
@@ -420,14 +340,14 @@ def iter_text_batches(
     batch_size: int,
     max_seq_len: int,
     pad_id: int,
-) -> Iterable[tuple[np.ndarray, np.ndarray]]:
-    """Yield padded batches of tokens and attention masks.
+) -> Iterable[np.ndarray]:
+    """Yield padded batches of tokens.
 
     :param dataset: Streaming dataset instance.
     :param batch_size: Batch size per host.
     :param max_seq_len: Maximum sequence length.
     :param pad_id: Padding token id.
-    :returns: Iterable of (tokens, attention_mask) batches.
+    :returns: Iterable of token batches.
     """
     if batch_size <= 0:
         raise ValueError("batch_size must be > 0")
@@ -437,11 +357,9 @@ def iter_text_batches(
     iterator = iter(dataset)
     while True:
         tokens = np.full((batch_size, max_seq_len), pad_id, dtype=np.int32)
-        attention_mask = np.zeros((batch_size, max_seq_len), dtype=np.bool_)
         for idx in range(batch_size):
             sample = next(iterator)
             length = min(len(sample), max_seq_len)
             if length > 0:
                 tokens[idx, :length] = np.asarray(sample[:length], dtype=np.int32)
-                attention_mask[idx, :length] = True
-        yield tokens, attention_mask
+        yield tokens
