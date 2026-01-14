@@ -21,6 +21,9 @@ def _zeros_like_or_none(value: Any) -> Any:
     """
     if value is None:
         return None
+    if isinstance(value, jax.Array):
+        if value.dtype in (jnp.float16, jnp.bfloat16):
+            return jnp.zeros(value.shape, dtype=jnp.float32)
     return jnp.zeros_like(value)
 
 
@@ -127,27 +130,33 @@ class MuonWithAdamWFallback:
             if velocity is None or m is None or v is None:
                 raise ValueError("Optimizer state missing for parameter.")
 
+            param_f32 = param.astype(jnp.float32)
+            grad_f32 = grad.astype(jnp.float32)
+            velocity_f32 = velocity.astype(jnp.float32)
+            m_f32 = m.astype(jnp.float32)
+            v_f32 = v.astype(jnp.float32)
+
             if use_muon is True:
-                if param.ndim != 2:
+                if param_f32.ndim != 2:
                     raise ValueError("Muon parameters must be 2D matrices.")
-                new_velocity = (self.muon_momentum * velocity) + grad
+                new_velocity = (self.muon_momentum * velocity_f32) + grad_f32
                 if self.muon_nesterov is True:
-                    raw_update = grad + self.muon_momentum * new_velocity
+                    raw_update = grad_f32 + self.muon_momentum * new_velocity
                 else:
                     raw_update = new_velocity
                 ortho_update = _muon_orthogonalize(raw_update, use_qkv)
                 update = -self.muon_learning_rate * ortho_update
                 if self.muon_weight_decay != 0.0:
-                    update = update - (self.muon_learning_rate * self.muon_weight_decay) * param
-                return update, new_velocity, m, v
+                    update = update - (self.muon_learning_rate * self.muon_weight_decay) * param_f32
+                return update, new_velocity, m_f32, v_f32
 
-            new_m = b1 * m + (1.0 - b1) * grad
-            new_v = b2 * v + (1.0 - b2) * grad * grad
+            new_m = b1 * m_f32 + (1.0 - b1) * grad_f32
+            new_v = b2 * v_f32 + (1.0 - b2) * grad_f32 * grad_f32
             denom = jnp.sqrt(new_v) + self.adamw_eps
             update = -self.adamw_learning_rate * new_m / denom
-            if self.adamw_weight_decay != 0.0 and param.ndim >= 2:
-                update = update - (self.adamw_learning_rate * self.adamw_weight_decay) * param
-            return update, velocity, new_m, new_v
+            if self.adamw_weight_decay != 0.0 and param_f32.ndim >= 2:
+                update = update - (self.adamw_learning_rate * self.adamw_weight_decay) * param_f32
+            return update, velocity_f32, new_m, new_v
 
         mapped = jax.tree_util.tree_map(
             _update_one,
@@ -208,15 +217,9 @@ def _newton_schulz_5(matrix: Array, *, steps: int, eps: float) -> Array:
     b = -4.7750
     c = 2.0315
 
-    original_dtype = matrix.dtype
-    if matrix.dtype in (jnp.float16, jnp.bfloat16):
-        work_dtype = matrix.dtype
-    else:
-        work_dtype = jnp.float32
-
-    work = matrix.astype(work_dtype)
+    work = matrix.astype(jnp.float32)
     norm = jnp.sqrt(jnp.sum(jnp.square(work.astype(jnp.float32))))
-    inv_norm = jnp.asarray(1.0 / (norm + eps), dtype=work_dtype)
+    inv_norm = jnp.asarray(1.0 / (norm + eps), dtype=jnp.float32)
     work = work * inv_norm
 
     transposed = work.shape[0] > work.shape[1]
@@ -234,7 +237,7 @@ def _newton_schulz_5(matrix: Array, *, steps: int, eps: float) -> Array:
     if transposed is True:
         work = jnp.swapaxes(work, 0, 1)
 
-    return work.astype(original_dtype)
+    return work
 
 
 def build_muon_masks(

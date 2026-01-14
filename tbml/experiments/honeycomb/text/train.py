@@ -438,6 +438,22 @@ def _scale_tree(tree: T, scale: int) -> T:
     )
 
 
+def _cast_tree_dtype(tree: T, dtype: jnp.dtype) -> T:
+    """Cast array leaves in a PyTree to a dtype.
+
+    :param tree: PyTree containing array leaves.
+    :param dtype: Target dtype for array leaves.
+    :returns: PyTree with casted array leaves.
+    """
+    return cast(
+        T,
+        jax.tree_util.tree_map(
+            lambda value: value.astype(dtype) if eqx.is_array(value) else value,
+            tree,
+        ),
+    )
+
+
 def _build_sharding(devices: list[jax.Device]) -> tuple[Mesh, NamedSharding, NamedSharding]:
     """Build sharding helpers for data and replicated params.
 
@@ -1268,7 +1284,7 @@ def _masked_probe_metrics(
     reps = jax.lax.stop_gradient(token_reps)
     targets = jnp.broadcast_to(tokens[:, None, :], mask_positions.shape)
     logits = probe(reps)
-    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    log_probs = jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)
     target_log_probs = jnp.take_along_axis(log_probs, targets[..., None], axis=-1).squeeze(-1)
     nll = -target_log_probs
     mask = mask_positions.astype(nll.dtype)
@@ -1380,6 +1396,10 @@ def main() -> None:
         raise ValueError("masked-probe is only supported with masking-mode 'tokens'")
 
     dtype = _dtype_from_name(args.dtype)
+    if dtype in (jnp.bfloat16, jnp.float16):
+        param_dtype = jnp.float32
+    else:
+        param_dtype = dtype
     betas = _parse_betas(args.adamw_betas)
     total_samples = _count_text_samples(args.data_folder, args.text_field)
 
@@ -1580,7 +1600,7 @@ def main() -> None:
     model = TextTransformer(
         model_config,
         dtype=dtype,
-        param_dtype=dtype,
+        param_dtype=param_dtype,
         key=model_key,
     )
     teacher: TextTransformer | None = None
@@ -1597,7 +1617,7 @@ def main() -> None:
             vocab_size=vocab_size,
             init_std=model_config.init_std,
             dtype=dtype,
-            param_dtype=dtype,
+            param_dtype=param_dtype,
             key=probe_key,
         )
         train_bundle = TextTrainBundle(model=model, probe=probe)
@@ -1608,6 +1628,7 @@ def main() -> None:
         params, static = eqx.partition(train_bundle, eqx.is_array)
     else:
         params, static = eqx.partition(model, eqx.is_array)
+        model_static = static
     flat_names = _flatten_param_names(params)
     muon_mask, qkv_mask = build_muon_masks(params, flat_names, exclusion_patterns)
 
@@ -1648,8 +1669,6 @@ def main() -> None:
         muon_mask=muon_mask,
         qkv_mask=qkv_mask,
     )
-
-    opt_state: MuonWithAdamWFallbackState = optimizer.init(params)
 
     opt_state: MuonWithAdamWFallbackState = optimizer.init(params)
 
@@ -1731,6 +1750,7 @@ def main() -> None:
                 (_, (model_loss, pred_loss, sigreg_loss, probe_loss, probe_acc)), grads = eqx.filter_value_and_grad(
                     _loss_fn, has_aux=True
                 )((bundle_in, teacher_in))
+                grads = _cast_tree_dtype(grads, jnp.float32)
                 grads = jax.lax.pmean(grads, axis_name="data")
                 bundle_grads, _teacher_grads = grads
                 model_loss = jax.lax.pmean(model_loss, axis_name="data")
@@ -1853,6 +1873,7 @@ def main() -> None:
                 (_, (model_loss, pred_loss, sigreg_loss, probe_loss, probe_acc)), grads = eqx.filter_value_and_grad(
                     _loss_fn, has_aux=True
                 )(bundle_in)
+                grads = _cast_tree_dtype(grads, jnp.float32)
                 grads = jax.lax.pmean(grads, axis_name="data")
                 model_loss = jax.lax.pmean(model_loss, axis_name="data")
                 pred_loss = jax.lax.pmean(pred_loss, axis_name="data")
@@ -1955,6 +1976,7 @@ def main() -> None:
                 (loss, (pred_loss, sigreg_loss)), grads = eqx.filter_value_and_grad(
                     _loss_fn, has_aux=True
                 )((model_in, teacher_in))
+                grads = _cast_tree_dtype(grads, jnp.float32)
                 grads = jax.lax.pmean(grads, axis_name="data")
                 model_grads, _teacher_grads = grads
                 loss = jax.lax.pmean(loss, axis_name="data")
@@ -2061,6 +2083,7 @@ def main() -> None:
                 (loss, (pred_loss, sigreg_loss)), grads = eqx.filter_value_and_grad(
                     _loss_fn, has_aux=True
                 )(model_in)
+                grads = _cast_tree_dtype(grads, jnp.float32)
                 grads = jax.lax.pmean(grads, axis_name="data")
                 loss = jax.lax.pmean(loss, axis_name="data")
                 pred_loss = jax.lax.pmean(pred_loss, axis_name="data")
@@ -2101,7 +2124,7 @@ def main() -> None:
         params_repl = jax.device_put(params_repl, device=data_sharding)
         train_repl = eqx.combine(params_repl, static)
     else:
-        model_params, model_static = params, static
+        model_params = params
         model_params_repl = _replicate_tree(model_params, num_devices)
         model_params_repl = jax.device_put(model_params_repl, device=data_sharding)
         train_repl = eqx.combine(model_params_repl, model_static)
