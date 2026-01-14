@@ -202,7 +202,7 @@ def _load_with_dtype_fallback(
     :param model: Model instance for shape/dtype reference.
     :returns: Loaded model instance.
     """
-    candidates = [model.param_dtype, jnp.float32, jnp.bfloat16, jnp.float16]
+    candidates = [jnp.float32, jnp.bfloat16, jnp.float16]
     seen: set[jnp.dtype] = set()
     last_error: Exception | None = None
     for candidate in candidates:
