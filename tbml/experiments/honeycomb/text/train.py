@@ -2353,6 +2353,7 @@ def main() -> None:
                     _block_until_ready(train_repl)
                     _block_until_ready(opt_state_repl)
                     opt_state_host = cast(MuonWithAdamWFallbackState, _unreplicate(opt_state_repl))
+                    opt_state_host = cast(MuonWithAdamWFallbackState, _to_host(opt_state_host))
                     probe_host: MaskedTokenProbe | None = None
                     if args.masked_probe is True:
                         bundle_host = cast(TextTrainBundle, _unreplicate(train_repl))
