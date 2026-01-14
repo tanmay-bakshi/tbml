@@ -191,6 +191,43 @@ def _build_legacy_filter_spec(model: eqx.Module) -> object:
     return jax.tree_util.tree_unflatten(tree_def, filter_leaves)
 
 
+def _load_with_dtype_fallback(
+    model_path: str,
+    model: TextTransformer,
+) -> TextTransformer:
+    """Load a model checkpoint, retrying on dtype mismatches.
+
+    :param model_path: Path to the model checkpoint.
+    :param model: Model instance for shape/dtype reference.
+    :returns: Loaded model instance.
+    """
+    candidates = [model.param_dtype, jnp.float32, jnp.bfloat16, jnp.float16]
+    seen: set[jnp.dtype] = set()
+    last_error: Exception | None = None
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        model_key = jax.random.PRNGKey(0)
+        config = model.config
+        model_candidate = TextTransformer(
+            config,
+            dtype=candidate,
+            param_dtype=candidate,
+            key=model_key,
+        )
+        try:
+            return eqx.tree_deserialise_leaves(model_path, model_candidate)
+        except RuntimeError as exc:
+            last_error = exc
+            if "changed dtype" not in str(exc):
+                raise
+            continue
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("failed to load model checkpoint")
+
+
 def _load_checkpoint_model(
     model_path: str,
     model: TextTransformer,
@@ -205,7 +242,7 @@ def _load_checkpoint_model(
     :returns: Loaded model instance.
     """
     try:
-        return eqx.tree_deserialise_leaves(model_path, model)
+        return _load_with_dtype_fallback(model_path, model)
     except (RuntimeError, ValueError) as exc:
         print("Detected legacy checkpoint format; patching d_out fields.")
         filter_spec = _build_legacy_filter_spec(model)

@@ -96,15 +96,31 @@ def _load_model(
     :returns: Deserialized TextTransformer model.
     """
     config = TextTransformerConfig(**model_config)
-    model_key = jax.random.PRNGKey(0)
-    model = TextTransformer(
-        config,
-        dtype=dtype,
-        param_dtype=dtype,
-        key=model_key,
-    )
     model_path = os.path.join(checkpoint_dir, "model.eqx")
-    return eqx.tree_deserialise_leaves(model_path, model)
+    candidates = [dtype, jnp.float32, jnp.bfloat16, jnp.float16]
+    seen: set[jnp.dtype] = set()
+    last_error: Exception | None = None
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        model_key = jax.random.PRNGKey(0)
+        model = TextTransformer(
+            config,
+            dtype=candidate,
+            param_dtype=candidate,
+            key=model_key,
+        )
+        try:
+            return eqx.tree_deserialise_leaves(model_path, model)
+        except RuntimeError as exc:
+            last_error = exc
+            if "changed dtype" not in str(exc):
+                raise
+            continue
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("failed to load model checkpoint")
 
 
 def _tokenize_text(
