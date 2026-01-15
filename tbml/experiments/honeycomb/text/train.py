@@ -1169,27 +1169,37 @@ def main() -> None:
         batch_tokens: Array,
         key: Array,
         global_step: Array,
+        micro_step0: Array,
+        micro_steps: Array,
     ) -> tuple[eqx.Module, Array, Array, Array]:
-        """Compute gradients and metrics.
+        """Compute accumulated gradients and metrics across micro-steps.
 
         :param model_in: Replicated model.
-        :param batch_tokens: Token batch of shape (B, T).
+        :param batch_tokens: Token batches of shape (M, B, T).
         :param key: PRNG key for view masking.
         :param global_step: Global step index for loss scheduling.
+        :param micro_step0: Starting micro-step index for RNG folding.
+        :param micro_steps: Number of valid micro-steps in the batch.
         :returns: Tuple of (grads, model loss, pred loss, sigreg loss).
         """
 
-        def _loss_fn(model_inner: TextTransformer) -> tuple[Array, tuple[Array, Array]]:
+        def _loss_fn(
+            model_inner: TextTransformer,
+            tokens: Array,
+            tokens_key: Array,
+        ) -> tuple[Array, tuple[Array, Array]]:
             """Compute the total loss and its components.
 
             :param model_inner: Model replica used for the loss computation.
+            :param tokens: Token batch of shape (B, T).
+            :param tokens_key: PRNG key for masking.
             :returns: Tuple of (total loss, (prediction loss, sigreg loss)).
             """
             emb = _encode_views(
                 model_inner,
-                batch_tokens,
+                tokens,
                 train=True,
-                key=key,
+                key=tokens_key,
                 num_global_views=args.num_global_views,
                 num_local_views=args.num_local_views,
                 global_mask_min=args.global_mask_min,
@@ -1214,10 +1224,69 @@ def main() -> None:
             )
             return total, (pred, sigreg)
 
-        (loss, (pred_loss, sigreg_loss)), grads = eqx.filter_value_and_grad(
-            _loss_fn, has_aux=True
-        )(model_in)
-        grads = _cast_tree_dtype(grads, jnp.float32)
+        value_and_grad = eqx.filter_value_and_grad(_loss_fn, has_aux=True)
+        params_only = eqx.filter(model_in, eqx.is_array)
+        grad_init = jax.tree_util.tree_map(
+            lambda value: jnp.zeros_like(value) if value is not None else None,
+            params_only,
+        )
+        loss_init = jnp.asarray(0.0, dtype=jnp.float32)
+        pred_init = jnp.asarray(0.0, dtype=jnp.float32)
+        sigreg_init = jnp.asarray(0.0, dtype=jnp.float32)
+
+        step_indices = jnp.arange(batch_tokens.shape[0], dtype=jnp.int32)
+
+        def _accum_body(
+            carry: tuple[eqx.Module, Array, Array, Array],
+            inputs: tuple[Array, Array],
+        ) -> tuple[tuple[eqx.Module, Array, Array, Array], None]:
+            """Accumulate gradients and metrics for one micro-step.
+
+            :param carry: Tuple of (grads, loss, pred loss, sigreg loss).
+            :param inputs: Tuple of (micro step index, token batch).
+            :returns: Updated carry and unused output.
+            """
+            grads_acc, loss_acc, pred_acc, sigreg_acc = carry
+            step_idx, tokens = inputs
+            step_idx_global = micro_step0 + step_idx
+            tokens_key = jax.random.fold_in(key, step_idx_global)
+
+            def _do_compute(_: None) -> tuple[eqx.Module, Array, Array, Array]:
+                (loss, (pred_loss, sigreg_loss)), grads = value_and_grad(
+                    model_in,
+                    tokens,
+                    tokens_key,
+                )
+                grads = _cast_tree_dtype(grads, jnp.float32)
+                grads_accum = _add_trees(grads_acc, grads)
+                loss_accum = loss_acc + loss
+                pred_accum = pred_acc + pred_loss
+                sigreg_accum = sigreg_acc + sigreg_loss
+                return grads_accum, loss_accum, pred_accum, sigreg_accum
+
+            def _skip_compute(_: None) -> tuple[eqx.Module, Array, Array, Array]:
+                return grads_acc, loss_acc, pred_acc, sigreg_acc
+
+            active = step_idx < micro_steps
+            new_carry = jax.lax.cond(active, _do_compute, _skip_compute, operand=None)
+            return new_carry, None
+
+        (grads, loss, pred_loss, sigreg_loss), _ = jax.lax.scan(
+            _accum_body,
+            (grad_init, loss_init, pred_init, sigreg_init),
+            (step_indices, batch_tokens),
+        )
+
+        scale = jnp.asarray(micro_steps, dtype=jnp.float32)
+        scale = jnp.maximum(scale, 1.0)
+        grads = jax.tree_util.tree_map(
+            lambda value: value / scale if value is not None else None,
+            grads,
+        )
+        loss = loss / scale
+        pred_loss = pred_loss / scale
+        sigreg_loss = sigreg_loss / scale
+
         grads = jax.lax.pmean(grads, axis_name="data")
         loss = jax.lax.pmean(loss, axis_name="data")
         pred_loss = jax.lax.pmean(pred_loss, axis_name="data")
@@ -1308,57 +1377,52 @@ def main() -> None:
                 step_start = time.perf_counter()
                 data_time = 0.0
                 compute_time = 0.0
-                grad_accum = None
-                loss_sum = None
-                pred_sum = None
-                sigreg_sum = None
                 step_key = jax.random.fold_in(base_key, global_step)
                 step_id = jnp.full((num_devices,), global_step, dtype=jnp.int32)
+                micro_step0 = jnp.full((num_devices,), micro_step, dtype=jnp.int32)
+                micro_steps_arr = jnp.full((num_devices,), micro_steps, dtype=jnp.int32)
+                micro_batches: list[Array] = []
+                last_batch: Array | None = None
 
                 for _micro_idx in range(micro_steps):
                     fetch_start = time.perf_counter()
                     batch_tokens = next(train_iter)
                     data_time += time.perf_counter() - fetch_start
-                    micro_key = jax.random.fold_in(step_key, micro_step)
-                    device_keys = jax.random.split(micro_key, num_devices)
-                    device_keys = jax.device_put(device_keys, device=data_sharding)
+                    micro_batches.append(batch_tokens)
+                    last_batch = batch_tokens
 
-                    compute_start = time.perf_counter()
-                    grads, loss, pred, sigreg = grad_step_pmap(
-                        train_repl,
-                        batch_tokens,
-                        device_keys,
-                        step_id,
-                    )
-                    compute_time += time.perf_counter() - compute_start
+                if len(micro_batches) < args.grad_accum_steps:
+                    if last_batch is None:
+                        break
+                    pad_count = args.grad_accum_steps - len(micro_batches)
+                    for _ in range(pad_count):
+                        micro_batches.append(last_batch)
 
-                    if grad_accum is None:
-                        grad_accum = grads
-                    else:
-                        grad_accum = _add_trees(grad_accum, grads)
+                batch_tokens = jnp.stack(micro_batches, axis=0)
+                batch_tokens = jnp.transpose(batch_tokens, (1, 0, 2, 3))
+                batch_tokens = jax.device_put(batch_tokens, device=data_sharding)
+                device_keys = jax.random.split(step_key, num_devices)
+                device_keys = jax.device_put(device_keys, device=data_sharding)
 
-                    loss_sum = loss if loss_sum is None else loss_sum + loss
-                    pred_sum = pred if pred_sum is None else pred_sum + pred
-                    sigreg_sum = sigreg if sigreg_sum is None else sigreg_sum + sigreg
-                    micro_step += 1
-
-                if grad_accum is None or loss_sum is None or pred_sum is None or sigreg_sum is None:
-                    break
-
-                grad_accum = _scale_tree(grad_accum, micro_steps)
-                scale = jnp.asarray(micro_steps, dtype=jnp.float32)
-                loss = loss_sum / scale
-                pred = pred_sum / scale
-                sigreg = sigreg_sum / scale
+                compute_start = time.perf_counter()
+                grads, loss, pred, sigreg = grad_step_pmap(
+                    train_repl,
+                    batch_tokens,
+                    device_keys,
+                    step_id,
+                    micro_step0,
+                    micro_steps_arr,
+                )
+                compute_time += time.perf_counter() - compute_start
+                micro_step += micro_steps
 
                 compute_start = time.perf_counter()
                 train_repl, opt_state_repl = apply_step_pmap(
                     train_repl,
                     opt_state_repl,
-                    grad_accum,
+                    grads,
                 )
                 compute_time += time.perf_counter() - compute_start
-                grad_accum = None
                 grads = None
 
                 if args.profile:
