@@ -1,16 +1,8 @@
 import argparse
-import json
-import os
-from typing import Any
-
-import equinox as eqx
-import jax
-import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
 
-from tbml.experiments.honeycomb.text.dataset import _build_tokenizer
-from tbml.experiments.honeycomb.text.model import TextTransformer, TextTransformerConfig
+from tbml.experiments.honeycomb.text.inference import TextInference
 
 
 def _parse_args() -> argparse.Namespace:
@@ -27,101 +19,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--interactive", action="store_true")
     parser.add_argument("--output", type=str, default="trajectory.png")
     return parser.parse_args()
-
-
-def _dtype_from_name(name: str) -> jnp.dtype:
-    """Map a dtype name to a JAX dtype.
-
-    :param name: Dtype name string.
-    :returns: JAX dtype.
-    """
-    if name == "float32":
-        return jnp.float32
-    if name == "bfloat16":
-        return jnp.bfloat16
-    if name == "float16":
-        return jnp.float16
-    raise ValueError(f"unsupported dtype: {name}")
-
-
-def _resolve_checkpoint_dir(path: str) -> str:
-    """Resolve a checkpoint directory from a user-provided path.
-
-    :param path: Path to a checkpoint directory or a checkpoint file.
-    :returns: Resolved checkpoint directory.
-    """
-    if os.path.isdir(path) is True:
-        ckpt_dir = path
-    else:
-        ckpt_dir = os.path.dirname(path)
-        if ckpt_dir == "":
-            raise ValueError("checkpoint path must be a directory or a file inside a directory")
-
-    model_path = os.path.join(ckpt_dir, "model.eqx")
-    metadata_path = os.path.join(ckpt_dir, "metadata.json")
-    if os.path.isfile(model_path) is False:
-        raise FileNotFoundError(f"model.eqx not found in checkpoint directory: {ckpt_dir}")
-    if os.path.isfile(metadata_path) is False:
-        raise FileNotFoundError(f"metadata.json not found in checkpoint directory: {ckpt_dir}")
-    return ckpt_dir
-
-
-def _load_run_config(checkpoint_dir: str) -> dict[str, Any]:
-    """Load the training run configuration from a checkpoint.
-
-    :param checkpoint_dir: Checkpoint directory path.
-    :returns: Run configuration dictionary.
-    """
-    metadata_path = os.path.join(checkpoint_dir, "metadata.json")
-    with open(metadata_path, "r", encoding="utf-8") as handle:
-        metadata = json.load(handle)
-    config = metadata.get("config")
-    if config is None:
-        raise ValueError("metadata.json does not contain a config entry")
-    if isinstance(config, dict) is False:
-        raise ValueError("metadata config entry must be a dictionary")
-    return config
-
-
-def _load_model(
-    checkpoint_dir: str,
-    *,
-    dtype: jnp.dtype,
-    model_config: dict[str, Any],
-) -> TextTransformer:
-    """Load a TextTransformer model from a checkpoint.
-
-    :param checkpoint_dir: Checkpoint directory path.
-    :param dtype: Compute and parameter dtype.
-    :param model_config: Model configuration dictionary.
-    :returns: Deserialized TextTransformer model.
-    """
-    config = TextTransformerConfig(**model_config)
-    model_path = os.path.join(checkpoint_dir, "model.eqx")
-    candidates = [dtype, jnp.float32, jnp.bfloat16, jnp.float16]
-    seen: set[jnp.dtype] = set()
-    last_error: Exception | None = None
-    for candidate in candidates:
-        if candidate in seen:
-            continue
-        seen.add(candidate)
-        model_key = jax.random.PRNGKey(0)
-        model = TextTransformer(
-            config,
-            dtype=candidate,
-            param_dtype=candidate,
-            key=model_key,
-        )
-        try:
-            return eqx.tree_deserialise_leaves(model_path, model)
-        except RuntimeError as exc:
-            last_error = exc
-            if "changed dtype" not in str(exc):
-                raise
-            continue
-    if last_error is not None:
-        raise last_error
-    raise RuntimeError("failed to load model")
 
 
 def _pca(embeddings: np.ndarray, *, dim: int) -> np.ndarray:
@@ -143,10 +40,18 @@ def _pca(embeddings: np.ndarray, *, dim: int) -> np.ndarray:
     return scores
 
 
-def _plot_trajectory_2d(points: np.ndarray, *, title: str, output: str, interactive: bool) -> None:
+def _plot_trajectory_2d(
+    points: np.ndarray,
+    labels: list[str],
+    *,
+    title: str,
+    output: str,
+    interactive: bool,
+) -> None:
     """Plot 2D trajectory with arrows.
 
     :param points: PCA points of shape (N, 2).
+    :param labels: Token labels for each point.
     :param title: Plot title.
     :param output: Output path for saved figure.
     :param interactive: Whether to display interactively.
@@ -160,6 +65,8 @@ def _plot_trajectory_2d(points: np.ndarray, *, title: str, output: str, interact
             xytext=(points[idx, 0], points[idx, 1]),
             arrowprops=dict(arrowstyle="->", color="#577590", linewidth=1.0),
         )
+    for idx, label in enumerate(labels):
+        ax.text(points[idx, 0], points[idx, 1], label, fontsize=8, ha="left", va="bottom")
     ax.set_title(title)
     ax.set_xlabel("PC1")
     ax.set_ylabel("PC2")
@@ -172,10 +79,18 @@ def _plot_trajectory_2d(points: np.ndarray, *, title: str, output: str, interact
         print(f"Wrote trajectory plot to: {output}")
 
 
-def _plot_trajectory_3d(points: np.ndarray, *, title: str, output: str, interactive: bool) -> None:
+def _plot_trajectory_3d(
+    points: np.ndarray,
+    labels: list[str],
+    *,
+    title: str,
+    output: str,
+    interactive: bool,
+) -> None:
     """Plot 3D trajectory with arrows.
 
     :param points: PCA points of shape (N, 3).
+    :param labels: Token labels for each point.
     :param title: Plot title.
     :param output: Output path for saved figure.
     :param interactive: Whether to display interactively.
@@ -197,6 +112,8 @@ def _plot_trajectory_3d(points: np.ndarray, *, title: str, output: str, interact
             color="#577590",
             linewidth=1.0,
         )
+    for idx, label in enumerate(labels):
+        ax.text(points[idx, 0], points[idx, 1], points[idx, 2], label, fontsize=8)
     ax.set_title(title)
     ax.set_xlabel("PC1")
     ax.set_ylabel("PC2")
@@ -249,72 +166,39 @@ def main() -> None:
     if args.interactive is False and args.output == "":
         raise ValueError("output path required when not using --interactive")
 
-    checkpoint_dir = _resolve_checkpoint_dir(args.checkpoint)
-    config = _load_run_config(checkpoint_dir)
-    model_config = config.get("model")
-    if model_config is None or isinstance(model_config, dict) is False:
-        raise ValueError("run config missing model configuration")
-    data_config = config.get("data")
-    if data_config is None or isinstance(data_config, dict) is False:
-        raise ValueError("run config missing data configuration")
-    training_config = config.get("training")
-    if training_config is None or isinstance(training_config, dict) is False:
-        raise ValueError("run config missing training configuration")
-
-    dtype_name = training_config.get("dtype")
-    if isinstance(dtype_name, str) is False:
-        raise ValueError("training config missing dtype string")
-
-    tokenizer_name = data_config.get("tokenizer")
-    eos_token = data_config.get("eos_token")
-    pad_token = data_config.get("pad_token")
-    mask_token = data_config.get("mask_token")
-    max_seq_len = data_config.get("max_seq_len")
-    if isinstance(tokenizer_name, str) is False:
-        raise ValueError("data config missing tokenizer name")
-    if isinstance(eos_token, str) is False:
-        raise ValueError("data config missing eos token")
-    if isinstance(pad_token, str) is False:
-        raise ValueError("data config missing pad token")
-    if isinstance(mask_token, str) is False:
-        raise ValueError("data config missing mask token")
-    if isinstance(max_seq_len, int) is False:
-        raise ValueError("data config missing max_seq_len")
-
-    dtype = _dtype_from_name(dtype_name)
-    tokenizer, eos_id, pad_id, mask_id = _build_tokenizer(
-        tokenizer_name,
-        eos_token=eos_token,
-        pad_token=pad_token,
-        mask_token=mask_token,
-    )
-
-    encoding = tokenizer.encode(args.text, add_special_tokens=False)
-    token_ids = list(encoding.ids)
-    if len(token_ids) > max_seq_len - 1:
-        token_ids = token_ids[: max_seq_len - 1]
-    token_ids_no_eos = token_ids
+    infer = TextInference.from_checkpoint(args.checkpoint)
+    token_ids_no_eos = infer.tokenize(args.text)
+    labels = [infer.decode_token(token_id) for token_id in token_ids_no_eos]
 
     samples = _build_samples(
         token_ids_no_eos,
-        mask_id=int(mask_id),
-        eos_id=int(eos_id),
-        pad_id=int(pad_id),
-        max_seq_len=max_seq_len,
+        mask_id=infer.mask_id,
+        eos_id=infer.eos_id,
+        pad_id=infer.pad_id,
+        max_seq_len=infer.max_seq_len,
     )
-
-    model = _load_model(checkpoint_dir, dtype=dtype, model_config=model_config)
-    tokens = jnp.asarray(samples)
-    attention_mask = jnp.asarray(samples != int(pad_id))
-    embeddings = model(tokens, attention_mask, train=False, key=None)
+    attention_mask = samples != infer.pad_id
+    embeddings = infer.embed_tokens(samples, attention_mask)
     embeddings = np.asarray(embeddings)
 
     points = _pca(embeddings, dim=args.pca_dim)
     title = "Trajectory of Masked-Prefix Embeddings"
     if args.pca_dim == 2:
-        _plot_trajectory_2d(points, title=title, output=args.output, interactive=args.interactive)
+        _plot_trajectory_2d(
+            points,
+            labels,
+            title=title,
+            output=args.output,
+            interactive=args.interactive,
+        )
     else:
-        _plot_trajectory_3d(points, title=title, output=args.output, interactive=args.interactive)
+        _plot_trajectory_3d(
+            points,
+            labels,
+            title=title,
+            output=args.output,
+            interactive=args.interactive,
+        )
 
 
 if __name__ == "__main__":
