@@ -24,7 +24,7 @@ class TextTransformerConfig(BaseModel):
     :ivar drop_path_rate: Stochastic depth rate at the final block.
     :ivar pope_base: Base for PoPE/RoPE frequency schedule.
     :ivar init_std: Standard deviation for truncated normal initialization.
-    :ivar use_cls_token: Whether to pool using the EOS token representation.
+    :ivar embedding_mode: Pooling mode ("mean", "cls", or "causal-token").
     :ivar attn_type: Attention type ("pope" or "rope").
     :ivar use_final_norm: Whether to apply the final RMSNorm.
     """
@@ -40,7 +40,8 @@ class TextTransformerConfig(BaseModel):
     drop_path_rate: float = Field(default=0.0)
     pope_base: float = Field(default=10000.0)
     init_std: float = Field(default=0.02)
-    use_cls_token: bool = Field(default=False)
+    embedding_mode: str = Field(default="mean")
+    use_cls_token: bool | None = Field(default=None, exclude=True)
     attn_type: str = Field(default="pope")
     use_final_norm: bool = Field(default=True)
 
@@ -125,6 +126,7 @@ class TextTransformerBlock(eqx.Module):
         drop_path_prob: float,
         pope_base: float,
         attn_type: str,
+        is_causal: bool,
         dtype: jnp.dtype,
         param_dtype: jnp.dtype,
         qkv_kernel_init: Initializer,
@@ -142,6 +144,7 @@ class TextTransformerBlock(eqx.Module):
         :param drop_path_prob: DropPath probability for this block.
         :param pope_base: Base for PoPE/RoPE frequencies.
         :param attn_type: Attention type ("pope" or "rope").
+        :param is_causal: Whether to apply causal attention masking.
         :param dtype: Compute dtype.
         :param param_dtype: Parameter dtype.
         :param qkv_kernel_init: Initializer for Q/K/V projections.
@@ -159,7 +162,7 @@ class TextTransformerBlock(eqx.Module):
                 n_kv_heads=n_heads,
                 attn_dropout=attn_dropout,
                 resid_dropout=resid_dropout,
-                is_causal=False,
+                is_causal=is_causal,
                 base=pope_base,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -174,7 +177,7 @@ class TextTransformerBlock(eqx.Module):
                 n_kv_heads=n_heads,
                 attn_dropout=attn_dropout,
                 resid_dropout=resid_dropout,
-                is_causal=False,
+                is_causal=is_causal,
                 base=pope_base,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -287,6 +290,9 @@ class TextTransformer(eqx.Module):
             raise ValueError("pope_base must be > 1.0")
         if config.attn_type not in ("pope", "rope"):
             raise ValueError("attn_type must be 'pope' or 'rope'")
+        embedding_mode = _resolve_embedding_mode(config)
+        if embedding_mode not in ("mean", "cls", "causal-token"):
+            raise ValueError("embedding_mode must be 'mean', 'cls', or 'causal-token'")
 
         init = truncated_normal_init(config.init_std)
         keys = jax.random.split(key, 2 + config.n_layers)
@@ -294,7 +300,7 @@ class TextTransformer(eqx.Module):
         block_keys = keys[1 : 1 + config.n_layers]
         final_key = keys[-1]
 
-        self.config = config
+        self.config = config.model_copy(update={"embedding_mode": embedding_mode})
         self.token_embed = TokenEmbedding(
             vocab_size=config.vocab_size,
             d_model=config.d_model,
@@ -321,6 +327,7 @@ class TextTransformer(eqx.Module):
                     drop_path_prob=drop_rates[idx],
                     pope_base=config.pope_base,
                     attn_type=config.attn_type,
+                    is_causal=embedding_mode == "causal-token",
                     dtype=dtype,
                     param_dtype=param_dtype,
                     qkv_kernel_init=init,
@@ -389,8 +396,13 @@ class TextTransformer(eqx.Module):
         reps = self.encode_tokens(tokens, attention_mask, train=train, key=key)
         mask = attention_mask.astype(reps.dtype)
         lengths = jnp.sum(mask, axis=1)
-        if self.config.use_cls_token is True:
+        if self.config.embedding_mode == "cls":
             idx = jnp.maximum(lengths.astype(jnp.int32) - 1, 0)
+            idx = idx[:, None, None]
+            idx = jnp.broadcast_to(idx, (idx.shape[0], 1, reps.shape[-1]))
+            pooled = jnp.take_along_axis(reps, idx, axis=1).squeeze(axis=1)
+        elif self.config.embedding_mode == "causal-token":
+            idx = jnp.maximum(lengths.astype(jnp.int32) - 2, 0)
             idx = idx[:, None, None]
             idx = jnp.broadcast_to(idx, (idx.shape[0], 1, reps.shape[-1]))
             pooled = jnp.take_along_axis(reps, idx, axis=1).squeeze(axis=1)
@@ -415,3 +427,17 @@ def _build_drop_rates(drop_path_rate: float, total_layers: int) -> list[float]:
     if total_layers == 1:
         return [drop_path_rate]
     return [drop_path_rate * (idx / (total_layers - 1)) for idx in range(total_layers)]
+
+
+def _resolve_embedding_mode(config: TextTransformerConfig) -> str:
+    """Resolve the effective embedding mode from the config.
+
+    :param config: Text transformer configuration.
+    :returns: Embedding mode string.
+    """
+    embedding_mode = config.embedding_mode
+    if config.use_cls_token is None:
+        return embedding_mode
+    if embedding_mode == "mean":
+        return "cls" if config.use_cls_token is True else "mean"
+    return embedding_mode

@@ -59,8 +59,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--drop-path-rate", type=float, default=0.0)
     parser.add_argument("--pope-base", type=float, default=10000.0)
     parser.add_argument("--init-std", type=float, default=0.02)
-    parser.add_argument("--use-cls-token", dest="use_cls_token", action="store_true")
-    parser.add_argument("--no-use-cls-token", dest="use_cls_token", action="store_false")
+    parser.add_argument(
+        "--embedding-mode",
+        type=str,
+        default="mean",
+        choices=["mean", "cls", "causal-token"],
+    )
     parser.add_argument("--attn-type", type=str, default="pope", choices=["pope", "rope"])
     parser.add_argument("--use-final-norm", dest="use_final_norm", action="store_true")
     parser.add_argument("--no-use-final-norm", dest="use_final_norm", action="store_false")
@@ -93,7 +97,6 @@ def _parse_args() -> argparse.Namespace:
 
     parser.set_defaults(
         muon_nesterov=True,
-        use_cls_token=False,
         use_final_norm=True,
     )
     return parser.parse_args()
@@ -668,8 +671,13 @@ def _pool_representations(
 
     mask = attention_mask.astype(reps.dtype)
     lengths = jnp.sum(mask, axis=1)
-    if model.config.use_cls_token is True:
+    if model.config.embedding_mode == "cls":
         idx = jnp.maximum(lengths.astype(jnp.int32) - 1, 0)
+        idx = idx[:, None, None]
+        idx = jnp.broadcast_to(idx, (idx.shape[0], 1, reps.shape[-1]))
+        pooled = jnp.take_along_axis(reps, idx, axis=1).squeeze(axis=1)
+    elif model.config.embedding_mode == "causal-token":
+        idx = jnp.maximum(lengths.astype(jnp.int32) - 2, 0)
         idx = idx[:, None, None]
         idx = jnp.broadcast_to(idx, (idx.shape[0], 1, reps.shape[-1]))
         pooled = jnp.take_along_axis(reps, idx, axis=1).squeeze(axis=1)
@@ -1040,7 +1048,7 @@ def main() -> None:
         drop_path_rate=args.drop_path_rate,
         pope_base=args.pope_base,
         init_std=args.init_std,
-        use_cls_token=args.use_cls_token,
+        embedding_mode=args.embedding_mode,
         attn_type=args.attn_type,
         use_final_norm=args.use_final_norm,
     )
