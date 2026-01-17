@@ -11,6 +11,7 @@ from tokenizers import Tokenizer
 
 from tbml.experiments.honeycomb.text.dataset import _build_tokenizer
 from tbml.experiments.honeycomb.text.model import TextTransformer, TextTransformerConfig
+from tbml.experiments.honeycomb.text.train_policy import PolicyTransformer, PolicyTransformerConfig
 
 
 def _dtype_from_name(name: str) -> jnp.dtype:
@@ -26,6 +27,17 @@ def _dtype_from_name(name: str) -> jnp.dtype:
     if name == "float16":
         return jnp.float16
     raise ValueError(f"unsupported dtype: {name}")
+
+
+def _param_dtype_for(dtype: jnp.dtype) -> jnp.dtype:
+    """Resolve parameter dtype for a compute dtype.
+
+    :param dtype: Compute dtype.
+    :returns: Parameter dtype.
+    """
+    if dtype in (jnp.bfloat16, jnp.float16):
+        return jnp.float32
+    return dtype
 
 
 def _resolve_checkpoint_dir(path: str) -> str:
@@ -106,6 +118,47 @@ def _load_model(
     if last_error is not None:
         raise last_error
     raise RuntimeError("failed to load model")
+
+
+def _load_policy_model(
+    checkpoint_dir: str,
+    *,
+    dtype: jnp.dtype,
+    policy_config: dict[str, Any],
+) -> PolicyTransformer:
+    """Load a PolicyTransformer model from a checkpoint.
+
+    :param checkpoint_dir: Checkpoint directory path.
+    :param dtype: Compute dtype to try first.
+    :param policy_config: Policy configuration dictionary.
+    :returns: Deserialized PolicyTransformer model.
+    """
+    config = PolicyTransformerConfig(**policy_config)
+    model_path = os.path.join(checkpoint_dir, "model.eqx")
+    candidates = [dtype, jnp.float32, jnp.bfloat16, jnp.float16]
+    seen: set[jnp.dtype] = set()
+    last_error: Exception | None = None
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        model_key = jax.random.PRNGKey(0)
+        model = PolicyTransformer(
+            config,
+            dtype=candidate,
+            param_dtype=_param_dtype_for(candidate),
+            key=model_key,
+        )
+        try:
+            return eqx.tree_deserialise_leaves(model_path, model)
+        except RuntimeError as exc:
+            last_error = exc
+            if "changed dtype" not in str(exc):
+                raise
+            continue
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("failed to load policy model")
 
 
 class TextInference:
@@ -283,6 +336,27 @@ class TextInference:
         mask_jax = jnp.asarray(attention_mask)
         return self._model(tokens_jax, mask_jax, train=False, key=None)
 
+    def encode_tokens(self, tokens: np.ndarray, attention_mask: np.ndarray) -> Array:
+        """Compute per-token representations for preprocessed sequences.
+
+        :param tokens: Token ids of shape (B, T).
+        :param attention_mask: Boolean attention mask of shape (B, T).
+        :returns: JAX array of token embeddings.
+        """
+        if tokens.ndim != 2:
+            raise ValueError("tokens must have shape (B, T)")
+        if attention_mask.ndim != 2:
+            raise ValueError("attention_mask must have shape (B, T)")
+        if tokens.shape != attention_mask.shape:
+            raise ValueError("tokens and attention_mask must have the same shape")
+        if tokens.shape[1] != self._max_seq_len:
+            raise ValueError("tokens sequence length must match max_seq_len")
+        if tokens.dtype != np.int32:
+            tokens = tokens.astype(np.int32, copy=False)
+        tokens_jax = jnp.asarray(tokens)
+        mask_jax = jnp.asarray(attention_mask)
+        return self._model.encode_tokens(tokens_jax, mask_jax, train=False, key=None)
+
     def embed(self, texts: list[str]) -> Array:
         """Embed a batch of texts with the loaded model.
 
@@ -291,6 +365,14 @@ class TextInference:
         """
         tokens_np, mask_np = self.preprocess(texts)
         return self.embed_tokens(tokens_np, mask_np)
+
+    @property
+    def model_config(self) -> TextTransformerConfig:
+        """Return the base model configuration.
+
+        :returns: TextTransformerConfig instance.
+        """
+        return self._model.config
 
     @property
     def max_seq_len(self) -> int:
@@ -323,3 +405,124 @@ class TextInference:
         :returns: Mask token id.
         """
         return self._mask_id
+
+
+class PolicyInference:
+    """Helper for running policy models on top of a base encoder."""
+
+    _base: TextInference
+    _policy: PolicyTransformer
+
+    def __init__(self, base: TextInference, policy: PolicyTransformer) -> None:
+        """Initialize the policy inference helper.
+
+        :param base: Base TextInference helper.
+        :param policy: Loaded policy model.
+        """
+        self._base = base
+        self._policy = policy
+
+    @classmethod
+    def from_checkpoints(
+        cls,
+        base_checkpoint: str,
+        policy_checkpoint: str,
+        *,
+        base_dtype: str | None = None,
+        policy_dtype: str | None = None,
+    ) -> "PolicyInference":
+        """Load a base checkpoint and a policy checkpoint.
+
+        :param base_checkpoint: Path to the base checkpoint directory or file.
+        :param policy_checkpoint: Path to the policy checkpoint directory or file.
+        :param base_dtype: Optional dtype override for the base model.
+        :param policy_dtype: Optional dtype override for the policy model.
+        :returns: PolicyInference instance.
+        """
+        base = TextInference.from_checkpoint(base_checkpoint, dtype=base_dtype)
+        if base.model_config.embedding_mode != "causal-token":
+            raise ValueError("base checkpoint must use embedding_mode='causal-token'")
+
+        policy_dir = _resolve_checkpoint_dir(policy_checkpoint)
+        policy_config_root = _load_run_config(policy_dir)
+        policy_config_raw = policy_config_root.get("policy_model")
+        if policy_config_raw is None or isinstance(policy_config_raw, dict) is False:
+            raise ValueError("policy checkpoint missing policy_model config")
+        training_config = policy_config_root.get("training")
+        if training_config is None or isinstance(training_config, dict) is False:
+            raise ValueError("policy checkpoint missing training config")
+
+        dtype_name: str
+        if policy_dtype is None:
+            dtype_name_raw = training_config.get("dtype")
+            if isinstance(dtype_name_raw, str) is False:
+                raise ValueError("policy training config missing dtype")
+            dtype_name = dtype_name_raw
+        else:
+            dtype_name = policy_dtype
+
+        policy = _load_policy_model(
+            policy_dir,
+            dtype=_dtype_from_name(dtype_name),
+            policy_config=policy_config_raw,
+        )
+        if policy.config.d_model != base.model_config.d_model:
+            raise ValueError("policy d_model must match base model output")
+        if policy.config.vocab_size != base.model_config.vocab_size:
+            raise ValueError("policy vocab_size must match base model vocab_size")
+        return cls(base, policy)
+
+    def preprocess(self, texts: list[str]) -> tuple[np.ndarray, np.ndarray]:
+        """Tokenize and pad a batch of texts.
+
+        :param texts: List of input strings.
+        :returns: Tuple of (tokens, attention_mask) arrays.
+        """
+        return self._base.preprocess(texts)
+
+    def encode_tokens(self, tokens: np.ndarray, attention_mask: np.ndarray) -> Array:
+        """Compute base model token representations.
+
+        :param tokens: Token ids of shape (B, T).
+        :param attention_mask: Boolean attention mask of shape (B, T).
+        :returns: JAX array of token embeddings.
+        """
+        return self._base.encode_tokens(tokens, attention_mask)
+
+    def policy_logits(self, tokens: np.ndarray, attention_mask: np.ndarray) -> Array:
+        """Compute policy logits for a batch of tokenized inputs.
+
+        :param tokens: Token ids of shape (B, T).
+        :param attention_mask: Boolean attention mask of shape (B, T).
+        :returns: Logits of shape (B, T, vocab_size).
+        """
+        reps = self._base.encode_tokens(tokens, attention_mask)
+        reps = reps.astype(self._policy.dtype)
+        logits = self._policy(reps, train=False, key=None)
+        bsz, seqlen = tokens.shape
+        return logits.reshape((bsz, seqlen, logits.shape[-1]))
+
+    def policy_logits_from_texts(self, texts: list[str]) -> Array:
+        """Compute policy logits directly from raw text inputs.
+
+        :param texts: List of input strings.
+        :returns: Logits of shape (B, T, vocab_size).
+        """
+        tokens, attention_mask = self._base.preprocess(texts)
+        return self.policy_logits(tokens, attention_mask)
+
+    @property
+    def base(self) -> TextInference:
+        """Return the base text inference helper.
+
+        :returns: TextInference instance.
+        """
+        return self._base
+
+    @property
+    def policy_model(self) -> PolicyTransformer:
+        """Return the loaded policy model.
+
+        :returns: PolicyTransformer instance.
+        """
+        return self._policy
