@@ -1005,6 +1005,8 @@ def main() -> None:
             """
             attention_mask = tokens != pad_id
             reps = base_inner.encode_tokens(tokens, attention_mask, train=False, key=None)
+            if base_inner.config.use_final_norm is True:
+                reps = base_inner.final_norm(reps)
             reps = jax.lax.stop_gradient(reps)
             reps = reps.astype(policy_inner.dtype)
             logits = policy_inner(reps, train=True, key=tokens_key)
