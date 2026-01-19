@@ -507,7 +507,10 @@ class PoPESelfAttention(eqx.Module):
             att = jnp.where(mask[None, None, :, :], -jnp.inf, att)
         if attention_mask is not None:
             mask = attention_mask.astype(bool)
-            att = jnp.where(mask[:, None, None, :], att, -jnp.inf)
+            key_mask = jnp.broadcast_to(mask[:, None, :], (bsz, seqlen, seqlen))
+            diag = jnp.eye(seqlen, dtype=bool)[None, :, :]
+            key_mask = jnp.logical_or(key_mask, diag)
+            att = jnp.where(key_mask[:, None, :, :], att, -jnp.inf)
 
         att = jax.nn.softmax(att, axis=-1)
         if self.attn_dropout > 0.0 and key is not None:
@@ -717,7 +720,10 @@ class RoPESelfAttention(eqx.Module):
             att = jnp.where(mask[None, None, :, :], -jnp.inf, att)
         if attention_mask is not None:
             mask = attention_mask.astype(bool)
-            att = jnp.where(mask[:, None, None, :], att, -jnp.inf)
+            key_mask = jnp.broadcast_to(mask[:, None, :], (bsz, seqlen, seqlen))
+            diag = jnp.eye(seqlen, dtype=bool)[None, :, :]
+            key_mask = jnp.logical_or(key_mask, diag)
+            att = jnp.where(key_mask[:, None, :, :], att, -jnp.inf)
 
         att = jax.nn.softmax(att, axis=-1)
         if self.attn_dropout > 0.0 and key is not None:

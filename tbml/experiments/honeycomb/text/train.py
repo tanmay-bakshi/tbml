@@ -444,6 +444,7 @@ def _mask_spans(
         eligible = jnp.logical_and(sample_tokens != pad_id, sample_tokens != eos_id)
         valid_len = jnp.sum(eligible).astype(jnp.int32)
         target = jnp.floor(ratio * valid_len).astype(jnp.int32)
+        target = jnp.minimum(target, jnp.maximum(valid_len - 1, 0))
         span_lengths = jax.random.poisson(key_len, poisson_lambda, shape=(seq_len,))
         span_lengths = jnp.maximum(span_lengths, 1)
         start_scores = jax.random.uniform(key_start, shape=(seq_len, seq_len), minval=0.0, maxval=1.0)
@@ -481,6 +482,22 @@ def _mask_spans(
             0, seq_len, _body, (init_mask, init_count)
         )
         attention_mask = jnp.logical_and(eligible, jnp.logical_not(final_mask))
+
+        def _with_fallback(_: None) -> tuple[Array, Array]:
+            fallback_idx = jnp.argmax(eligible)
+            attn = attention_mask.at[fallback_idx].set(True)
+            mask = final_mask.at[fallback_idx].set(False)
+            return attn, mask
+
+        def _no_fallback(_: None) -> tuple[Array, Array]:
+            return attention_mask, final_mask
+
+        attention_mask, final_mask = jax.lax.cond(
+            jnp.any(attention_mask),
+            _no_fallback,
+            _with_fallback,
+            operand=None,
+        )
         return sample_tokens, final_mask, attention_mask
 
     masked, positions, attn_mask = jax.vmap(_one_sample)(tokens, ratios, keys)
