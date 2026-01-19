@@ -60,8 +60,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--pope-base", type=float, default=10000.0)
     parser.add_argument("--init-std", type=float, default=0.02)
     parser.add_argument("--attn-type", type=str, default="pope", choices=["pope", "rope"])
-    parser.add_argument("--use-final-norm", dest="use_final_norm", action="store_true")
-    parser.add_argument("--no-use-final-norm", dest="use_final_norm", action="store_false")
 
     parser.add_argument("--num-global-views", type=int, default=2)
     parser.add_argument("--num-local-views", type=int, default=6)
@@ -88,10 +86,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--adamw-eps", type=float, default=1e-8)
     parser.add_argument("--adamw-weight-decay", type=float, default=0.01)
 
-    parser.set_defaults(
-        muon_nesterov=True,
-        use_final_norm=True,
-    )
+    parser.set_defaults(muon_nesterov=True)
     return parser.parse_args()
 
 
@@ -928,7 +923,6 @@ def main() -> None:
         pope_base=args.pope_base,
         init_std=args.init_std,
         attn_type=args.attn_type,
-        use_final_norm=args.use_final_norm,
     )
     exclusion_patterns = list(TextTransformer.MUON_PARAM_EXCLUSION_PATTERNS)
 

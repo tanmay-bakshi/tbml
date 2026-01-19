@@ -25,7 +25,6 @@ class TextTransformerConfig(BaseModel):
     :ivar pope_base: Base for PoPE/RoPE frequency schedule.
     :ivar init_std: Standard deviation for truncated normal initialization.
     :ivar attn_type: Attention type ("pope" or "rope").
-    :ivar use_final_norm: Whether to apply the final RMSNorm.
     """
 
     vocab_size: int = Field(default=50257)
@@ -40,7 +39,6 @@ class TextTransformerConfig(BaseModel):
     pope_base: float = Field(default=10000.0)
     init_std: float = Field(default=0.02)
     attn_type: str = Field(default="pope")
-    use_final_norm: bool = Field(default=True)
 
 
 class TokenEmbedding(eqx.Module):
@@ -369,8 +367,7 @@ class TextTransformer(eqx.Module):
         for block, block_key in zip(self.blocks, block_keys):
             reps = block(reps, attention_mask=attention_mask, train=train, key=block_key)
 
-        if self.config.use_final_norm is True:
-            reps = self.final_norm(reps)
+        reps = self.final_norm(reps)
 
         mask = attention_mask.astype(reps.dtype)
         lengths = jnp.sum(mask, axis=1)
@@ -393,4 +390,3 @@ def _build_drop_rates(drop_path_rate: float, total_layers: int) -> list[float]:
     if total_layers == 1:
         return [drop_path_rate]
     return [drop_path_rate * (idx / (total_layers - 1)) for idx in range(total_layers)]
-
