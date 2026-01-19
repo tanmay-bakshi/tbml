@@ -201,7 +201,7 @@ def _pooled_embedding(
     tokens, attention_mask = _prepare_batch(token_ids, max_seq_len=max_seq_len, pad_id=pad_id)
     token_tensor = jnp.asarray(tokens, dtype=jnp.int32)
     mask_tensor = jnp.asarray(attention_mask, dtype=jnp.bool_)
-    pooled = model(token_tensor, mask_tensor, train=False, key=None)
+    _token_reps, pooled = model(token_tensor, mask_tensor, train=False, key=None)
     pooled = jax.device_get(pooled)
     return np.asarray(pooled, dtype=np.float32)[0]
 

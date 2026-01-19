@@ -998,7 +998,7 @@ def main() -> None:
             """
             model_inner = bundle_inner.model
             classifier_inner = bundle_inner.classifier
-            pooled = model_inner(batch_tokens, batch_mask, train=train_backbone, key=key)
+            _token_reps, pooled = model_inner(batch_tokens, batch_mask, train=train_backbone, key=key)
             if train_backbone is False:
                 pooled = jax.lax.stop_gradient(pooled)
             logits = classifier_inner(pooled)
@@ -1046,7 +1046,7 @@ def main() -> None:
         :param labels_in: Label ids of shape (B,).
         :returns: Loss and accuracy.
         """
-        pooled = bundle_in.model(batch_tokens, batch_mask, train=False, key=None)
+        _token_reps, pooled = bundle_in.model(batch_tokens, batch_mask, train=False, key=None)
         logits = bundle_in.classifier(pooled)
         log_probs = jax.nn.log_softmax(logits, axis=-1)
         labels_b = labels_in.astype(jnp.int32)

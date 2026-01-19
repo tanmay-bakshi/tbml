@@ -334,7 +334,8 @@ class TextInference:
             tokens = tokens.astype(np.int32, copy=False)
         tokens_jax = jnp.asarray(tokens)
         mask_jax = jnp.asarray(attention_mask)
-        return self._model(tokens_jax, mask_jax, train=False, key=None)
+        _token_reps, pooled = self._model(tokens_jax, mask_jax, train=False, key=None)
+        return pooled
 
     def encode_tokens(self, tokens: np.ndarray, attention_mask: np.ndarray) -> Array:
         """Compute per-token representations for preprocessed sequences.
@@ -355,7 +356,8 @@ class TextInference:
             tokens = tokens.astype(np.int32, copy=False)
         tokens_jax = jnp.asarray(tokens)
         mask_jax = jnp.asarray(attention_mask)
-        return self._model.encode_tokens(tokens_jax, mask_jax, train=False, key=None)
+        token_reps, _pooled = self._model(tokens_jax, mask_jax, train=False, key=None)
+        return token_reps
 
     def embed(self, texts: list[str]) -> Array:
         """Embed a batch of texts with the loaded model.
@@ -365,16 +367,6 @@ class TextInference:
         """
         tokens_np, mask_np = self.preprocess(texts)
         return self.embed_tokens(tokens_np, mask_np)
-
-    def apply_final_norm(self, reps: Array) -> Array:
-        """Apply the model's final RMSNorm for causal-token embeddings if enabled.
-
-        :param reps: Representation tensor.
-        :returns: Normalized representations (or unchanged if disabled).
-        """
-        if self._model.config.use_final_norm is True and self._model.config.embedding_mode == "causal-token":
-            return self._model.final_norm(reps)
-        return reps
 
     @property
     def model_config(self) -> TextTransformerConfig:
@@ -450,8 +442,6 @@ class PolicyInference:
         :returns: PolicyInference instance.
         """
         base = TextInference.from_checkpoint(base_checkpoint, dtype=base_dtype)
-        if base.model_config.embedding_mode != "causal-token":
-            raise ValueError("base checkpoint must use embedding_mode='causal-token'")
 
         policy_dir = _resolve_checkpoint_dir(policy_checkpoint)
         policy_config_root = _load_run_config(policy_dir)
@@ -497,8 +487,7 @@ class PolicyInference:
         :param attention_mask: Boolean attention mask of shape (B, T).
         :returns: JAX array of token embeddings.
         """
-        reps = self._base.encode_tokens(tokens, attention_mask)
-        return self._base.apply_final_norm(reps)
+        return self._base.encode_tokens(tokens, attention_mask)
 
     def policy_logits(self, tokens: np.ndarray, attention_mask: np.ndarray) -> Array:
         """Compute policy logits for a batch of tokenized inputs.
@@ -508,7 +497,6 @@ class PolicyInference:
         :returns: Logits of shape (B, T, vocab_size).
         """
         reps = self._base.encode_tokens(tokens, attention_mask)
-        reps = self._base.apply_final_norm(reps)
         reps = reps.astype(self._policy.dtype)
         logits = self._policy(reps, train=False, key=None)
         bsz, seqlen = tokens.shape

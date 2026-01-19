@@ -138,8 +138,6 @@ def main() -> None:
         raise ValueError("top-k must be > 0")
 
     base_infer = TextInference.from_checkpoint(args.base_checkpoint)
-    if base_infer.model_config.embedding_mode != "causal-token":
-        raise ValueError("base checkpoint must use embedding_mode='causal-token'")
     tokens, attention_mask = base_infer.preprocess([args.text])
     length = int(np.sum(attention_mask[0]))
     if length < 1:
@@ -156,7 +154,6 @@ def main() -> None:
     prev_token_id = int(seq_tokens[-2]) if length > 1 else -1
 
     base_reps = base_infer.encode_tokens(tokens, attention_mask)
-    base_reps = base_infer.apply_final_norm(base_reps)
     reps_last = base_reps[:, length - 2 : length, :] if length > 1 else base_reps[:, length - 1 : length, :]
 
     policy_dir = _resolve_checkpoint_dir(args.policy_checkpoint)

@@ -1053,8 +1053,6 @@ def main() -> None:
         dtype=base_model_dtype,
         model_config=model_config_raw,
     )
-    if base_model.config.embedding_mode != "causal-token":
-        raise ValueError("base checkpoint must use embedding_mode='causal-token'")
     if base_model.config.vocab_size != vocab_size:
         raise ValueError("base model vocab_size must match dataset")
     if base_model.config.max_seq_len != max_seq_len:
@@ -1209,9 +1207,7 @@ def main() -> None:
                 eos_id=eos_id,
                 pad_id=pad_id,
             )
-            reps = base_inner.encode_tokens(prefix_tokens, attention_mask, train=False, key=None)
-            if base_inner.config.use_final_norm is True:
-                reps = base_inner.final_norm(reps)
+            reps, _pooled = base_inner(prefix_tokens, attention_mask, train=False, key=None)
             reps = jax.lax.stop_gradient(reps)
             x0 = reps[:, : args.num_prefix_tokens, :]
             cond = x0[:, -1, :]

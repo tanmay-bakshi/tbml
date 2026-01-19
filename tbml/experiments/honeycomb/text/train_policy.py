@@ -868,8 +868,6 @@ def main() -> None:
         dtype=base_model_dtype,
         model_config=model_config_raw,
     )
-    if base_model.config.embedding_mode != "causal-token":
-        raise ValueError("base checkpoint must use embedding_mode='causal-token'")
     if base_model.config.vocab_size != vocab_size:
         raise ValueError("base model vocab_size must match dataset")
     if base_model.config.max_seq_len != max_seq_len:
@@ -1004,9 +1002,7 @@ def main() -> None:
             :returns: Tuple of (loss, accuracy).
             """
             attention_mask = tokens != pad_id
-            reps = base_inner.encode_tokens(tokens, attention_mask, train=False, key=None)
-            if base_inner.config.use_final_norm is True:
-                reps = base_inner.final_norm(reps)
+            reps, _pooled = base_inner(tokens, attention_mask, train=False, key=None)
             reps = jax.lax.stop_gradient(reps)
             reps = reps.astype(policy_inner.dtype)
             logits = policy_inner(reps, train=True, key=tokens_key)

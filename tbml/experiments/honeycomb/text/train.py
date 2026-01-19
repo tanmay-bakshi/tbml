@@ -59,12 +59,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--drop-path-rate", type=float, default=0.0)
     parser.add_argument("--pope-base", type=float, default=10000.0)
     parser.add_argument("--init-std", type=float, default=0.02)
-    parser.add_argument(
-        "--embedding-mode",
-        type=str,
-        default="mean",
-        choices=["mean", "cls", "causal-token"],
-    )
     parser.add_argument("--attn-type", type=str, default="pope", choices=["pope", "rope"])
     parser.add_argument("--use-final-norm", dest="use_final_norm", action="store_true")
     parser.add_argument("--no-use-final-norm", dest="use_final_norm", action="store_false")
@@ -75,7 +69,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--global-mask-max", type=float, default=None)
     parser.add_argument("--local-mask-min", type=float, default=None)
     parser.add_argument("--local-mask-max", type=float, default=None)
-    parser.add_argument("--masking-mode", type=str, default="tokens", choices=["tokens", "spans"])
 
     parser.add_argument("--sigreg-weight", type=float, default=0.25)
     parser.add_argument("--sigreg-slices", type=int, default=256)
@@ -395,48 +388,6 @@ def _iter_batches(
         yield tokens
 
 
-def _mask_tokens(
-    tokens: Array,
-    key: Array,
-    *,
-    min_ratio: float,
-    max_ratio: float,
-    mask_id: int,
-    pad_id: int,
-    eos_id: int,
-) -> tuple[Array, Array, Array]:
-    """Apply random masking to tokens.
-
-    :param tokens: Token ids of shape (B, T).
-    :param key: PRNG key.
-    :param min_ratio: Minimum masking ratio.
-    :param max_ratio: Maximum masking ratio.
-    :param mask_id: Masking token id.
-    :param pad_id: Padding token id.
-    :param eos_id: EOS token id.
-    :returns: Tuple of (masked token ids, mask positions).
-    """
-    if min_ratio < 0.0 or min_ratio > 1.0:
-        raise ValueError("min_ratio must be in [0, 1]")
-    if max_ratio < 0.0 or max_ratio > 1.0:
-        raise ValueError("max_ratio must be in [0, 1]")
-    if min_ratio > max_ratio:
-        raise ValueError("min_ratio must be <= max_ratio")
-
-    key_ratio, key_mask = jax.random.split(key)
-    ratios = jax.random.uniform(
-        key_ratio,
-        shape=(tokens.shape[0],),
-        minval=min_ratio,
-        maxval=max_ratio,
-    )
-    rand = jax.random.uniform(key_mask, shape=tokens.shape, minval=0.0, maxval=1.0)
-    eligible = jnp.logical_and(tokens != pad_id, tokens != eos_id)
-    mask = jnp.logical_and(rand < ratios[:, None], eligible)
-    masked_tokens = jnp.where(mask, jnp.asarray(mask_id, dtype=tokens.dtype), tokens)
-    return masked_tokens, mask
-
-
 def _mask_spans(
     tokens: Array,
     key: Array,
@@ -586,7 +537,6 @@ def _mask_views(
     num_views: int,
     min_ratio: float,
     max_ratio: float,
-    masking_mode: str,
     mask_id: int,
     pad_id: int,
     eos_id: int,
@@ -598,7 +548,6 @@ def _mask_views(
     :param num_views: Number of views to generate.
     :param min_ratio: Minimum masking ratio.
     :param max_ratio: Maximum masking ratio.
-    :param masking_mode: Masking mode ("tokens" or "spans").
     :param mask_id: Masking token id.
     :param pad_id: Padding token id.
     :param eos_id: EOS token id.
@@ -616,31 +565,17 @@ def _mask_views(
         """Mask tokens using the provided view key.
 
         :param view_key: PRNG key for masking.
-        :returns: Tuple of (masked token ids, mask positions).
+        :returns: Tuple of (masked token ids, mask positions, attention mask).
         """
-        if masking_mode == "tokens":
-            masked_tokens, mask_positions = _mask_tokens(
-                tokens,
-                view_key,
-                min_ratio=min_ratio,
-                max_ratio=max_ratio,
-                mask_id=mask_id,
-                pad_id=pad_id,
-                eos_id=eos_id,
-            )
-            attn_mask = tokens != pad_id
-            return masked_tokens, mask_positions, attn_mask
-        if masking_mode == "spans":
-            return _mask_spans(
-                tokens,
-                view_key,
-                min_ratio=min_ratio,
-                max_ratio=max_ratio,
-                mask_id=mask_id,
-                pad_id=pad_id,
-                eos_id=eos_id,
-            )
-        raise ValueError("masking_mode must be 'tokens' or 'spans'")
+        return _mask_spans(
+            tokens,
+            view_key,
+            min_ratio=min_ratio,
+            max_ratio=max_ratio,
+            mask_id=mask_id,
+            pad_id=pad_id,
+            eos_id=eos_id,
+        )
 
     views, masks, attn_masks = jax.vmap(_one_view)(keys)
     return (
@@ -648,46 +583,6 @@ def _mask_views(
         jnp.transpose(masks, (1, 0, 2)),
         jnp.transpose(attn_masks, (1, 0, 2)),
     )
-
-
-def _pool_representations(
-    model: TextTransformer,
-    reps: Array,
-    attention_mask: Array,
-) -> Array:
-    """Pool token representations and apply final normalization.
-
-    :param model: Text transformer model.
-    :param reps: Token representations of shape (B, T, d_model).
-    :param attention_mask: Attention mask of shape (B, T).
-    :returns: Pooled embeddings of shape (B, d_model).
-    """
-    if reps.ndim != 3:
-        raise ValueError("reps must have shape (B, T, d_model)")
-    if attention_mask.ndim != 2:
-        raise ValueError("attention_mask must have shape (B, T)")
-    if reps.shape[:2] != attention_mask.shape:
-        raise ValueError("attention_mask must match reps batch and sequence dimensions")
-
-    mask = attention_mask.astype(reps.dtype)
-    lengths = jnp.sum(mask, axis=1)
-    if model.config.embedding_mode == "cls":
-        idx = jnp.maximum(lengths.astype(jnp.int32) - 1, 0)
-        idx = idx[:, None, None]
-        idx = jnp.broadcast_to(idx, (idx.shape[0], 1, reps.shape[-1]))
-        pooled = jnp.take_along_axis(reps, idx, axis=1).squeeze(axis=1)
-    elif model.config.embedding_mode == "causal-token":
-        idx = jnp.maximum(lengths.astype(jnp.int32) - 2, 0)
-        idx = idx[:, None, None]
-        idx = jnp.broadcast_to(idx, (idx.shape[0], 1, reps.shape[-1]))
-        pooled = jnp.take_along_axis(reps, idx, axis=1).squeeze(axis=1)
-    else:
-        masked = reps * mask[:, :, None]
-        denom = jnp.maximum(lengths, 1.0)
-        pooled = jnp.sum(masked, axis=1) / denom[:, None]
-    if model.config.use_final_norm is True:
-        return model.final_norm(pooled)
-    return pooled
 
 
 def _build_views(
@@ -700,7 +595,6 @@ def _build_views(
     global_mask_max: float,
     local_mask_min: float,
     local_mask_max: float,
-    masking_mode: str,
     mask_id: int,
     pad_id: int,
     eos_id: int,
@@ -715,7 +609,6 @@ def _build_views(
     :param global_mask_max: Maximum global masking ratio.
     :param local_mask_min: Minimum local masking ratio.
     :param local_mask_max: Maximum local masking ratio.
-    :param masking_mode: Masking mode ("tokens" or "spans").
     :param mask_id: Masking token id.
     :param pad_id: Padding token id.
     :param eos_id: EOS token id.
@@ -728,7 +621,6 @@ def _build_views(
         num_views=num_global_views,
         min_ratio=global_mask_min,
         max_ratio=global_mask_max,
-        masking_mode=masking_mode,
         mask_id=mask_id,
         pad_id=pad_id,
         eos_id=eos_id,
@@ -739,7 +631,6 @@ def _build_views(
         num_views=num_local_views,
         min_ratio=local_mask_min,
         max_ratio=local_mask_max,
-        masking_mode=masking_mode,
         mask_id=mask_id,
         pad_id=pad_id,
         eos_id=eos_id,
@@ -791,7 +682,6 @@ def _encode_views(
     global_mask_max: float,
     local_mask_min: float,
     local_mask_max: float,
-    masking_mode: str,
     mask_id: int,
     pad_id: int,
     eos_id: int,
@@ -808,7 +698,6 @@ def _encode_views(
     :param global_mask_max: Maximum global masking ratio.
     :param local_mask_min: Minimum local masking ratio.
     :param local_mask_max: Maximum local masking ratio.
-    :param masking_mode: Masking mode ("tokens" or "spans").
     :param mask_id: Masking token id.
     :param pad_id: Padding token id.
     :param eos_id: EOS token id.
@@ -834,7 +723,6 @@ def _encode_views(
         global_mask_max=global_mask_max,
         local_mask_min=local_mask_min,
         local_mask_max=local_mask_max,
-        masking_mode=masking_mode,
         mask_id=mask_id,
         pad_id=pad_id,
         eos_id=eos_id,
@@ -851,7 +739,7 @@ def _encode_views(
     bsz, num_views, seq_len = views.shape
     flat_views = views.reshape((bsz * num_views, seq_len))
     flat_mask = view_attn.reshape((bsz * num_views, seq_len))
-    pooled = model(flat_views, flat_mask, train=train, key=model_key)
+    _token_reps, pooled = model(flat_views, flat_mask, train=train, key=model_key)
     return pooled.reshape((bsz, num_views, pooled.shape[-1]))
 
 
@@ -896,16 +784,10 @@ def main() -> None:
         raise ValueError("num-global-views must be >= 0")
     if args.num_local_views < 0:
         raise ValueError("num-local-views must be >= 0")
-    if args.masking_mode == "spans":
-        default_global_min = 0.25
-        default_global_max = 0.30
-        default_local_min = 0.40
-        default_local_max = 0.45
-    else:
-        default_global_min = 0.20
-        default_global_max = 0.40
-        default_local_min = 0.60
-        default_local_max = 0.70
+    default_global_min = 0.25
+    default_global_max = 0.30
+    default_local_min = 0.40
+    default_local_max = 0.45
 
     if args.global_mask_min is None:
         args.global_mask_min = default_global_min
@@ -996,7 +878,6 @@ def main() -> None:
             num_views=args.num_global_views,
             min_ratio=args.global_mask_min,
             max_ratio=args.global_mask_max,
-            masking_mode=args.masking_mode,
             mask_id=mask_id,
             pad_id=pad_id,
             eos_id=eos_id,
@@ -1007,13 +888,11 @@ def main() -> None:
             num_views=args.num_local_views,
             min_ratio=args.local_mask_min,
             max_ratio=args.local_mask_max,
-            masking_mode=args.masking_mode,
             mask_id=mask_id,
             pad_id=pad_id,
             eos_id=eos_id,
         )
 
-        print(f"Masking mode: {args.masking_mode}")
         for idx in range(batch_tokens.shape[0]):
             original = _decode_tokens(tokenizer, batch_tokens[idx], pad_id=pad_id)
             print(f"\nSample {idx + 1}")
@@ -1048,7 +927,6 @@ def main() -> None:
         drop_path_rate=args.drop_path_rate,
         pope_base=args.pope_base,
         init_std=args.init_std,
-        embedding_mode=args.embedding_mode,
         attn_type=args.attn_type,
         use_final_norm=args.use_final_norm,
     )
@@ -1077,7 +955,6 @@ def main() -> None:
             "global_mask_max": args.global_mask_max,
             "local_mask_min": args.local_mask_min,
             "local_mask_max": args.local_mask_max,
-            "masking_mode": args.masking_mode,
         },
         "loss": {
             "sigreg_weight": args.sigreg_weight,
@@ -1214,7 +1091,6 @@ def main() -> None:
                 global_mask_max=args.global_mask_max,
                 local_mask_min=args.local_mask_min,
                 local_mask_max=args.local_mask_max,
-                masking_mode=args.masking_mode,
                 mask_id=mask_id,
                 pad_id=pad_id,
                 eos_id=eos_id,

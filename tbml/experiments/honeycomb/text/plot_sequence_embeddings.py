@@ -457,11 +457,9 @@ def main() -> None:
     model = _load_model(checkpoint_dir, dtype=dtype, model_config=model_config)
     token_tensor = jnp.asarray(tokens, dtype=jnp.int32)
     mask_tensor = jnp.asarray(attention_mask, dtype=jnp.bool_)
-    pooled = model(token_tensor, mask_tensor, train=False, key=None)
+    token_reps, pooled = model(token_tensor, mask_tensor, train=False, key=None)
     pooled = jax.device_get(pooled)
     pooled_np = np.asarray(pooled, dtype=np.float32)
-
-    token_reps = model.encode_tokens(token_tensor, mask_tensor, train=False, key=None)
     token_reps = jax.device_get(token_reps)
     token_reps_np = np.asarray(token_reps, dtype=np.float32)
 

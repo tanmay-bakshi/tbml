@@ -40,7 +40,6 @@ def main() -> None:
     base = TextInference.from_checkpoint(args.base_checkpoint)
     tokens, attention_mask = base.preprocess([args.text])
     reps = base.encode_tokens(tokens, attention_mask)
-    reps = base.apply_final_norm(reps)
     last_idx = _last_non_eos_index(tokens, attention_mask, base.eos_id)
     trajectory = np.asarray(reps)[0, : last_idx + 1]
     np.save(args.output, trajectory)

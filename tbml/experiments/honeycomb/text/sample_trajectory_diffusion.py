@@ -182,7 +182,6 @@ def _compute_condition(base: TextInference, text: str) -> jnp.ndarray:
     """
     tokens, attention_mask = base.preprocess([text])
     reps = base.encode_tokens(tokens, attention_mask)
-    reps = base.apply_final_norm(reps)
     idx = _last_non_eos_index(tokens, attention_mask, base.eos_id)
     return reps[:, idx, :]
 
@@ -198,8 +197,6 @@ def main() -> None:
         raise ValueError("override beta values must be >= 0")
 
     base = TextInference.from_checkpoint(args.base_checkpoint)
-    if base.model_config.embedding_mode != "causal-token":
-        raise ValueError("base checkpoint must use embedding_mode='causal-token'")
 
     diffusion_dir = _resolve_checkpoint_dir(args.diffusion_checkpoint)
     diff_config_root = _load_run_config(diffusion_dir)

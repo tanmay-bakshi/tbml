@@ -194,7 +194,7 @@ def _compute_token_embeddings(
     *,
     dtype: jnp.dtype,
 ) -> np.ndarray:
-    """Compute token embeddings before pooling and final normalization.
+    """Compute token embeddings (after final norm if enabled).
 
     :param model: Text transformer model.
     :param tokens: Token ids array of shape (1, T).
@@ -208,9 +208,9 @@ def _compute_token_embeddings(
         raise ValueError("attention_mask must have shape (1, T)")
     token_tensor = jnp.asarray(tokens, dtype=jnp.int32)
     mask_tensor = jnp.asarray(attention_mask, dtype=jnp.bool_)
-    embeddings = model.encode_tokens(token_tensor, mask_tensor, train=False, key=None)
-    embeddings = jax.device_get(embeddings)
-    return np.asarray(embeddings, dtype=np.float32)[0]
+    token_reps, _pooled = model(token_tensor, mask_tensor, train=False, key=None)
+    token_reps = jax.device_get(token_reps)
+    return np.asarray(token_reps, dtype=np.float32)[0]
 
 
 def _pca_to_rgb(embeddings: np.ndarray) -> np.ndarray:

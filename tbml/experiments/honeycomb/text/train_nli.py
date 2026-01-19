@@ -1048,10 +1048,10 @@ def main() -> None:
                 head_key = None
             else:
                 premise_key, hypothesis_key, head_key = jax.random.split(key, 3)
-            pooled_p = model_inner(
+            _token_reps_p, pooled_p = model_inner(
                 premise_tokens, premise_mask, train=train_backbone, key=premise_key
             )
-            pooled_h = model_inner(
+            _token_reps_h, pooled_h = model_inner(
                 hypothesis_tokens, hypothesis_mask, train=train_backbone, key=hypothesis_key
             )
             if train_backbone is False:
@@ -1106,8 +1106,8 @@ def main() -> None:
         :param labels_in: Label ids of shape (B,).
         :returns: Loss and accuracy.
         """
-        pooled_p = bundle_in.model(premise_tokens, premise_mask, train=False, key=None)
-        pooled_h = bundle_in.model(hypothesis_tokens, hypothesis_mask, train=False, key=None)
+        _token_reps_p, pooled_p = bundle_in.model(premise_tokens, premise_mask, train=False, key=None)
+        _token_reps_h, pooled_h = bundle_in.model(hypothesis_tokens, hypothesis_mask, train=False, key=None)
         logits = bundle_in.classifier(pooled_p, pooled_h, train=False, key=None)
         log_probs = jax.nn.log_softmax(logits, axis=-1)
         labels_b = labels_in.astype(jnp.int32)

@@ -24,7 +24,6 @@ class TextTransformerConfig(BaseModel):
     :ivar drop_path_rate: Stochastic depth rate at the final block.
     :ivar pope_base: Base for PoPE/RoPE frequency schedule.
     :ivar init_std: Standard deviation for truncated normal initialization.
-    :ivar embedding_mode: Pooling mode ("mean", "cls", or "causal-token").
     :ivar attn_type: Attention type ("pope" or "rope").
     :ivar use_final_norm: Whether to apply the final RMSNorm.
     """
@@ -40,8 +39,6 @@ class TextTransformerConfig(BaseModel):
     drop_path_rate: float = Field(default=0.0)
     pope_base: float = Field(default=10000.0)
     init_std: float = Field(default=0.02)
-    embedding_mode: str = Field(default="mean")
-    use_cls_token: bool | None = Field(default=None, exclude=True)
     attn_type: str = Field(default="pope")
     use_final_norm: bool = Field(default=True)
 
@@ -290,9 +287,6 @@ class TextTransformer(eqx.Module):
             raise ValueError("pope_base must be > 1.0")
         if config.attn_type not in ("pope", "rope"):
             raise ValueError("attn_type must be 'pope' or 'rope'")
-        embedding_mode = _resolve_embedding_mode(config)
-        if embedding_mode not in ("mean", "cls", "causal-token"):
-            raise ValueError("embedding_mode must be 'mean', 'cls', or 'causal-token'")
 
         init = truncated_normal_init(config.init_std)
         keys = jax.random.split(key, 2 + config.n_layers)
@@ -300,7 +294,7 @@ class TextTransformer(eqx.Module):
         block_keys = keys[1 : 1 + config.n_layers]
         final_key = keys[-1]
 
-        self.config = config.model_copy(update={"embedding_mode": embedding_mode})
+        self.config = config
         self.token_embed = TokenEmbedding(
             vocab_size=config.vocab_size,
             d_model=config.d_model,
@@ -327,7 +321,7 @@ class TextTransformer(eqx.Module):
                     drop_path_prob=drop_rates[idx],
                     pope_base=config.pope_base,
                     attn_type=config.attn_type,
-                    is_causal=embedding_mode == "causal-token",
+                    is_causal=True,
                     dtype=dtype,
                     param_dtype=param_dtype,
                     qkv_kernel_init=init,
@@ -341,21 +335,21 @@ class TextTransformer(eqx.Module):
         self.final_norm = RMSNorm(config.d_model, dtype=dtype, param_dtype=param_dtype)
         _ = final_key
 
-    def encode_tokens(
+    def __call__(
         self,
         tokens: Array,
         attention_mask: Array,
         *,
         train: bool,
         key: Array | None,
-    ) -> Array:
-        """Compute token representations.
+    ) -> tuple[Array, Array]:
+        """Compute per-token and pooled sequence embeddings.
 
         :param tokens: Token ids of shape (B, T).
         :param attention_mask: Attention mask of shape (B, T).
         :param train: Whether to enable dropout.
         :param key: PRNG key for dropout and DropPath.
-        :returns: Token representations of shape (B, T, d_model).
+        :returns: Tuple of (token_reps, pooled_reps).
         """
         if tokens.ndim != 2:
             raise ValueError("tokens must have shape (B, T)")
@@ -366,53 +360,25 @@ class TextTransformer(eqx.Module):
         if tokens.shape[1] > self.config.max_seq_len:
             raise ValueError("sequence length exceeds max_seq_len")
 
-        x = self.token_embed(tokens)
+        reps = self.token_embed(tokens)
         if key is None:
             block_keys: list[Array | None] = [None] * len(self.blocks)
         else:
             block_keys = list(jax.random.split(key, len(self.blocks)))
 
         for block, block_key in zip(self.blocks, block_keys):
-            x = block(x, attention_mask=attention_mask, train=train, key=block_key)
+            reps = block(reps, attention_mask=attention_mask, train=train, key=block_key)
 
-        return x
+        if self.config.use_final_norm is True:
+            reps = self.final_norm(reps)
 
-    def __call__(
-        self,
-        tokens: Array,
-        attention_mask: Array,
-        *,
-        train: bool,
-        key: Array | None,
-    ) -> Array:
-        """Compute pooled sequence embeddings.
-
-        :param tokens: Token ids of shape (B, T).
-        :param attention_mask: Attention mask of shape (B, T).
-        :param train: Whether to enable dropout.
-        :param key: PRNG key for dropout and DropPath.
-        :returns: Pooled embeddings of shape (B, d_model).
-        """
-        reps = self.encode_tokens(tokens, attention_mask, train=train, key=key)
         mask = attention_mask.astype(reps.dtype)
         lengths = jnp.sum(mask, axis=1)
-        if self.config.embedding_mode == "cls":
-            idx = jnp.maximum(lengths.astype(jnp.int32) - 1, 0)
-            idx = idx[:, None, None]
-            idx = jnp.broadcast_to(idx, (idx.shape[0], 1, reps.shape[-1]))
-            pooled = jnp.take_along_axis(reps, idx, axis=1).squeeze(axis=1)
-        elif self.config.embedding_mode == "causal-token":
-            idx = jnp.maximum(lengths.astype(jnp.int32) - 2, 0)
-            idx = idx[:, None, None]
-            idx = jnp.broadcast_to(idx, (idx.shape[0], 1, reps.shape[-1]))
-            pooled = jnp.take_along_axis(reps, idx, axis=1).squeeze(axis=1)
-        else:
-            masked = reps * mask[:, :, None]
-            denom = jnp.maximum(lengths, 1.0)
-            pooled = jnp.sum(masked, axis=1) / denom[:, None]
-        if self.config.use_final_norm is True:
-            return self.final_norm(pooled)
-        return pooled
+        idx = jnp.maximum(lengths.astype(jnp.int32) - 2, 0)
+        idx = idx[:, None, None]
+        idx = jnp.broadcast_to(idx, (idx.shape[0], 1, reps.shape[-1]))
+        pooled = jnp.take_along_axis(reps, idx, axis=1).squeeze(axis=1)
+        return reps, pooled
 
 
 def _build_drop_rates(drop_path_rate: float, total_layers: int) -> list[float]:
@@ -428,16 +394,3 @@ def _build_drop_rates(drop_path_rate: float, total_layers: int) -> list[float]:
         return [drop_path_rate]
     return [drop_path_rate * (idx / (total_layers - 1)) for idx in range(total_layers)]
 
-
-def _resolve_embedding_mode(config: TextTransformerConfig) -> str:
-    """Resolve the effective embedding mode from the config.
-
-    :param config: Text transformer configuration.
-    :returns: Embedding mode string.
-    """
-    embedding_mode = config.embedding_mode
-    if config.use_cls_token is None:
-        return embedding_mode
-    if embedding_mode == "mean":
-        return "cls" if config.use_cls_token is True else "mean"
-    return embedding_mode
