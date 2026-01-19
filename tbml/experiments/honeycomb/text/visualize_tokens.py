@@ -168,12 +168,14 @@ def _prepare_batch(
     *,
     max_seq_len: int,
     pad_id: int,
+    eos_id: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Pad token ids into a batch and build the attention mask.
 
     :param token_ids: Token ids for a single sample.
     :param max_seq_len: Maximum sequence length.
     :param pad_id: Padding token id.
+    :param eos_id: EOS token id.
     :returns: Tuple of (tokens, attention_mask) arrays.
     """
     if len(token_ids) > max_seq_len:
@@ -184,6 +186,10 @@ def _prepare_batch(
     if length > 0:
         tokens[0, :length] = np.asarray(token_ids, dtype=np.int32)
         attention_mask[0, :length] = True
+    eos_positions = tokens == eos_id
+    if eos_positions.any():
+        tokens = np.where(eos_positions, pad_id, tokens)
+        attention_mask = np.where(eos_positions, False, attention_mask)
     return tokens, attention_mask
 
 
@@ -353,7 +359,12 @@ def main() -> None:
         mask_token=mask_token,
         max_seq_len=max_seq_len,
     )
-    tokens, attention_mask = _prepare_batch(token_ids, max_seq_len=max_seq_len, pad_id=pad_id)
+    tokens, attention_mask = _prepare_batch(
+        token_ids,
+        max_seq_len=max_seq_len,
+        pad_id=pad_id,
+        eos_id=eos_id,
+    )
     embeddings = _compute_token_embeddings(model, tokens, attention_mask, dtype=dtype)
     embeddings = embeddings[: len(token_ids)]
 

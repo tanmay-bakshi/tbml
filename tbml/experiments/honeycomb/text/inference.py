@@ -332,6 +332,8 @@ class TextInference:
             raise ValueError("tokens sequence length must match max_seq_len")
         if tokens.dtype != np.int32:
             tokens = tokens.astype(np.int32, copy=False)
+        tokens = np.where(tokens == self._eos_id, self._pad_id, tokens)
+        attention_mask = np.logical_and(attention_mask, tokens != self._pad_id)
         tokens_jax = jnp.asarray(tokens)
         mask_jax = jnp.asarray(attention_mask)
         _token_reps, pooled = self._model(tokens_jax, mask_jax, train=False, key=None)
@@ -354,6 +356,8 @@ class TextInference:
             raise ValueError("tokens sequence length must match max_seq_len")
         if tokens.dtype != np.int32:
             tokens = tokens.astype(np.int32, copy=False)
+        tokens = np.where(tokens == self._eos_id, self._pad_id, tokens)
+        attention_mask = np.logical_and(attention_mask, tokens != self._pad_id)
         tokens_jax = jnp.asarray(tokens)
         mask_jax = jnp.asarray(attention_mask)
         token_reps, _pooled = self._model(tokens_jax, mask_jax, train=False, key=None)

@@ -497,6 +497,7 @@ class NliDataset:
     _hypothesis_tokens: list[list[int]]
     _labels: np.ndarray
     _pad_id: int
+    _eos_id: int
     _max_seq_len: int
     _seed: int
     _shuffle: bool
@@ -558,6 +559,7 @@ class NliDataset:
         self._hypothesis_tokens = hypothesis_tokens
         self._labels = labels.astype(np.int64)
         self._pad_id = int(pad_id)
+        self._eos_id = int(eos_id)
         self._max_seq_len = max_seq_len
         self._seed = seed
         self._shuffle = shuffle
@@ -638,6 +640,14 @@ def _iter_epoch_batches(
                 tokens_h[row, :len_h] = np.asarray(hypothesis[:len_h], dtype=np.int32)
                 mask_h[row, :len_h] = True
             labels[row] = int(dataset._labels[int(idx)])
+        eos_positions_p = tokens_p == dataset._eos_id
+        eos_positions_h = tokens_h == dataset._eos_id
+        if eos_positions_p.any():
+            tokens_p = np.where(eos_positions_p, dataset._pad_id, tokens_p)
+            mask_p = np.where(eos_positions_p, False, mask_p)
+        if eos_positions_h.any():
+            tokens_h = np.where(eos_positions_h, dataset._pad_id, tokens_h)
+            mask_h = np.where(eos_positions_h, False, mask_h)
         yield tokens_p, mask_p, tokens_h, mask_h, labels
 
 

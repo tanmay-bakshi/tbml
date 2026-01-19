@@ -369,10 +369,13 @@ class TextTransformer(eqx.Module):
 
         reps = self.final_norm(reps)
 
-        mask = attention_mask.astype(reps.dtype)
-        lengths = jnp.sum(mask, axis=1)
-        idx = jnp.maximum(lengths.astype(jnp.int32) - 2, 0)
-        idx = idx[:, None, None]
+        mask = attention_mask.astype(bool)
+        positions = jnp.arange(reps.shape[1], dtype=jnp.int32)
+        positions = jnp.broadcast_to(positions[None, :], mask.shape)
+        masked_positions = jnp.where(mask, positions, jnp.full_like(positions, -1))
+        last_idx = jnp.max(masked_positions, axis=1)
+        last_idx = jnp.maximum(last_idx, 0)
+        idx = last_idx[:, None, None]
         idx = jnp.broadcast_to(idx, (idx.shape[0], 1, reps.shape[-1]))
         pooled = jnp.take_along_axis(reps, idx, axis=1).squeeze(axis=1)
         return reps, pooled

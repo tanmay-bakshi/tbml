@@ -842,12 +842,15 @@ def main() -> None:
     vocab_size = int(metadata.get("vocab_size", 0))
     max_seq_len = int(metadata.get("max_seq_len", 0))
     pad_id = int(metadata.get("pad_id", -1))
+    eos_id = int(metadata.get("eos_id", -1))
     if vocab_size <= 0:
         raise ValueError("metadata missing vocab_size")
     if max_seq_len <= 0:
         raise ValueError("metadata missing max_seq_len")
     if pad_id < 0:
         raise ValueError("metadata missing pad_id")
+    if eos_id < 0:
+        raise ValueError("metadata missing eos_id")
     total_samples = len(dataset)
 
     checkpoint_dir = _resolve_checkpoint_dir(args.checkpoint)
@@ -1001,15 +1004,16 @@ def main() -> None:
             :param tokens_key: PRNG key for dropout.
             :returns: Tuple of (loss, accuracy).
             """
-            attention_mask = tokens != pad_id
-            reps, _pooled = base_inner(tokens, attention_mask, train=False, key=None)
+            clean_tokens = jnp.where(tokens == eos_id, pad_id, tokens)
+            attention_mask = clean_tokens != pad_id
+            reps, _pooled = base_inner(clean_tokens, attention_mask, train=False, key=None)
             reps = jax.lax.stop_gradient(reps)
             reps = reps.astype(policy_inner.dtype)
             logits = policy_inner(reps, train=True, key=tokens_key)
             logits = logits.astype(jnp.float32)
 
             targets = tokens.reshape((-1,)).astype(jnp.int32)
-            mask = targets != pad_id
+            mask = jnp.logical_and(targets != pad_id, targets != eos_id)
             log_probs = jax.nn.log_softmax(logits, axis=-1)
             nll = -jnp.take_along_axis(log_probs, targets[:, None], axis=-1).squeeze(axis=-1)
             nll = nll * mask

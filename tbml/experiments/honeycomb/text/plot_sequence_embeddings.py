@@ -189,6 +189,10 @@ def _prepare_batch(
         if length > 0:
             tokens[row, :length] = np.asarray(token_ids[:length], dtype=np.int32)
             attention_mask[row, :length] = True
+    eos_positions = tokens == eos_id
+    if eos_positions.any():
+        tokens = np.where(eos_positions, pad_id, tokens)
+        attention_mask = np.where(eos_positions, False, attention_mask)
     return tokens, attention_mask, labels, token_ids_per_sample
 
 

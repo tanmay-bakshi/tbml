@@ -130,7 +130,7 @@ def _tokenize_text(
     pad_token: str,
     mask_token: str,
     max_seq_len: int,
-) -> tuple[list[int], int]:
+) -> tuple[list[int], int, int]:
     """Tokenize text the same way as the streaming dataset.
 
     :param text: Input text string.
@@ -139,7 +139,7 @@ def _tokenize_text(
     :param pad_token: Padding token string.
     :param mask_token: Masking token string.
     :param max_seq_len: Maximum sequence length.
-    :returns: Tuple of (token ids, pad token id).
+    :returns: Tuple of (token ids, pad token id, eos token id).
     """
     _tokenizer, eos_id, pad_id, _mask_id = _build_tokenizer(
         tokenizer_name,
@@ -154,7 +154,7 @@ def _tokenize_text(
     if len(token_ids) > max_seq_len - 1:
         token_ids = token_ids[: max_seq_len - 1]
     token_ids.append(eos_id)
-    return token_ids, pad_id
+    return token_ids, pad_id, eos_id
 
 
 def _prepare_batch(
@@ -162,12 +162,14 @@ def _prepare_batch(
     *,
     max_seq_len: int,
     pad_id: int,
+    eos_id: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Pad token ids into a batch and build the attention mask.
 
     :param token_ids: Token ids for a single sample.
     :param max_seq_len: Maximum sequence length.
     :param pad_id: Padding token id.
+    :param eos_id: EOS token id.
     :returns: Tuple of (tokens, attention_mask) arrays.
     """
     if len(token_ids) > max_seq_len:
@@ -178,6 +180,10 @@ def _prepare_batch(
     if length > 0:
         tokens[0, :length] = np.asarray(token_ids, dtype=np.int32)
         attention_mask[0, :length] = True
+    eos_positions = tokens == eos_id
+    if eos_positions.any():
+        tokens = np.where(eos_positions, pad_id, tokens)
+        attention_mask = np.where(eos_positions, False, attention_mask)
     return tokens, attention_mask
 
 
@@ -187,6 +193,7 @@ def _pooled_embedding(
     *,
     max_seq_len: int,
     pad_id: int,
+    eos_id: int,
     dtype: jnp.dtype,
 ) -> np.ndarray:
     """Compute pooled, normalized embedding for a single sequence.
@@ -195,10 +202,16 @@ def _pooled_embedding(
     :param token_ids: Token ids for a single sample.
     :param max_seq_len: Maximum sequence length.
     :param pad_id: Padding token id.
+    :param eos_id: EOS token id.
     :param dtype: Compute dtype.
     :returns: Pooled embedding array of shape (d_model,).
     """
-    tokens, attention_mask = _prepare_batch(token_ids, max_seq_len=max_seq_len, pad_id=pad_id)
+    tokens, attention_mask = _prepare_batch(
+        token_ids,
+        max_seq_len=max_seq_len,
+        pad_id=pad_id,
+        eos_id=eos_id,
+    )
     token_tensor = jnp.asarray(tokens, dtype=jnp.int32)
     mask_tensor = jnp.asarray(attention_mask, dtype=jnp.bool_)
     _token_reps, pooled = model(token_tensor, mask_tensor, train=False, key=None)
@@ -273,7 +286,7 @@ def main() -> None:
 
     model = _load_model(checkpoint_dir, dtype=dtype, model_config=model_config)
 
-    anchor_ids, pad_id = _tokenize_text(
+    anchor_ids, pad_id, eos_id = _tokenize_text(
         args.anchor,
         tokenizer_name=tokenizer_name,
         eos_token=eos_token,
@@ -281,7 +294,7 @@ def main() -> None:
         mask_token=mask_token,
         max_seq_len=max_seq_len,
     )
-    candidate_a_ids, _pad_id_a = _tokenize_text(
+    candidate_a_ids, _pad_id_a, _eos_id_a = _tokenize_text(
         args.candidate_a,
         tokenizer_name=tokenizer_name,
         eos_token=eos_token,
@@ -289,7 +302,7 @@ def main() -> None:
         mask_token=mask_token,
         max_seq_len=max_seq_len,
     )
-    candidate_b_ids, _pad_id_b = _tokenize_text(
+    candidate_b_ids, _pad_id_b, _eos_id_b = _tokenize_text(
         args.candidate_b,
         tokenizer_name=tokenizer_name,
         eos_token=eos_token,
@@ -303,6 +316,7 @@ def main() -> None:
         anchor_ids,
         max_seq_len=max_seq_len,
         pad_id=pad_id,
+        eos_id=eos_id,
         dtype=dtype,
     )
     candidate_a_vec = _pooled_embedding(
@@ -310,6 +324,7 @@ def main() -> None:
         candidate_a_ids,
         max_seq_len=max_seq_len,
         pad_id=pad_id,
+        eos_id=eos_id,
         dtype=dtype,
     )
     candidate_b_vec = _pooled_embedding(
@@ -317,6 +332,7 @@ def main() -> None:
         candidate_b_ids,
         max_seq_len=max_seq_len,
         pad_id=pad_id,
+        eos_id=eos_id,
         dtype=dtype,
     )
 

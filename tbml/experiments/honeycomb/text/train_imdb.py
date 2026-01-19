@@ -474,6 +474,7 @@ class ImdbDataset:
     _tokens: list[list[int]]
     _labels: np.ndarray
     _pad_id: int
+    _eos_id: int
     _max_seq_len: int
     _seed: int
     _shuffle: bool
@@ -527,6 +528,7 @@ class ImdbDataset:
         self._tokens = tokens
         self._labels = labels.astype(np.int64)
         self._pad_id = int(pad_id)
+        self._eos_id = int(eos_id)
         self._max_seq_len = max_seq_len
         self._seed = seed
         self._shuffle = shuffle
@@ -569,6 +571,10 @@ class ImdbDataset:
                         tokens[row, :length] = np.asarray(sample[:length], dtype=np.int32)
                         attention_mask[row, :length] = True
                     labels[row] = int(self._labels[int(idx)])
+                eos_positions = tokens == self._eos_id
+                if eos_positions.any():
+                    tokens = np.where(eos_positions, self._pad_id, tokens)
+                    attention_mask = np.where(eos_positions, False, attention_mask)
                 yield tokens, attention_mask, labels
 
 
@@ -631,6 +637,10 @@ def _iter_epoch_batches(
                 tokens[row, :length] = np.asarray(sample[:length], dtype=np.int32)
                 attention_mask[row, :length] = True
             labels[row] = int(dataset._labels[int(idx)])
+        eos_positions = tokens == dataset._eos_id
+        if eos_positions.any():
+            tokens = np.where(eos_positions, dataset._pad_id, tokens)
+            attention_mask = np.where(eos_positions, False, attention_mask)
         yield tokens, attention_mask, labels
 
 

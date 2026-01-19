@@ -398,14 +398,10 @@ def _prepare_prefix_batch_jax(
     if num_prefix <= 0:
         raise ValueError("num_prefix must be > 0")
     batch_size, seq_len = tokens.shape
+    tokens = jnp.where(tokens == eos_id, jnp.asarray(pad_id, dtype=tokens.dtype), tokens)
     prefix_tokens = jnp.full((batch_size, seq_len), pad_id, dtype=tokens.dtype)
     prefix_tokens = prefix_tokens.at[:, :num_prefix].set(tokens[:, :num_prefix])
-    attention_mask = jnp.zeros((batch_size, seq_len), dtype=jnp.bool_)
-    if num_prefix < seq_len:
-        prefix_tokens = prefix_tokens.at[:, num_prefix].set(eos_id)
-        attention_mask = attention_mask.at[:, : num_prefix + 1].set(True)
-    else:
-        attention_mask = attention_mask.at[:, :num_prefix].set(True)
+    attention_mask = prefix_tokens != pad_id
     return prefix_tokens, attention_mask
 
 
