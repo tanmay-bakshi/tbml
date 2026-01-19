@@ -17,10 +17,10 @@ def _parse_args() -> argparse.Namespace:
 
     :returns: Parsed arguments namespace.
     """
-    parser = argparse.ArgumentParser(description="Infer next-token predictions from a policy checkpoint.")
+    parser = argparse.ArgumentParser(description="Run a policy model over a saved trajectory.")
     parser.add_argument("--base-checkpoint", type=str, required=True)
     parser.add_argument("--policy-checkpoint", type=str, required=True)
-    parser.add_argument("--text", type=str, required=True)
+    parser.add_argument("--trajectory", type=str, required=True)
     parser.add_argument("--top-k", type=int, default=5)
     return parser.parse_args()
 
@@ -131,34 +131,36 @@ def _load_policy_model(
     raise RuntimeError("failed to load policy model")
 
 
+def _format_top_k(
+    base: TextInference,
+    probs: np.ndarray,
+    *,
+    top_k: int,
+) -> list[tuple[str, int, float]]:
+    """Format top-K tokens and probabilities.
+
+    :param base: Base inference helper.
+    :param probs: Probability array of shape (V,).
+    :param top_k: Number of top tokens to return.
+    :returns: List of (token_text, token_id, probability).
+    """
+    k = min(top_k, probs.shape[0])
+    indices = np.argsort(-probs)[:k]
+    results: list[tuple[str, int, float]] = []
+    for idx in indices:
+        token_id = int(idx)
+        token_text = base.decode_token(token_id)
+        results.append((token_text, token_id, float(probs[token_id])))
+    return results
+
+
 def main() -> None:
-    """Run policy inference on a single text input."""
+    """Run policy logits on a trajectory and print top-k tokens."""
     args = _parse_args()
     if args.top_k <= 0:
         raise ValueError("top-k must be > 0")
 
-    base_infer = TextInference.from_checkpoint(args.base_checkpoint)
-    if base_infer.model_config.embedding_mode != "causal-token":
-        raise ValueError("base checkpoint must use embedding_mode='causal-token'")
-    tokens, attention_mask = base_infer.preprocess([args.text])
-    length = int(np.sum(attention_mask[0]))
-    if length < 1:
-        raise ValueError("text must contain at least one token after EOS is appended")
-
-    seq_tokens = tokens[0, :length]
-    if seq_tokens.shape[0] > 0 and int(seq_tokens[-1]) == base_infer.eos_id:
-        length = length - 1
-        seq_tokens = tokens[0, :length]
-    if length < 1:
-        raise ValueError("text must contain at least one non-EOS token")
-
-    last_token_id = int(seq_tokens[-1])
-    prev_token_id = int(seq_tokens[-2]) if length > 1 else -1
-
-    base_reps = base_infer.encode_tokens(tokens, attention_mask)
-    base_reps = base_infer.apply_final_norm(base_reps)
-    reps_last = base_reps[:, length - 2 : length, :] if length > 1 else base_reps[:, length - 1 : length, :]
-
+    base = TextInference.from_checkpoint(args.base_checkpoint)
     policy_dir = _resolve_checkpoint_dir(args.policy_checkpoint)
     policy_config_root = _load_run_config(policy_dir)
     policy_config_raw = policy_config_root.get("policy_model")
@@ -176,35 +178,29 @@ def main() -> None:
         dtype=_dtype_from_name(dtype_name),
         policy_config=policy_config_raw,
     )
-    if policy_model.config.d_model != reps_last.shape[-1]:
-        raise ValueError("policy model d_model must match base model output")
 
-    if reps_last.shape[1] == 1:
-        start = policy_model.start_token.astype(reps_last.dtype)
-        start = jnp.broadcast_to(start[None, None, :], (reps_last.shape[0], 1, reps_last.shape[2]))
-        reps_last = jnp.concatenate([start, reps_last], axis=1)
+    trajectory = np.load(args.trajectory)
+    if trajectory.ndim != 2:
+        raise ValueError("trajectory must have shape (T, D)")
+    if trajectory.shape[0] == 0:
+        raise ValueError("trajectory must contain at least one token")
+    if trajectory.shape[1] != policy_model.config.d_model:
+        raise ValueError("trajectory dimension must match policy d_model")
 
-    logits = policy_model(reps_last, train=False, key=None)
-    if logits.shape[0] < 2:
-        raise ValueError("policy logits must contain at least two positions")
-    logits_last = logits[1].astype(jnp.float32)
-    probs = jax.nn.softmax(logits_last, axis=-1)
-    probs_np = np.asarray(probs)
+    reps = jnp.asarray(trajectory, dtype=policy_model.dtype)
+    reps_batch = reps[None, :, :]
+    logits = policy_model(reps_batch, train=False, key=None)
 
-    top_k = min(args.top_k, probs_np.shape[0])
-    top_indices = np.argsort(-probs_np)[:top_k]
+    probs = np.asarray(jax.nn.softmax(logits.astype(jnp.float32), axis=-1))
 
-    if prev_token_id >= 0:
-        prev_label = repr(base_infer.decode_token(prev_token_id))
-    else:
-        prev_label = "<start>"
-    print("Previous token:", prev_label, f"(id={prev_token_id})")
-    print("True last token:", repr(base_infer.decode_token(last_token_id)), f"(id={last_token_id})")
-    print("Top predictions:")
-    for rank, token_id in enumerate(top_indices, start=1):
-        token_text = base_infer.decode_token(int(token_id))
-        confidence = float(probs_np[int(token_id)])
-        print(f"  {rank}. {repr(token_text)} (id={int(token_id)}): {confidence:.6f}")
+    for idx in range(trajectory.shape[0]):
+        header = f"Token {idx + 1}/{trajectory.shape[0]}"
+        print(header)
+        print("-" * len(header))
+        top = _format_top_k(base, probs[idx], top_k=args.top_k)
+        for rank, (text, token_id, prob) in enumerate(top, start=1):
+            print(f"  {rank:>2}. {repr(text)} (id={token_id}): {prob:.6f}")
+        print("")
 
 
 if __name__ == "__main__":
