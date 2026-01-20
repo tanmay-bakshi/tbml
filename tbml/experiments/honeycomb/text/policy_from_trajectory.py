@@ -10,6 +10,10 @@ import numpy as np
 
 from tbml.experiments.honeycomb.text.inference import TextInference
 from tbml.experiments.honeycomb.text.train_recurrent_policy import RecurrentPolicy, RecurrentPolicyConfig
+from tbml.experiments.honeycomb.text.train_transformer_policy import (
+    PolicyTransformer,
+    PolicyTransformerConfig,
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -94,16 +98,17 @@ def _load_policy_model(
     checkpoint_dir: str,
     *,
     dtype: jnp.dtype,
+    policy_type: str,
     policy_config: dict[str, Any],
-) -> RecurrentPolicy:
-    """Load a RecurrentPolicy model from a checkpoint.
+) -> RecurrentPolicy | PolicyTransformer:
+    """Load a policy model from a checkpoint.
 
     :param checkpoint_dir: Checkpoint directory path.
     :param dtype: Compute dtype to try first.
+    :param policy_type: Policy type identifier.
     :param policy_config: Policy configuration dictionary.
-    :returns: Deserialized RecurrentPolicy model.
+    :returns: Deserialized policy model.
     """
-    config = RecurrentPolicyConfig(**policy_config)
     model_path = os.path.join(checkpoint_dir, "model.eqx")
     candidates = [dtype, jnp.float32, jnp.bfloat16, jnp.float16]
     seen: set[jnp.dtype] = set()
@@ -113,12 +118,22 @@ def _load_policy_model(
             continue
         seen.add(candidate)
         model_key = jax.random.PRNGKey(0)
-        model = RecurrentPolicy(
-            config,
-            dtype=candidate,
-            param_dtype=_param_dtype_for(candidate),
-            key=model_key,
-        )
+        if policy_type == "transformer":
+            config = PolicyTransformerConfig(**policy_config)
+            model = PolicyTransformer(
+                config,
+                dtype=candidate,
+                param_dtype=_param_dtype_for(candidate),
+                key=model_key,
+            )
+        else:
+            config = RecurrentPolicyConfig(**policy_config)
+            model = RecurrentPolicy(
+                config,
+                dtype=candidate,
+                param_dtype=_param_dtype_for(candidate),
+                key=model_key,
+            )
         try:
             return eqx.tree_deserialise_leaves(model_path, model)
         except RuntimeError as exc:
@@ -173,9 +188,16 @@ def main() -> None:
     if isinstance(dtype_name, str) is False:
         raise ValueError("policy training config missing dtype")
 
+    policy_type = policy_config_root.get("policy_type")
+    if policy_type is None:
+        policy_type = "recurrent_lstm"
+    if isinstance(policy_type, str) is False:
+        raise ValueError("policy_type must be a string")
+
     policy_model = _load_policy_model(
         policy_dir,
         dtype=_dtype_from_name(dtype_name),
+        policy_type=policy_type,
         policy_config=policy_config_raw,
     )
 
@@ -184,12 +206,20 @@ def main() -> None:
         raise ValueError("trajectory must have shape (T, D)")
     if trajectory.shape[0] == 0:
         raise ValueError("trajectory must contain at least one token")
-    if trajectory.shape[1] != policy_model.config.input_dim:
-        raise ValueError("trajectory dimension must match policy input_dim")
+    if isinstance(policy_model, RecurrentPolicy):
+        expected_dim = policy_model.config.input_dim
+    else:
+        expected_dim = policy_model.config.d_model
+    if trajectory.shape[1] != expected_dim:
+        raise ValueError("trajectory dimension must match policy input dimension")
 
     reps = jnp.asarray(trajectory, dtype=policy_model.dtype)
     reps_batch = reps[None, :, :]
-    logits = policy_model(reps_batch, train=False, key=None)
+    if isinstance(policy_model, PolicyTransformer):
+        attention_mask = jnp.ones((1, reps.shape[0]), dtype=bool)
+        logits = policy_model(reps_batch, attention_mask=attention_mask, train=False, key=None)
+    else:
+        logits = policy_model(reps_batch, train=False, key=None)
 
     probs = np.asarray(jax.nn.softmax(logits.astype(jnp.float32), axis=-1))
 
