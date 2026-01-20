@@ -126,38 +126,6 @@ def _plot_trajectory_3d(
         print(f"Wrote trajectory plot to: {output}")
 
 
-def _build_samples(
-    token_ids: list[int],
-    *,
-    mask_id: int,
-    eos_id: int,
-    pad_id: int,
-    max_seq_len: int,
-) -> np.ndarray:
-    """Build masked-prefix samples from a token sequence (excluding EOS).
-
-    :param token_ids: Token ids without EOS.
-    :param mask_id: Mask token id.
-    :param eos_id: EOS token id.
-    :param pad_id: Padding token id.
-    :param max_seq_len: Maximum sequence length.
-    :returns: Array of shape (N, max_seq_len).
-    """
-    if len(token_ids) == 0:
-        raise ValueError("token_ids must be non-empty")
-    samples: list[np.ndarray] = []
-    for idx in range(len(token_ids)):
-        prefix = list(token_ids[: idx + 1])
-        max_prefix = max_seq_len - 2
-        if len(prefix) > max_prefix:
-            prefix = prefix[:max_prefix]
-        sample_tokens = prefix + [mask_id, eos_id]
-        sample = np.full((max_seq_len,), pad_id, dtype=np.int32)
-        sample[: len(sample_tokens)] = np.asarray(sample_tokens, dtype=np.int32)
-        samples.append(sample)
-    return np.stack(samples, axis=0)
-
-
 def main() -> None:
     """Run the trajectory visualization."""
     args = _parse_args()
@@ -168,18 +136,13 @@ def main() -> None:
 
     infer = TextInference.from_checkpoint(args.checkpoint)
     token_ids_no_eos = infer.tokenize(args.text)
+    if len(token_ids_no_eos) == 0:
+        raise ValueError("text must contain at least one token")
     labels = [infer.decode_token(token_id) for token_id in token_ids_no_eos]
 
-    samples = _build_samples(
-        token_ids_no_eos,
-        mask_id=infer.mask_id,
-        eos_id=infer.eos_id,
-        pad_id=infer.pad_id,
-        max_seq_len=infer.max_seq_len,
-    )
-    attention_mask = samples != infer.pad_id
-    embeddings = infer.embed_tokens(samples, attention_mask)
-    embeddings = np.asarray(embeddings)
+    tokens, attention_mask = infer.preprocess([args.text])
+    embeddings = infer.encode_tokens(tokens, attention_mask)
+    embeddings = np.asarray(embeddings)[0, : len(token_ids_no_eos)]
 
     points = _pca(embeddings, dim=args.pca_dim)
     title = "Trajectory of Masked-Prefix Embeddings"

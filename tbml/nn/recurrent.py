@@ -1,0 +1,245 @@
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+from jaxtyping import Array
+
+from tbml.nn.init import Initializer
+from tbml.nn.linear import Linear
+from tbml.nn.rmsnorm import RMSNorm
+
+
+class LSTMCell(eqx.Module):
+    """LSTM cell with a single input/hidden projection."""
+
+    input_dim: int
+    hidden_dim: int
+    dtype: jnp.dtype
+    param_dtype: jnp.dtype
+    proj: Linear
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        *,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        kernel_init: Initializer = jax.nn.initializers.lecun_normal(),
+        key: Array,
+    ) -> None:
+        """Initialize the LSTM cell.
+
+        :param input_dim: Input feature dimension.
+        :param hidden_dim: Hidden state dimension.
+        :param dtype: Compute dtype.
+        :param param_dtype: Parameter dtype.
+        :param kernel_init: Initializer for the projection weights.
+        :param key: PRNG key for parameter initialization.
+        """
+        if input_dim <= 0:
+            raise ValueError("input_dim must be > 0")
+        if hidden_dim <= 0:
+            raise ValueError("hidden_dim must be > 0")
+
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.proj = Linear(
+            in_features=input_dim + hidden_dim,
+            out_features=4 * hidden_dim,
+            use_bias=True,
+            bias_value=0.0,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=kernel_init,
+            key=key,
+        )
+
+    def __call__(
+        self,
+        x: Array,
+        h: Array,
+        c: Array,
+    ) -> tuple[Array, Array]:
+        """Apply the LSTM cell.
+
+        :param x: Input tensor of shape (B, input_dim).
+        :param h: Hidden state of shape (B, hidden_dim).
+        :param c: Cell state of shape (B, hidden_dim).
+        :returns: Tuple of (new hidden, new cell).
+        """
+        if x.shape[-1] != self.input_dim:
+            raise ValueError("x last dimension must match input_dim")
+        if h.shape[-1] != self.hidden_dim:
+            raise ValueError("h last dimension must match hidden_dim")
+        if c.shape[-1] != self.hidden_dim:
+            raise ValueError("c last dimension must match hidden_dim")
+
+        combined = jnp.concatenate([x, h], axis=-1)
+        gates = self.proj(combined)
+        i_gate, f_gate, g_gate, o_gate = jnp.split(gates, 4, axis=-1)
+        i_gate = jax.nn.sigmoid(i_gate)
+        f_gate = jax.nn.sigmoid(f_gate)
+        o_gate = jax.nn.sigmoid(o_gate)
+        g_gate = jnp.tanh(g_gate)
+        new_c = f_gate * c + i_gate * g_gate
+        new_h = o_gate * jnp.tanh(new_c)
+        return new_h, new_c
+
+
+class LSTMLayer(eqx.Module):
+    """Single LSTM layer with RMSNorm on the hidden state."""
+
+    cell: LSTMCell
+    norm: RMSNorm
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        *,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        kernel_init: Initializer = jax.nn.initializers.lecun_normal(),
+        key: Array,
+    ) -> None:
+        """Initialize the LSTM layer.
+
+        :param input_dim: Input feature dimension.
+        :param hidden_dim: Hidden state dimension.
+        :param dtype: Compute dtype.
+        :param param_dtype: Parameter dtype.
+        :param kernel_init: Initializer for the projection weights.
+        :param key: PRNG key for parameter initialization.
+        """
+        cell_key, norm_key = jax.random.split(key, 2)
+        self.cell = LSTMCell(
+            input_dim,
+            hidden_dim,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=kernel_init,
+            key=cell_key,
+        )
+        self.norm = RMSNorm(hidden_dim, dtype=dtype, param_dtype=param_dtype)
+        _ = norm_key
+
+    def __call__(
+        self,
+        x: Array,
+        h: Array,
+        c: Array,
+    ) -> tuple[Array, Array]:
+        """Apply the LSTM layer.
+
+        :param x: Input tensor of shape (B, input_dim).
+        :param h: Hidden state of shape (B, hidden_dim).
+        :param c: Cell state of shape (B, hidden_dim).
+        :returns: Tuple of (new hidden, new cell).
+        """
+        new_h, new_c = self.cell(x, h, c)
+        new_h = self.norm(new_h)
+        return new_h, new_c
+
+
+class LSTMStack(eqx.Module):
+    """Stacked LSTM with RMSNorm between layers."""
+
+    input_dim: int
+    hidden_dim: int
+    num_layers: int
+    layers: tuple[LSTMLayer, ...]
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        num_layers: int,
+        *,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        kernel_init: Initializer = jax.nn.initializers.lecun_normal(),
+        key: Array,
+    ) -> None:
+        """Initialize the LSTM stack.
+
+        :param input_dim: Input feature dimension for the first layer.
+        :param hidden_dim: Hidden state dimension for all layers.
+        :param num_layers: Number of stacked LSTM layers.
+        :param dtype: Compute dtype.
+        :param param_dtype: Parameter dtype.
+        :param kernel_init: Initializer for the projection weights.
+        :param key: PRNG key for parameter initialization.
+        """
+        if input_dim <= 0:
+            raise ValueError("input_dim must be > 0")
+        if hidden_dim <= 0:
+            raise ValueError("hidden_dim must be > 0")
+        if num_layers <= 0:
+            raise ValueError("num_layers must be > 0")
+
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+
+        keys = jax.random.split(key, num_layers)
+        layers: list[LSTMLayer] = []
+        for idx in range(num_layers):
+            layer_input_dim = input_dim if idx == 0 else hidden_dim
+            layers.append(
+                LSTMLayer(
+                    layer_input_dim,
+                    hidden_dim,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    kernel_init=kernel_init,
+                    key=keys[idx],
+                )
+            )
+        self.layers = tuple(layers)
+
+    def __call__(self, inputs: Array) -> Array:
+        """Run the LSTM stack over a sequence.
+
+        :param inputs: Input tensor of shape (B, T, input_dim).
+        :returns: Output tensor of shape (B, T, hidden_dim).
+        """
+        if inputs.ndim != 3:
+            raise ValueError("inputs must have shape (B, T, input_dim)")
+        if inputs.shape[2] != self.input_dim:
+            raise ValueError("inputs last dimension must match input_dim")
+
+        batch_size = inputs.shape[0]
+        init_h = tuple(
+            jnp.zeros((batch_size, self.hidden_dim), dtype=inputs.dtype)
+            for _ in range(self.num_layers)
+        )
+        init_c = tuple(
+            jnp.zeros((batch_size, self.hidden_dim), dtype=inputs.dtype)
+            for _ in range(self.num_layers)
+        )
+
+        def _step(
+            carry: tuple[tuple[Array, ...], tuple[Array, ...]],
+            x_t: Array,
+        ) -> tuple[tuple[tuple[Array, ...], tuple[Array, ...]], Array]:
+            h_list, c_list = carry
+            new_h: list[Array] = []
+            new_c: list[Array] = []
+            layer_input = x_t
+            for layer, h_state, c_state in zip(self.layers, h_list, c_list):
+                h_next, c_next = layer(layer_input, h_state, c_state)
+                layer_input = h_next
+                new_h.append(h_next)
+                new_c.append(c_next)
+            return (tuple(new_h), tuple(new_c)), layer_input
+
+        inputs_time = jnp.swapaxes(inputs, 0, 1)
+        (_final_h, _final_c), outputs = jax.lax.scan(
+            _step,
+            (init_h, init_c),
+            inputs_time,
+        )
+        outputs = jnp.swapaxes(outputs, 0, 1)
+        return outputs
