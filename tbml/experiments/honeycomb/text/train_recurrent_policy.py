@@ -422,8 +422,9 @@ class RecurrentPolicyConfig(BaseModel):
 
     :ivar vocab_size: Output vocabulary size.
     :ivar input_dim: Input feature dimension.
-    :ivar hidden_dim: LSTM hidden state dimension.
-    :ivar n_layers: Number of LSTM layers.
+    :ivar hidden_dim: LSTM hidden state dimension per direction.
+    :ivar n_layers: Number of LSTM layers per direction.
+    :ivar bidirectional: Whether to use a bidirectional LSTM stack.
     :ivar init_std: Standard deviation for truncated normal initialization.
     """
 
@@ -431,6 +432,7 @@ class RecurrentPolicyConfig(BaseModel):
     input_dim: int = Field(default=768)
     hidden_dim: int = Field(default=768)
     n_layers: int = Field(default=2)
+    bidirectional: bool = Field(default=True)
     init_std: float = Field(default=0.02)
 
 
@@ -443,7 +445,8 @@ class RecurrentPolicy(eqx.Module):
 
     config: RecurrentPolicyConfig = eqx.field(static=True)
     dtype: jnp.dtype = eqx.field(static=True)
-    rnn: LSTMStack
+    rnn_forward: LSTMStack
+    rnn_backward: LSTMStack
     head: Linear
 
     def __init__(
@@ -469,25 +472,37 @@ class RecurrentPolicy(eqx.Module):
             raise ValueError("hidden_dim must be > 0")
         if config.n_layers <= 0:
             raise ValueError("n_layers must be > 0")
+        if config.bidirectional is False:
+            raise ValueError("bidirectional must be True for recurrent policy")
         if config.init_std <= 0.0:
             raise ValueError("init_std must be > 0")
 
         init = truncated_normal_init(config.init_std)
-        rnn_key, head_key = jax.random.split(key, 2)
+        rnn_forward_key, rnn_backward_key, head_key = jax.random.split(key, 3)
 
         self.config = config
         self.dtype = dtype
-        self.rnn = LSTMStack(
+        self.rnn_forward = LSTMStack(
             input_dim=config.input_dim,
             hidden_dim=config.hidden_dim,
             num_layers=config.n_layers,
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=init,
-            key=rnn_key,
+            key=rnn_forward_key,
         )
+        self.rnn_backward = LSTMStack(
+            input_dim=config.input_dim,
+            hidden_dim=config.hidden_dim,
+            num_layers=config.n_layers,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=init,
+            key=rnn_backward_key,
+        )
+        rnn_out_dim = config.hidden_dim * 2
         self.head = Linear(
-            in_features=config.hidden_dim,
+            in_features=rnn_out_dim,
             out_features=config.vocab_size,
             use_bias=True,
             bias_value=0.0,
@@ -511,7 +526,11 @@ class RecurrentPolicy(eqx.Module):
             raise ValueError("reps last dimension must match input_dim")
         _ = train
         _ = key
-        hidden = self.rnn(reps)
+        hidden_forward = self.rnn_forward(reps)
+        reps_rev = jnp.flip(reps, axis=1)
+        hidden_backward_rev = self.rnn_backward(reps_rev)
+        hidden_backward = jnp.flip(hidden_backward_rev, axis=1)
+        hidden = jnp.concatenate([hidden_forward, hidden_backward], axis=-1)
         return self.head(hidden)
 
 
