@@ -7,6 +7,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
+from tqdm import tqdm  # type: ignore[import-untyped]
 
 from tbml.experiments.honeycomb.text.inference import TextInference
 from tbml.experiments.honeycomb.text.train_trajectory_diffusion import DiffusionTransformer, DiffusionTransformerConfig
@@ -249,9 +250,12 @@ def main() -> None:
     if args.cfg_scale > 0.0 and use_cond is False:
         raise ValueError("cfg-scale requires a non-empty --condition-text")
 
+    null_cond = diffusion_model.null_cond[None, :]
     cond_vec: jnp.ndarray | None = None
     if use_cond is True:
         cond_vec = _compute_condition(base, cond_text)
+    else:
+        cond_vec = null_cond
 
     betas, alpha_cumprod = _linear_noise_schedule(
         beta_start=beta_start,
@@ -260,47 +264,72 @@ def main() -> None:
     )
     alphas = 1.0 - betas
 
-    for t in reversed(range(num_steps)):
-        t_batch = jnp.asarray([t], dtype=jnp.int32)
-        alpha_t = alphas[t].astype(jnp.float32)
-        alpha_bar_t = alpha_cumprod[t].astype(jnp.float32)
-
-        if use_cond is True and args.cfg_scale > 0.0:
-            if cond_vec is None:
-                raise ValueError("conditioning vector missing")
-            v_cond = diffusion_model(x, t_batch, cond_vec, train=False, key=None)
-            v_uncond = diffusion_model(
-                x,
-                t_batch,
-                diffusion_model.null_cond[None, :],
-                train=False,
-                key=None,
-            )
-            v_pred = v_uncond + args.cfg_scale * (v_cond - v_uncond)
-        else:
-            if use_cond is True:
-                if cond_vec is None:
-                    raise ValueError("conditioning vector missing")
-                cond = cond_vec
-            else:
-                cond = diffusion_model.null_cond[None, :]
-            v_pred = diffusion_model(x, t_batch, cond, train=False, key=None)
-
+    def _step_from_v(
+        x_in: jnp.ndarray,
+        t_index: jnp.ndarray,
+        v_pred: jnp.ndarray,
+        key_in: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        alpha_t = alphas[t_index].astype(jnp.float32)
+        alpha_bar_t = alpha_cumprod[t_index].astype(jnp.float32)
         v_pred = v_pred.astype(jnp.float32)
         sqrt_alpha = jnp.sqrt(alpha_t)
         sqrt_one_minus = jnp.sqrt(1.0 - alpha_bar_t)
-        eps = sqrt_one_minus * x + sqrt_alpha * v_pred
-        pred_mean = (x - (1.0 - alpha_t) / sqrt_one_minus * eps) / sqrt_alpha
+        eps = sqrt_one_minus * x_in + sqrt_alpha * v_pred
+        pred_mean = (x_in - (1.0 - alpha_t) / sqrt_one_minus * eps) / sqrt_alpha
 
-        if t > 0:
-            alpha_bar_prev = alpha_cumprod[t - 1].astype(jnp.float32)
-            beta_t = betas[t].astype(jnp.float32)
+        def _add_noise() -> tuple[jnp.ndarray, jnp.ndarray]:
+            alpha_bar_prev = alpha_cumprod[t_index - 1].astype(jnp.float32)
+            beta_t = betas[t_index].astype(jnp.float32)
             variance = beta_t * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t)
-            key, noise_key = jax.random.split(key)
-            noise = jax.random.normal(noise_key, x.shape, dtype=jnp.float32)
-            x = pred_mean + jnp.sqrt(variance) * noise
+            key_out, noise_key = jax.random.split(key_in)
+            noise = jax.random.normal(noise_key, x_in.shape, dtype=jnp.float32)
+            return pred_mean + jnp.sqrt(variance) * noise, key_out
+
+        def _no_noise() -> tuple[jnp.ndarray, jnp.ndarray]:
+            return pred_mean, key_in
+
+        x_out, key_out = jax.lax.cond(t_index > 0, _add_noise, _no_noise)
+        return x_out, key_out
+
+    def _step_single(
+        x_in: jnp.ndarray,
+        t_index: jnp.ndarray,
+        cond_in: jnp.ndarray,
+        key_in: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        t_batch = jnp.asarray([t_index], dtype=jnp.int32)
+        v_pred = diffusion_model(x_in, t_batch, cond_in, train=False, key=None)
+        return _step_from_v(x_in, t_index, v_pred, key_in)
+
+    def _step_cfg(
+        x_in: jnp.ndarray,
+        t_index: jnp.ndarray,
+        cond_in: jnp.ndarray,
+        null_in: jnp.ndarray,
+        cfg_scale: jnp.ndarray,
+        key_in: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        t_batch = jnp.asarray([t_index], dtype=jnp.int32)
+        v_cond = diffusion_model(x_in, t_batch, cond_in, train=False, key=None)
+        v_uncond = diffusion_model(x_in, t_batch, null_in, train=False, key=None)
+        v_pred = v_uncond + cfg_scale * (v_cond - v_uncond)
+        return _step_from_v(x_in, t_index, v_pred, key_in)
+
+    step_single_jit = jax.jit(_step_single)
+    step_cfg_jit = jax.jit(_step_cfg)
+    cfg_scale = jnp.asarray(args.cfg_scale, dtype=jnp.float32)
+
+    for t in tqdm(reversed(range(num_steps)), total=num_steps, desc="Sampling"):
+        t_index = jnp.asarray(t, dtype=jnp.int32)
+        if use_cond is True and args.cfg_scale > 0.0:
+            if cond_vec is None:
+                raise ValueError("conditioning vector missing")
+            x, key = step_cfg_jit(x, t_index, cond_vec, null_cond, cfg_scale, key)
         else:
-            x = pred_mean
+            if cond_vec is None:
+                raise ValueError("conditioning vector missing")
+            x, key = step_single_jit(x, t_index, cond_vec, key)
 
     trajectory = np.asarray(x[0])
     np.save(args.output, trajectory)
