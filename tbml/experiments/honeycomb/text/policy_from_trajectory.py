@@ -202,6 +202,12 @@ def main() -> None:
             print(f"  {rank:>2}. {repr(text)} (id={token_id}): {prob:.6f}")
         print("")
 
+    top_ids = np.argmax(probs[0], axis=-1)
+    predicted_tokens = [base.decode_token(int(token_id)) for token_id in top_ids]
+    predicted_text = "".join(predicted_tokens)
+    print("Predicted text:")
+    print(repr(predicted_text))
+
 
 if __name__ == "__main__":
     main()
