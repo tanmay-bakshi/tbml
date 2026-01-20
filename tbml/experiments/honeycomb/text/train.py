@@ -898,6 +898,7 @@ def main() -> None:
         init_std=args.init_std,
         attn_type=args.attn_type,
         embed_norm=True,
+        embed_norm_scale=args.init_std,
     )
     exclusion_patterns = list(TextTransformer.MUON_PARAM_EXCLUSION_PATTERNS)
 

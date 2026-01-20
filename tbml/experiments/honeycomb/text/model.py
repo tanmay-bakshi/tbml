@@ -26,6 +26,7 @@ class TextTransformerConfig(BaseModel):
     :ivar init_std: Standard deviation for truncated normal initialization.
     :ivar attn_type: Attention type ("pope" or "rope").
     :ivar embed_norm: Whether to apply RMSNorm to token embeddings and unembedding weights.
+    :ivar embed_norm_scale: Scale applied after embedding RMSNorm.
     """
 
     vocab_size: int = Field(default=50257)
@@ -41,6 +42,7 @@ class TextTransformerConfig(BaseModel):
     init_std: float = Field(default=0.02)
     attn_type: str = Field(default="pope")
     embed_norm: bool = Field(default=False)
+    embed_norm_scale: float = Field(default=1.0)
 
 
 class TokenEmbedding(eqx.Module):
@@ -51,6 +53,7 @@ class TokenEmbedding(eqx.Module):
     :ivar dtype: Compute dtype.
     :ivar param_dtype: Parameter dtype.
     :ivar use_norm: Whether to apply RMSNorm to embeddings.
+    :ivar embed_scale: Scale applied after embedding RMSNorm.
     :ivar weight: Embedding matrix of shape (vocab_size, d_model).
     :ivar norm: RMSNorm module applied to embeddings when enabled.
     """
@@ -60,6 +63,7 @@ class TokenEmbedding(eqx.Module):
     dtype: jnp.dtype
     param_dtype: jnp.dtype
     use_norm: bool
+    embed_scale: float
     weight: Array
     norm: RMSNorm | None
 
@@ -71,6 +75,7 @@ class TokenEmbedding(eqx.Module):
         dtype: jnp.dtype = jnp.float32,
         param_dtype: jnp.dtype = jnp.float32,
         use_norm: bool = False,
+        embed_scale: float = 1.0,
         kernel_init: Initializer = jax.nn.initializers.lecun_normal(),
         key: Array,
     ) -> None:
@@ -81,6 +86,7 @@ class TokenEmbedding(eqx.Module):
         :param dtype: Compute dtype.
         :param param_dtype: Parameter dtype.
         :param use_norm: Whether to apply RMSNorm to embeddings.
+        :param embed_scale: Scale applied after embedding RMSNorm.
         :param kernel_init: Initializer for the embedding matrix.
         :param key: PRNG key for parameter initialization.
         """
@@ -88,12 +94,15 @@ class TokenEmbedding(eqx.Module):
             raise ValueError("vocab_size must be > 0")
         if d_model <= 0:
             raise ValueError("d_model must be > 0")
+        if embed_scale <= 0.0:
+            raise ValueError("embed_scale must be > 0")
 
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.use_norm = use_norm
+        self.embed_scale = embed_scale
         self.weight = kernel_init(key, (vocab_size, d_model), param_dtype)
         if use_norm is True:
             self.norm = RMSNorm(d_model, dtype=dtype, param_dtype=param_dtype)
@@ -114,7 +123,7 @@ class TokenEmbedding(eqx.Module):
         if self.use_norm is True:
             if self.norm is None:
                 raise ValueError("norm must be set when use_norm is True")
-            embeddings = self.norm(embeddings)
+            embeddings = self.norm(embeddings) * self.embed_scale
         return embeddings
 
     def unembed(self, embeddings: Array) -> Array:
@@ -130,7 +139,7 @@ class TokenEmbedding(eqx.Module):
         if self.use_norm is True:
             if self.norm is None:
                 raise ValueError("norm must be set when use_norm is True")
-            weight = self.norm(self.weight.astype(self.dtype))
+            weight = self.norm(self.weight.astype(self.dtype)) * self.embed_scale
         else:
             weight = self.weight.astype(self.dtype)
         return jnp.matmul(embeddings.astype(self.dtype), weight.T)
@@ -317,6 +326,8 @@ class TextTransformer(eqx.Module):
             raise ValueError("drop_path_rate must be in [0, 1)")
         if config.init_std <= 0.0:
             raise ValueError("init_std must be > 0")
+        if config.embed_norm_scale <= 0.0:
+            raise ValueError("embed_norm_scale must be > 0")
         if config.pope_base <= 1.0:
             raise ValueError("pope_base must be > 1.0")
         if config.attn_type not in ("pope", "rope"):
@@ -335,6 +346,7 @@ class TextTransformer(eqx.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             use_norm=config.embed_norm,
+            embed_scale=config.embed_norm_scale,
             kernel_init=init,
             key=embed_key,
         )
