@@ -791,14 +791,14 @@ class DiffusionTransformer(eqx.Module):
         train: bool,
         key: Array | None,
     ) -> Array:
-        """Predict diffusion noise for a trajectory.
+        """Predict diffusion velocity for a trajectory.
 
         :param x: Noised trajectory of shape (B, T, d_model).
         :param timesteps: Diffusion timesteps of shape (B,).
         :param cond: Conditioning embeddings of shape (B, d_model).
         :param train: Whether to enable dropout.
         :param key: PRNG key for dropout and DropPath.
-        :returns: Predicted noise of shape (B, T, d_model).
+        :returns: Predicted velocity of shape (B, T, d_model).
         """
         if x.ndim != 3:
             raise ValueError("x must have shape (B, T, d_model)")
@@ -1225,10 +1225,14 @@ def main() -> None:
             null_cond = model_inner.null_cond.astype(cond.dtype)
             cond = jnp.where(drop_mask[:, None], null_cond[None, :], cond)
 
+            alpha = jnp.sqrt(alpha_bar)
+            sigma = jnp.sqrt(1.0 - alpha_bar)
+            v_target = alpha * noise - sigma * x0
+
             pred = model_inner(x_t, timesteps, cond, train=True, key=tokens_key)
             pred = pred.astype(jnp.float32)
-            noise = noise.astype(jnp.float32)
-            loss = jnp.mean(jnp.square(pred - noise))
+            v_target = v_target.astype(jnp.float32)
+            loss = jnp.mean(jnp.square(pred - v_target))
             return loss
 
         value_and_grad = eqx.filter_value_and_grad(_loss_fn)

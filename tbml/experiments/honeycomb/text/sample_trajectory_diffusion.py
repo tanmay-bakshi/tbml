@@ -268,15 +268,15 @@ def main() -> None:
         if use_cond is True and args.cfg_scale > 0.0:
             if cond_vec is None:
                 raise ValueError("conditioning vector missing")
-            eps_cond = diffusion_model(x, t_batch, cond_vec, train=False, key=None)
-            eps_uncond = diffusion_model(
+            v_cond = diffusion_model(x, t_batch, cond_vec, train=False, key=None)
+            v_uncond = diffusion_model(
                 x,
                 t_batch,
                 diffusion_model.null_cond[None, :],
                 train=False,
                 key=None,
             )
-            eps = eps_uncond + args.cfg_scale * (eps_cond - eps_uncond)
+            v_pred = v_uncond + args.cfg_scale * (v_cond - v_uncond)
         else:
             if use_cond is True:
                 if cond_vec is None:
@@ -284,11 +284,12 @@ def main() -> None:
                 cond = cond_vec
             else:
                 cond = diffusion_model.null_cond[None, :]
-            eps = diffusion_model(x, t_batch, cond, train=False, key=None)
+            v_pred = diffusion_model(x, t_batch, cond, train=False, key=None)
 
-        eps = eps.astype(jnp.float32)
+        v_pred = v_pred.astype(jnp.float32)
         sqrt_alpha = jnp.sqrt(alpha_t)
         sqrt_one_minus = jnp.sqrt(1.0 - alpha_bar_t)
+        eps = sqrt_one_minus * x + sqrt_alpha * v_pred
         pred_mean = (x - (1.0 - alpha_t) / sqrt_one_minus * eps) / sqrt_alpha
 
         if t > 0:
