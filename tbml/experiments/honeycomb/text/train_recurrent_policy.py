@@ -946,14 +946,23 @@ def main() -> None:
                 if micro_steps <= 0:
                     break
 
-                micro_step0 = jnp.asarray(micro_step, dtype=jnp.int32)
-                micro_steps_arr = jnp.asarray(micro_steps, dtype=jnp.int32)
-                step_key, base_key = jax.random.split(base_key)
+                step_key = jax.random.fold_in(base_key, global_step)
+                micro_step0 = jnp.full((num_devices,), micro_step, dtype=jnp.int32)
+                micro_steps_arr = jnp.full((num_devices,), micro_steps, dtype=jnp.int32)
 
                 data_start = time.perf_counter()
                 micro_batches: list[Array] = []
-                for _ in range(micro_steps):
-                    micro_batches.append(next(train_iter))
+                last_batch: Array | None = None
+                for _micro_idx in range(micro_steps):
+                    batch = next(train_iter)
+                    micro_batches.append(batch)
+                    last_batch = batch
+                if len(micro_batches) < args.grad_accum_steps:
+                    if last_batch is None:
+                        break
+                    pad_count = args.grad_accum_steps - len(micro_batches)
+                    for _ in range(pad_count):
+                        micro_batches.append(last_batch)
                 data_time = time.perf_counter() - data_start
 
                 batch_tokens = jnp.stack(micro_batches, axis=0)
