@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from tbml.experiments.honeycomb.text.inference import TextInference
-from tbml.experiments.honeycomb.text.train_policy import PolicyTransformer, PolicyTransformerConfig
+from tbml.experiments.honeycomb.text.train_recurrent_policy import RecurrentPolicy, RecurrentPolicyConfig
 
 
 def _parse_args() -> argparse.Namespace:
@@ -95,15 +95,15 @@ def _load_policy_model(
     *,
     dtype: jnp.dtype,
     policy_config: dict[str, Any],
-) -> PolicyTransformer:
-    """Load a PolicyTransformer model from a checkpoint.
+) -> RecurrentPolicy:
+    """Load a RecurrentPolicy model from a checkpoint.
 
     :param checkpoint_dir: Checkpoint directory path.
     :param dtype: Compute dtype to try first.
     :param policy_config: Policy configuration dictionary.
-    :returns: Deserialized PolicyTransformer model.
+    :returns: Deserialized RecurrentPolicy model.
     """
-    config = PolicyTransformerConfig(**policy_config)
+    config = RecurrentPolicyConfig(**policy_config)
     model_path = os.path.join(checkpoint_dir, "model.eqx")
     candidates = [dtype, jnp.float32, jnp.bfloat16, jnp.float16]
     seen: set[jnp.dtype] = set()
@@ -113,7 +113,7 @@ def _load_policy_model(
             continue
         seen.add(candidate)
         model_key = jax.random.PRNGKey(0)
-        model = PolicyTransformer(
+        model = RecurrentPolicy(
             config,
             dtype=candidate,
             param_dtype=_param_dtype_for(candidate),
@@ -184,8 +184,8 @@ def main() -> None:
         raise ValueError("trajectory must have shape (T, D)")
     if trajectory.shape[0] == 0:
         raise ValueError("trajectory must contain at least one token")
-    if trajectory.shape[1] != policy_model.config.d_model:
-        raise ValueError("trajectory dimension must match policy d_model")
+    if trajectory.shape[1] != policy_model.config.input_dim:
+        raise ValueError("trajectory dimension must match policy input_dim")
 
     reps = jnp.asarray(trajectory, dtype=policy_model.dtype)
     reps_batch = reps[None, :, :]
@@ -197,7 +197,7 @@ def main() -> None:
         header = f"Token {idx + 1}/{trajectory.shape[0]}"
         print(header)
         print("-" * len(header))
-        top = _format_top_k(base, probs[idx], top_k=args.top_k)
+        top = _format_top_k(base, probs[0, idx], top_k=args.top_k)
         for rank, (text, token_id, prob) in enumerate(top, start=1):
             print(f"  {rank:>2}. {repr(text)} (id={token_id}): {prob:.6f}")
         print("")
