@@ -243,3 +243,149 @@ class LSTMStack(eqx.Module):
         )
         outputs = jnp.swapaxes(outputs, 0, 1)
         return outputs
+
+
+class BiLSTMLayer(eqx.Module):
+    """Bidirectional LSTM layer with a projection for the next layer."""
+
+    forward: LSTMLayer
+    backward: LSTMLayer
+    proj: Linear
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        *,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        kernel_init: Initializer = jax.nn.initializers.lecun_normal(),
+        key: Array,
+    ) -> None:
+        """Initialize the bidirectional LSTM layer.
+
+        :param input_dim: Input feature dimension.
+        :param hidden_dim: Hidden state dimension per direction.
+        :param dtype: Compute dtype.
+        :param param_dtype: Parameter dtype.
+        :param kernel_init: Initializer for the projection weights.
+        :param key: PRNG key for parameter initialization.
+        """
+        if input_dim <= 0:
+            raise ValueError("input_dim must be > 0")
+        if hidden_dim <= 0:
+            raise ValueError("hidden_dim must be > 0")
+        forward_key, backward_key, proj_key = jax.random.split(key, 3)
+        self.forward = LSTMLayer(
+            input_dim,
+            hidden_dim,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=kernel_init,
+            key=forward_key,
+        )
+        self.backward = LSTMLayer(
+            input_dim,
+            hidden_dim,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=kernel_init,
+            key=backward_key,
+        )
+        self.proj = Linear(
+            in_features=hidden_dim * 2,
+            out_features=hidden_dim,
+            use_bias=True,
+            bias_value=0.0,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=kernel_init,
+            key=proj_key,
+        )
+
+    def __call__(self, inputs: Array) -> Array:
+        """Run the bidirectional layer over a sequence.
+
+        :param inputs: Input tensor of shape (B, T, input_dim).
+        :returns: Output tensor of shape (B, T, hidden_dim).
+        """
+        if inputs.ndim != 3:
+            raise ValueError("inputs must have shape (B, T, input_dim)")
+        forward_out = self.forward(inputs)
+        reversed_inputs = jnp.flip(inputs, axis=1)
+        backward_out_reversed = self.backward(reversed_inputs)
+        backward_out = jnp.flip(backward_out_reversed, axis=1)
+        combined = jnp.concatenate([forward_out, backward_out], axis=-1)
+        return self.proj(combined)
+
+
+class BiLSTMStack(eqx.Module):
+    """Stacked bidirectional LSTM with per-layer projections."""
+
+    input_dim: int
+    hidden_dim: int
+    num_layers: int
+    layers: tuple[BiLSTMLayer, ...]
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        num_layers: int,
+        *,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        kernel_init: Initializer = jax.nn.initializers.lecun_normal(),
+        key: Array,
+    ) -> None:
+        """Initialize the bidirectional LSTM stack.
+
+        :param input_dim: Input feature dimension for the first layer.
+        :param hidden_dim: Hidden state dimension per direction.
+        :param num_layers: Number of stacked bidirectional layers.
+        :param dtype: Compute dtype.
+        :param param_dtype: Parameter dtype.
+        :param kernel_init: Initializer for the projection weights.
+        :param key: PRNG key for parameter initialization.
+        """
+        if input_dim <= 0:
+            raise ValueError("input_dim must be > 0")
+        if hidden_dim <= 0:
+            raise ValueError("hidden_dim must be > 0")
+        if num_layers <= 0:
+            raise ValueError("num_layers must be > 0")
+
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+
+        keys = jax.random.split(key, num_layers)
+        layers: list[BiLSTMLayer] = []
+        for idx in range(num_layers):
+            layer_input_dim = input_dim if idx == 0 else hidden_dim
+            layers.append(
+                BiLSTMLayer(
+                    layer_input_dim,
+                    hidden_dim,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    kernel_init=kernel_init,
+                    key=keys[idx],
+                )
+            )
+        self.layers = tuple(layers)
+
+    def __call__(self, inputs: Array) -> Array:
+        """Run the bidirectional LSTM stack over a sequence.
+
+        :param inputs: Input tensor of shape (B, T, input_dim).
+        :returns: Output tensor of shape (B, T, hidden_dim).
+        """
+        if inputs.ndim != 3:
+            raise ValueError("inputs must have shape (B, T, input_dim)")
+        if inputs.shape[2] != self.input_dim:
+            raise ValueError("inputs last dimension must match input_dim")
+        outputs = inputs
+        for layer in self.layers:
+            outputs = layer(outputs)
+        return outputs

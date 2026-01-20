@@ -21,7 +21,7 @@ from tqdm import tqdm  # type: ignore[import-untyped]
 
 from tbml.experiments.honeycomb.text.dataset import MMapTokenDataset, iter_text_batches
 from tbml.experiments.honeycomb.text.model import TextTransformer, TextTransformerConfig
-from tbml.nn import LSTMStack, Linear
+from tbml.nn import BiLSTMStack, Linear
 from tbml.nn.init import truncated_normal_init
 from tbml.optimizers import MuonWithAdamWFallback, MuonWithAdamWFallbackState, build_muon_masks
 
@@ -445,8 +445,7 @@ class RecurrentPolicy(eqx.Module):
 
     config: RecurrentPolicyConfig = eqx.field(static=True)
     dtype: jnp.dtype = eqx.field(static=True)
-    rnn_forward: LSTMStack
-    rnn_backward: LSTMStack
+    rnn: BiLSTMStack
     head: Linear
 
     def __init__(
@@ -478,31 +477,21 @@ class RecurrentPolicy(eqx.Module):
             raise ValueError("init_std must be > 0")
 
         init = truncated_normal_init(config.init_std)
-        rnn_forward_key, rnn_backward_key, head_key = jax.random.split(key, 3)
+        rnn_key, head_key = jax.random.split(key, 2)
 
         self.config = config
         self.dtype = dtype
-        self.rnn_forward = LSTMStack(
+        self.rnn = BiLSTMStack(
             input_dim=config.input_dim,
             hidden_dim=config.hidden_dim,
             num_layers=config.n_layers,
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=init,
-            key=rnn_forward_key,
+            key=rnn_key,
         )
-        self.rnn_backward = LSTMStack(
-            input_dim=config.input_dim,
-            hidden_dim=config.hidden_dim,
-            num_layers=config.n_layers,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=init,
-            key=rnn_backward_key,
-        )
-        rnn_out_dim = config.hidden_dim * 2
         self.head = Linear(
-            in_features=rnn_out_dim,
+            in_features=config.hidden_dim,
             out_features=config.vocab_size,
             use_bias=True,
             bias_value=0.0,
@@ -526,11 +515,7 @@ class RecurrentPolicy(eqx.Module):
             raise ValueError("reps last dimension must match input_dim")
         _ = train
         _ = key
-        hidden_forward = self.rnn_forward(reps)
-        reps_rev = jnp.flip(reps, axis=1)
-        hidden_backward_rev = self.rnn_backward(reps_rev)
-        hidden_backward = jnp.flip(hidden_backward_rev, axis=1)
-        hidden = jnp.concatenate([hidden_forward, hidden_backward], axis=-1)
+        hidden = self.rnn(reps)
         return self.head(hidden)
 
 
