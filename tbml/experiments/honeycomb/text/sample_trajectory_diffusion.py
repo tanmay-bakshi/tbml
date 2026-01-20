@@ -273,10 +273,11 @@ def main() -> None:
         alpha_t = alphas[t_index].astype(jnp.float32)
         alpha_bar_t = alpha_cumprod[t_index].astype(jnp.float32)
         v_pred = v_pred.astype(jnp.float32)
-        sqrt_alpha = jnp.sqrt(alpha_t)
+        sqrt_alpha_t = jnp.sqrt(alpha_t)
+        sqrt_alpha_bar = jnp.sqrt(alpha_bar_t)
         sqrt_one_minus = jnp.sqrt(1.0 - alpha_bar_t)
-        eps = sqrt_one_minus * x_in + sqrt_alpha * v_pred
-        pred_mean = (x_in - (1.0 - alpha_t) / sqrt_one_minus * eps) / sqrt_alpha
+        eps = sqrt_one_minus * x_in + sqrt_alpha_bar * v_pred
+        pred_mean = (x_in - (1.0 - alpha_t) / sqrt_one_minus * eps) / sqrt_alpha_t
 
         def _add_noise() -> tuple[jnp.ndarray, jnp.ndarray]:
             alpha_bar_prev = alpha_cumprod[t_index - 1].astype(jnp.float32)
