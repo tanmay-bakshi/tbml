@@ -25,6 +25,7 @@ class TextTransformerConfig(BaseModel):
     :ivar pope_base: Base for PoPE/RoPE frequency schedule.
     :ivar init_std: Standard deviation for truncated normal initialization.
     :ivar attn_type: Attention type ("pope" or "rope").
+    :ivar embed_norm: Whether to apply RMSNorm to token embeddings and unembedding weights.
     """
 
     vocab_size: int = Field(default=50257)
@@ -39,6 +40,7 @@ class TextTransformerConfig(BaseModel):
     pope_base: float = Field(default=10000.0)
     init_std: float = Field(default=0.02)
     attn_type: str = Field(default="pope")
+    embed_norm: bool = Field(default=False)
 
 
 class TokenEmbedding(eqx.Module):
@@ -48,14 +50,18 @@ class TokenEmbedding(eqx.Module):
     :ivar d_model: Embedding dimension.
     :ivar dtype: Compute dtype.
     :ivar param_dtype: Parameter dtype.
+    :ivar use_norm: Whether to apply RMSNorm to embeddings.
     :ivar weight: Embedding matrix of shape (vocab_size, d_model).
+    :ivar norm: RMSNorm module applied to embeddings when enabled.
     """
 
     vocab_size: int
     d_model: int
     dtype: jnp.dtype
     param_dtype: jnp.dtype
+    use_norm: bool
     weight: Array
+    norm: RMSNorm | None
 
     def __init__(
         self,
@@ -64,6 +70,7 @@ class TokenEmbedding(eqx.Module):
         *,
         dtype: jnp.dtype = jnp.float32,
         param_dtype: jnp.dtype = jnp.float32,
+        use_norm: bool = False,
         kernel_init: Initializer = jax.nn.initializers.lecun_normal(),
         key: Array,
     ) -> None:
@@ -73,6 +80,7 @@ class TokenEmbedding(eqx.Module):
         :param d_model: Embedding dimension.
         :param dtype: Compute dtype.
         :param param_dtype: Parameter dtype.
+        :param use_norm: Whether to apply RMSNorm to embeddings.
         :param kernel_init: Initializer for the embedding matrix.
         :param key: PRNG key for parameter initialization.
         """
@@ -85,7 +93,12 @@ class TokenEmbedding(eqx.Module):
         self.d_model = d_model
         self.dtype = dtype
         self.param_dtype = param_dtype
+        self.use_norm = use_norm
         self.weight = kernel_init(key, (vocab_size, d_model), param_dtype)
+        if use_norm is True:
+            self.norm = RMSNorm(d_model, dtype=dtype, param_dtype=param_dtype)
+        else:
+            self.norm = None
 
     def __call__(self, tokens: Array) -> Array:
         """Embed token ids.
@@ -97,7 +110,30 @@ class TokenEmbedding(eqx.Module):
             raise ValueError("tokens must have shape (B, T)")
         if tokens.dtype not in (jnp.int32, jnp.int64):
             raise ValueError("tokens must be integer dtype")
-        return jnp.take(self.weight.astype(self.dtype), tokens, axis=0)
+        embeddings = jnp.take(self.weight.astype(self.dtype), tokens, axis=0)
+        if self.use_norm is True:
+            if self.norm is None:
+                raise ValueError("norm must be set when use_norm is True")
+            embeddings = self.norm(embeddings)
+        return embeddings
+
+    def unembed(self, embeddings: Array) -> Array:
+        """Project embeddings back to vocabulary logits.
+
+        :param embeddings: Embedding tensor of shape (..., d_model).
+        :returns: Logits of shape (..., vocab_size).
+        """
+        if embeddings.ndim < 2:
+            raise ValueError("embeddings must have shape (..., d_model)")
+        if embeddings.shape[-1] != self.d_model:
+            raise ValueError("embeddings last dimension must match d_model")
+        if self.use_norm is True:
+            if self.norm is None:
+                raise ValueError("norm must be set when use_norm is True")
+            weight = self.norm(self.weight.astype(self.dtype))
+        else:
+            weight = self.weight.astype(self.dtype)
+        return jnp.matmul(embeddings.astype(self.dtype), weight.T)
 
 
 class TextTransformerBlock(eqx.Module):
@@ -298,6 +334,7 @@ class TextTransformer(eqx.Module):
             d_model=config.d_model,
             dtype=dtype,
             param_dtype=param_dtype,
+            use_norm=config.embed_norm,
             kernel_init=init,
             key=embed_key,
         )
