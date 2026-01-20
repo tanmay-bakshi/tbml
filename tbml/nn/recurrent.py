@@ -311,9 +311,25 @@ class BiLSTMLayer(eqx.Module):
         """
         if inputs.ndim != 3:
             raise ValueError("inputs must have shape (B, T, input_dim)")
-        forward_out = self.forward(inputs)
+        batch_size = inputs.shape[0]
+
+        def _run_layer(layer: LSTMLayer, seq: Array) -> Array:
+            init_h = jnp.zeros((batch_size, layer.cell.hidden_dim), dtype=seq.dtype)
+            init_c = jnp.zeros((batch_size, layer.cell.hidden_dim), dtype=seq.dtype)
+
+            def _step(carry: tuple[Array, Array], x_t: Array) -> tuple[tuple[Array, Array], Array]:
+                h_state, c_state = carry
+                h_next, c_next = layer.cell(x_t, h_state, c_state)
+                h_next = layer.norm(h_next)
+                return (h_next, c_next), h_next
+
+            seq_time = jnp.swapaxes(seq, 0, 1)
+            (_final_h, _final_c), outputs = jax.lax.scan(_step, (init_h, init_c), seq_time)
+            return jnp.swapaxes(outputs, 0, 1)
+
+        forward_out = _run_layer(self.forward, inputs)
         reversed_inputs = jnp.flip(inputs, axis=1)
-        backward_out_reversed = self.backward(reversed_inputs)
+        backward_out_reversed = _run_layer(self.backward, reversed_inputs)
         backward_out = jnp.flip(backward_out_reversed, axis=1)
         combined = jnp.concatenate([forward_out, backward_out], axis=-1)
         return self.proj(combined)
