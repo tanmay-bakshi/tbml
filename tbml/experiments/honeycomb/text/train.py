@@ -78,6 +78,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-loss-weight", type=float, default=0.5)
     parser.add_argument("--span-loss-weight", type=float, default=0.0)
     parser.add_argument("--decoder-loss-weight", type=float, default=0.5)
+    parser.add_argument("--span-tokenwise", action="store_true")
 
     parser.add_argument("--muon-lr", type=float, default=1e-3)
     parser.add_argument("--muon-momentum", type=float, default=0.95)
@@ -840,6 +841,60 @@ def _predictor_span_loss(
     return jnp.mean(losses)
 
 
+def _predictor_span_loss_tokenwise(
+    sample_reps: Array,
+    view_reps: Array,
+    mask_positions: Array,
+    *,
+    base_norm: RMSNorm,
+    predictor_norm: RMSNorm,
+) -> Array:
+    """Compute predictor span loss using per-token reconstruction.
+
+    :param sample_reps: Sample token reps of shape (B, T, D) pre-base-norm.
+    :param view_reps: Predictor reps of shape (B, V, T, D) pre-predictor-norm.
+    :param mask_positions: Mask positions of shape (B, V, T).
+    :param base_norm: Base model RMSNorm module.
+    :param predictor_norm: Predictor RMSNorm module.
+    :returns: Scalar loss.
+    """
+    if sample_reps.ndim != 3:
+        raise ValueError("sample_reps must have shape (B, T, D)")
+    if view_reps.ndim != 4:
+        raise ValueError("view_reps must have shape (B, V, T, D)")
+    if mask_positions.ndim != 3:
+        raise ValueError("mask_positions must have shape (B, V, T)")
+    if view_reps.shape[:3] != mask_positions.shape:
+        raise ValueError("view_reps and mask_positions must align on (B, V, T)")
+    if sample_reps.shape[0] != view_reps.shape[0]:
+        raise ValueError("batch sizes must match")
+    if sample_reps.shape[1] != view_reps.shape[2]:
+        raise ValueError("sequence lengths must match")
+
+    num_segments = sample_reps.shape[1] + 1
+
+    def _loss_for_view(sample_rep: Array, view_rep: Array, mask: Array) -> Array:
+        span_ids = _span_ids(mask)
+        sample_post = base_norm(sample_rep).astype(jnp.float32)
+        view_post = predictor_norm(view_rep).astype(jnp.float32)
+        mse = jnp.mean(jnp.square(sample_post - view_post), axis=-1)
+        mask_f = mask.astype(jnp.float32)
+        span_loss = jax.ops.segment_sum(mse * mask_f, span_ids, num_segments)
+        counts = jax.ops.segment_sum(mask_f, span_ids, num_segments)
+        denom = jnp.maximum(counts, 1.0)
+        mean_span = span_loss / denom
+        valid = counts > 0
+        valid_count = jnp.sum(valid)
+        return jnp.where(valid_count > 0, jnp.sum(mean_span * valid) / valid_count, 0.0)
+
+    def _loss_for_sample(sample_rep: Array, view_rep: Array, mask: Array) -> Array:
+        view_losses = jax.vmap(_loss_for_view, in_axes=(None, 0, 0))(sample_rep, view_rep, mask)
+        return jnp.mean(view_losses)
+
+    losses = jax.vmap(_loss_for_sample, in_axes=(0, 0, 0))(sample_reps, view_reps, mask_positions)
+    return jnp.mean(losses)
+
+
 def _decoder_loss(
     model: TextTransformer,
     sample_tokens: Array,
@@ -1285,6 +1340,7 @@ def main() -> None:
             "seq_loss_weight": args.seq_loss_weight,
             "span_loss_weight": args.span_loss_weight,
             "decoder_loss_weight": args.decoder_loss_weight,
+            "span_tokenwise": args.span_tokenwise,
         },
         "optimizer": {
             "muon_lr": args.muon_lr,
@@ -1573,13 +1629,22 @@ def main() -> None:
                             axis_name="data",
                         )
 
-                    span_rec_loss = _predictor_span_loss(
-                        sample_reps,
-                        view_pred_reps,
-                        view_masks,
-                        base_norm=model_inner.final_norm,
-                        predictor_norm=model_inner.predictor.final_norm,
-                    )
+                    if args.span_tokenwise is False:
+                        span_rec_loss = _predictor_span_loss(
+                            sample_reps,
+                            view_pred_reps,
+                            view_masks,
+                            base_norm=model_inner.final_norm,
+                            predictor_norm=model_inner.predictor.final_norm,
+                        )
+                    else:
+                        span_rec_loss = _predictor_span_loss_tokenwise(
+                            sample_reps,
+                            view_pred_reps,
+                            view_masks,
+                            base_norm=model_inner.final_norm,
+                            predictor_norm=model_inner.predictor.final_norm,
+                        )
                     span_lejepa_loss = (
                         (1.0 - args.sigreg_weight) * span_rec_loss + args.sigreg_weight * span_sigreg_loss
                     )

@@ -106,12 +106,13 @@ seq_lejepa_loss = (1 - sigreg_weight) * seq_rec_loss + sigreg_weight * seq_sigre
 
 4) **Span reconstruction loss (`span_rec_loss`)**
 
-- For each global/local view, every masked span is reconstructed by comparing:
+- By default, for each global/local view, every masked span is reconstructed by comparing:
   - the base model’s *pre‑final‑norm* sample view representations averaged over that span
     (then passed through the base model’s final RMSNorm), against
   - the predictor’s output for the same span averaged and passed through the predictor’s
     final RMSNorm.
-- Mean squared error is applied over these span averages, then averaged across spans and views.
+- If `--span-tokenwise` is enabled, the loss is computed **per token** within each masked span
+  (after applying the final norms), and then averaged across tokens, spans, and views.
 
 5) **Span SIGReg (`span_sigreg_loss`)**
 
