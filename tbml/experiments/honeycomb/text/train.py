@@ -1397,7 +1397,7 @@ def main() -> None:
             model_inner: TextTransformer,
             tokens: Array,
             tokens_key: Array,
-        ) -> tuple[Array, tuple[Array, Array, Array, Array, Array, Array, Array]]:
+        ) -> tuple[Array, tuple[Array, Array, Array, Array, Array, Array, Array, Array]]:
             """Compute the total loss and its components.
 
             :param model_inner: Model replica used for the loss computation.
@@ -1430,31 +1430,35 @@ def main() -> None:
             )
 
             total_views = args.num_global_views + args.num_local_views
-            pooled_post_views = pooled_post[:, :total_views, :]
-            pooled_pre_global = pooled_pre[:, : args.num_global_views, :]
-            center_pre = jnp.mean(pooled_pre_global, axis=1)
-            center = model_inner.final_norm(center_pre)
-            pooled_post_views = pooled_post_views.astype(jnp.float32)
-            center = center.astype(jnp.float32)
+            seq_rec_loss = jnp.asarray(0.0, dtype=jnp.float32)
+            seq_sigreg_loss = jnp.asarray(0.0, dtype=jnp.float32)
+            seq_lejepa_loss = jnp.asarray(0.0, dtype=jnp.float32)
+            if args.seq_loss_weight > 0.0:
+                pooled_post_views = pooled_post[:, :total_views, :]
+                pooled_pre_global = pooled_pre[:, : args.num_global_views, :]
+                center_pre = jnp.mean(pooled_pre_global, axis=1)
+                center = model_inner.final_norm(center_pre)
+                pooled_post_views = pooled_post_views.astype(jnp.float32)
+                center = center.astype(jnp.float32)
 
-            if args.pred_loss == "mse":
-                diffs = pooled_post_views - center[:, None, :]
-                seq_rec_loss = jnp.mean(jnp.square(diffs))
-            else:
-                eps = jnp.asarray(1e-8, dtype=pooled_post_views.dtype)
-                emb_norm = pooled_post_views / (jnp.linalg.norm(pooled_post_views, axis=-1, keepdims=True) + eps)
-                ctr_norm = center / (jnp.linalg.norm(center, axis=-1, keepdims=True) + eps)
-                cos_sim = jnp.sum(emb_norm * ctr_norm[:, None, :], axis=-1)
-                seq_rec_loss = jnp.mean(1.0 - cos_sim)
+                if args.pred_loss == "mse":
+                    diffs = pooled_post_views - center[:, None, :]
+                    seq_rec_loss = jnp.mean(jnp.square(diffs))
+                else:
+                    eps = jnp.asarray(1e-8, dtype=pooled_post_views.dtype)
+                    emb_norm = pooled_post_views / (jnp.linalg.norm(pooled_post_views, axis=-1, keepdims=True) + eps)
+                    ctr_norm = center / (jnp.linalg.norm(center, axis=-1, keepdims=True) + eps)
+                    cos_sim = jnp.sum(emb_norm * ctr_norm[:, None, :], axis=-1)
+                    seq_rec_loss = jnp.mean(1.0 - cos_sim)
 
-            seq_sigreg_loss = sigreg_loss_views(
-                pooled_post_views,
-                global_step=global_step,
-                num_slices=args.sigreg_slices,
-                seed=args.sigreg_seed,
-                axis_name="data",
-            )
-            seq_lejepa_loss = (1.0 - args.sigreg_weight) * seq_rec_loss + args.sigreg_weight * seq_sigreg_loss
+                seq_sigreg_loss = sigreg_loss_views(
+                    pooled_post_views,
+                    global_step=global_step,
+                    num_slices=args.sigreg_slices,
+                    seed=args.sigreg_seed,
+                    axis_name="data",
+                )
+                seq_lejepa_loss = (1.0 - args.sigreg_weight) * seq_rec_loss + args.sigreg_weight * seq_sigreg_loss
 
             bsz, num_views, seq_len, dim = token_post.shape
             if args.num_global_views <= 0:
@@ -1510,12 +1514,12 @@ def main() -> None:
                 )
                 pred_reps = pred_reps.reshape((bsz, 2, seq_len, dim))
 
-                sample_index = total_views
-                sample_reps = token_pre[:, sample_index, :, :]
                 view_pred_reps = pred_reps
                 view_masks = view_masks_sel
 
                 if args.span_loss_weight > 0.0:
+                    sample_index = total_views
+                    sample_reps = token_pre[:, sample_index, :, :]
                     sigreg_global_key, sigreg_local_key = jax.random.split(sigreg_key)
                     if args.num_global_views > 0 and args.num_local_views > 0:
                         span_targets_global = _select_span_targets(
