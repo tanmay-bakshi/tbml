@@ -1300,31 +1300,52 @@ def main() -> None:
             sigreg_global_key, sigreg_local_key = jax.random.split(sigreg_key)
 
             span_sigreg_loss = jnp.asarray(0.0, dtype=jnp.float32)
-            if args.num_global_views > 0:
+            if args.num_global_views > 0 and args.num_local_views > 0:
                 span_targets_global = _select_span_targets(
                     sample_reps,
                     mask_positions[:, : args.num_global_views, :],
                     base_norm=model_inner.final_norm,
                     key=sigreg_global_key,
                 )
-                span_targets_global = span_targets_global[:, None, :]
-                span_sigreg_loss = span_sigreg_loss + sigreg_loss_views(
-                    span_targets_global,
-                    global_step=global_step,
-                    num_slices=args.sigreg_slices,
-                    seed=args.sigreg_seed,
-                    axis_name="data",
-                )
-            if args.num_local_views > 0:
                 span_targets_local = _select_span_targets(
                     sample_reps,
                     mask_positions[:, args.num_global_views : total_views, :],
                     base_norm=model_inner.final_norm,
                     key=sigreg_local_key,
                 )
-                span_targets_local = span_targets_local[:, None, :]
-                span_sigreg_loss = span_sigreg_loss + sigreg_loss_views(
-                    span_targets_local,
+                span_targets = jnp.stack([span_targets_global, span_targets_local], axis=1)
+                span_sigreg_loss = sigreg_loss_views(
+                    span_targets,
+                    global_step=global_step,
+                    num_slices=args.sigreg_slices,
+                    seed=args.sigreg_seed,
+                    axis_name="data",
+                )
+            elif args.num_global_views > 0:
+                span_targets_global = _select_span_targets(
+                    sample_reps,
+                    mask_positions[:, : args.num_global_views, :],
+                    base_norm=model_inner.final_norm,
+                    key=sigreg_global_key,
+                )
+                span_targets = span_targets_global[:, None, :]
+                span_sigreg_loss = sigreg_loss_views(
+                    span_targets,
+                    global_step=global_step,
+                    num_slices=args.sigreg_slices,
+                    seed=args.sigreg_seed,
+                    axis_name="data",
+                )
+            elif args.num_local_views > 0:
+                span_targets_local = _select_span_targets(
+                    sample_reps,
+                    mask_positions[:, args.num_global_views : total_views, :],
+                    base_norm=model_inner.final_norm,
+                    key=sigreg_local_key,
+                )
+                span_targets = span_targets_local[:, None, :]
+                span_sigreg_loss = sigreg_loss_views(
+                    span_targets,
                     global_step=global_step,
                     num_slices=args.sigreg_slices,
                     seed=args.sigreg_seed,

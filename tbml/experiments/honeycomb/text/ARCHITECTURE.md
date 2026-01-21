@@ -108,10 +108,10 @@ seq_lejepa_loss = (1 - sigreg_weight) * seq_rec_loss + sigreg_weight * seq_sigre
 
 5) **Span SIGReg (`span_sigreg_loss`)**
 
-- Two SIGReg terms computed on random span targets:
-  - one random masked‑span target per sample drawn from the **global** views,
-  - one random masked‑span target per sample drawn from the **local** views.
-- The span SIGReg loss is the sum of the global and local span SIGReg terms.
+- One random masked‑span target per sample is selected from the **global** views and one from
+  the **local** views.
+- These two sets are stacked into a two‑view batch (V=2) and passed to a single SIGReg call,
+  matching the sequence‑level SIGReg structure.
 
 6) **Span LeJEPA loss (`span_lejepa_loss`)**
 
