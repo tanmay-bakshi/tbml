@@ -55,6 +55,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--n-heads", type=int, default=12)
     parser.add_argument("--n-layers", type=int, default=12)
     parser.add_argument("--predictor-n-layers", type=int, default=None)
+    parser.add_argument("--decoder-n-layers", type=int, default=None)
     parser.add_argument("--mlp-ratio", type=float, default=4.0)
     parser.add_argument("--attn-dropout", type=float, default=0.0)
     parser.add_argument("--resid-dropout", type=float, default=0.0)
@@ -75,7 +76,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sigreg-seed", type=int, default=0)
     parser.add_argument("--pred-loss", type=str, default="mse", choices=["mse", "cosine"])
     parser.add_argument("--seq-loss-weight", type=float, default=0.5)
-    parser.add_argument("--span-loss-weight", type=float, default=0.5)
+    parser.add_argument("--span-loss-weight", type=float, default=0.0)
+    parser.add_argument("--decoder-loss-weight", type=float, default=0.5)
+    parser.add_argument("--decoder-span-batch", type=int, default=256)
 
     parser.add_argument("--muon-lr", type=float, default=1e-3)
     parser.add_argument("--muon-momentum", type=float, default=0.95)
@@ -838,6 +841,162 @@ def _predictor_span_loss(
     return jnp.mean(losses)
 
 
+def _decoder_loss(
+    model: TextTransformer,
+    sample_tokens: Array,
+    view_pred_reps: Array,
+    view_masks: Array,
+    *,
+    bos_id: int,
+    eos_id: int,
+    pad_id: int,
+    span_batch: int,
+    key: Array,
+) -> Array:
+    """Compute decoder autoregressive loss over masked spans.
+
+    :param model: TextTransformer containing the decoder and embeddings.
+    :param sample_tokens: Token ids of shape (B, T) with EOS removed.
+    :param view_pred_reps: Predictor outputs of shape (B, V, T, D) pre-predictor-norm.
+    :param view_masks: Mask positions of shape (B, V, T) for the decoder views.
+    :param bos_id: BOS token id.
+    :param eos_id: EOS token id.
+    :param pad_id: Padding token id.
+    :param span_batch: Number of spans to process per decoder batch.
+    :param key: PRNG key for decoder dropout.
+    :returns: Scalar decoder loss.
+    """
+    if sample_tokens.ndim != 2:
+        raise ValueError("sample_tokens must have shape (B, T)")
+    if view_pred_reps.ndim != 4:
+        raise ValueError("view_pred_reps must have shape (B, V, T, D)")
+    if view_masks.ndim != 3:
+        raise ValueError("view_masks must have shape (B, V, T)")
+    if view_pred_reps.shape[:3] != view_masks.shape:
+        raise ValueError("view_pred_reps and view_masks must align on (B, V, T)")
+    if sample_tokens.shape[0] != view_pred_reps.shape[0]:
+        raise ValueError("batch sizes must match")
+    if sample_tokens.shape[1] != view_pred_reps.shape[2]:
+        raise ValueError("sequence lengths must match")
+    if span_batch <= 0:
+        raise ValueError("span_batch must be > 0")
+
+    bsz, num_views, seq_len, dim = view_pred_reps.shape
+    flat_masks = view_masks.reshape((bsz * num_views, seq_len))
+    flat_pred = view_pred_reps.reshape((bsz * num_views, seq_len, dim))
+    sample_tokens = sample_tokens.astype(jnp.int32)
+    sample_tokens_flat = jnp.repeat(sample_tokens, repeats=num_views, axis=0)
+
+    positions = jnp.arange(seq_len, dtype=jnp.int32)
+
+    def _span_meta(mask: Array) -> tuple[Array, Array]:
+        span_ids = _span_ids(mask)
+        pos_for_min = jnp.where(span_ids > 0, positions, jnp.full_like(positions, seq_len))
+        pos_for_max = jnp.where(span_ids > 0, positions, jnp.full_like(positions, -1))
+        start = jax.ops.segment_min(pos_for_min, span_ids, seq_len + 1)
+        end = jax.ops.segment_max(pos_for_max, span_ids, seq_len + 1)
+        length = jnp.where(end >= start, end - start + 1, 0)
+        length = length.at[0].set(0)
+        return start, length
+
+    starts, lengths = jax.vmap(_span_meta)(flat_masks)
+    span_starts = starts.reshape((-1,))
+    span_lengths = lengths.reshape((-1,))
+    view_idx = jnp.repeat(jnp.arange(flat_masks.shape[0], dtype=jnp.int32), seq_len + 1)
+    span_valid = span_lengths > 0
+
+    total_spans = int(span_starts.shape[0])
+    pad_needed = (-total_spans) % span_batch
+    if pad_needed != 0:
+        span_starts = jnp.pad(span_starts, (0, pad_needed))
+        span_lengths = jnp.pad(span_lengths, (0, pad_needed))
+        view_idx = jnp.pad(view_idx, (0, pad_needed))
+        span_valid = jnp.pad(span_valid, (0, pad_needed))
+
+    span_total_padded = int(span_starts.shape[0])
+    num_chunks = span_total_padded // span_batch
+    offsets = jnp.arange(seq_len, dtype=jnp.int32)
+    offsets_with_bos = jnp.arange(seq_len + 1, dtype=jnp.int32)
+    chunk_keys = jax.random.split(key, num_chunks)
+
+    def _chunk_step(
+        carry: tuple[Array, Array],
+        inputs: tuple[Array, Array],
+    ) -> tuple[tuple[Array, Array], None]:
+        loss_sum, count_sum = carry
+        chunk_idx, chunk_key = inputs
+        start_idx = chunk_idx * span_batch
+        span_st = jax.lax.dynamic_slice(span_starts, (start_idx,), (span_batch,))
+        span_ln = jax.lax.dynamic_slice(span_lengths, (start_idx,), (span_batch,))
+        span_vi = jax.lax.dynamic_slice(view_idx, (start_idx,), (span_batch,))
+        span_ok = jax.lax.dynamic_slice(span_valid, (start_idx,), (span_batch,))
+
+        tokens_view = sample_tokens_flat[span_vi]
+        pred_view = flat_pred[span_vi]
+        idxs = span_st[:, None] + offsets[None, :]
+        idxs = jnp.clip(idxs, 0, seq_len - 1)
+        span_tokens = jnp.take_along_axis(tokens_view, idxs, axis=1)
+        span_mem = jnp.take_along_axis(pred_view, idxs[:, :, None], axis=1)
+
+        span_mask = offsets[None, :] < span_ln[:, None]
+        span_tokens = jnp.where(span_mask, span_tokens, pad_id)
+        span_mem = jnp.where(span_mask[:, :, None], span_mem, jnp.zeros_like(span_mem))
+
+        bos_col = jnp.full((span_batch, 1), bos_id, dtype=span_tokens.dtype)
+        dec_in = jnp.concatenate([bos_col, span_tokens], axis=1)
+        dec_mask = offsets_with_bos[None, :] < (span_ln + 1)[:, None]
+        dec_mask = jnp.logical_and(dec_mask, span_ok[:, None])
+
+        dec_targets = jnp.full((span_batch, seq_len + 1), pad_id, dtype=span_tokens.dtype)
+        dec_targets = dec_targets.at[:, :seq_len].set(span_tokens)
+        eos_pos = jnp.clip(span_ln, 0, seq_len)
+        row_idx = jnp.arange(span_batch, dtype=jnp.int32)
+        dec_targets = dec_targets.at[row_idx, eos_pos].set(eos_id)
+
+        target_mask = offsets_with_bos[None, :] < (span_ln + 1)[:, None]
+        target_mask = jnp.logical_and(target_mask, span_ok[:, None])
+
+        mem_mask = jnp.logical_and(span_mask, span_ok[:, None])
+        any_mem = jnp.any(mem_mask, axis=1)
+        fallback = jnp.zeros_like(mem_mask)
+        fallback = fallback.at[:, 0].set(True)
+        mem_mask = jnp.where(any_mem[:, None], mem_mask, fallback)
+
+        dec_embed = model.token_embed(dec_in)
+        dec_out = model.decoder(
+            dec_embed,
+            dec_mask,
+            span_mem,
+            mem_mask,
+            train=True,
+            key=chunk_key,
+        )
+        logits = model.token_embed.unembed(dec_out).astype(jnp.float32)
+        log_probs = jax.nn.log_softmax(logits, axis=-1)
+        target_idx = dec_targets.astype(jnp.int32)
+        token_logp = jnp.take_along_axis(log_probs, target_idx[..., None], axis=-1).squeeze(-1)
+        loss = -token_logp * target_mask.astype(jnp.float32)
+        loss_sum = loss_sum + jnp.sum(loss)
+        count_sum = count_sum + jnp.sum(target_mask.astype(jnp.float32))
+        return (loss_sum, count_sum), None
+
+    init_loss = jnp.asarray(0.0, dtype=jnp.float32)
+    init_count = jnp.asarray(0.0, dtype=jnp.float32)
+    (loss_sum, count_sum), _ = jax.lax.scan(
+        _chunk_step,
+        (init_loss, init_count),
+        (jnp.arange(num_chunks, dtype=jnp.int32), chunk_keys),
+    )
+
+    def _with_count() -> Array:
+        return loss_sum / count_sum
+
+    def _no_count() -> Array:
+        return jnp.asarray(0.0, dtype=jnp.float32)
+
+    return jax.lax.cond(count_sum > 0.0, _with_count, _no_count)
+
+
 def _select_span_targets(
     sample_reps: Array,
     mask_positions: Array,
@@ -975,6 +1134,12 @@ def main() -> None:
         raise ValueError("seq-loss-weight must be >= 0")
     if args.span_loss_weight < 0.0:
         raise ValueError("span-loss-weight must be >= 0")
+    if args.decoder_loss_weight < 0.0:
+        raise ValueError("decoder-loss-weight must be >= 0")
+    if args.decoder_span_batch <= 0:
+        raise ValueError("decoder-span-batch must be > 0")
+    if args.seq_loss_weight + args.span_loss_weight + args.decoder_loss_weight <= 0.0:
+        raise ValueError("at least one loss weight must be > 0")
     if args.num_global_views + args.num_local_views <= 0:
         raise ValueError("at least one view must be requested")
 
@@ -1004,6 +1169,8 @@ def main() -> None:
     eos_token = metadata.get("eos_token")
     pad_token = metadata.get("pad_token")
     mask_token = metadata.get("mask_token")
+    bos_token = metadata.get("bos_token")
+    bos_id_raw = metadata.get("bos_id")
     if isinstance(tokenizer_name, str) is False:
         raise ValueError("metadata missing tokenizer")
     if isinstance(eos_token, str) is False:
@@ -1015,6 +1182,11 @@ def main() -> None:
     max_seq_len = dataset.max_seq_len
     vocab_size, eos_id, pad_id, mask_id = dataset.tokenizer_info()
     total_samples = len(dataset)
+    if isinstance(bos_token, str) is True and isinstance(bos_id_raw, int) is True:
+        bos_id = int(bos_id_raw)
+    else:
+        bos_token = eos_token
+        bos_id = eos_id
 
     if args.preview_views is True:
         tokenizer, _eos_id, _pad_id, _mask_id = _build_tokenizer(
@@ -1084,6 +1256,11 @@ def main() -> None:
         predictor_layers = args.n_layers
     if predictor_layers <= 0:
         raise ValueError("predictor-n-layers must be > 0")
+    decoder_layers = args.decoder_n_layers
+    if decoder_layers is None:
+        decoder_layers = args.n_layers
+    if decoder_layers <= 0:
+        raise ValueError("decoder-n-layers must be > 0")
 
     model_config = TextTransformerConfig(
         vocab_size=vocab_size,
@@ -1092,6 +1269,7 @@ def main() -> None:
         n_heads=args.n_heads,
         n_layers=args.n_layers,
         predictor_n_layers=int(predictor_layers),
+        decoder_n_layers=int(decoder_layers),
         mlp_ratio=args.mlp_ratio,
         attn_dropout=args.attn_dropout,
         resid_dropout=args.resid_dropout,
@@ -1110,12 +1288,14 @@ def main() -> None:
             "dataset_folder": args.data_folder,
             "tokenizer": tokenizer_name,
             "eos_token": eos_token,
+            "bos_token": bos_token,
             "pad_token": pad_token,
             "mask_token": mask_token,
             "max_seq_len": max_seq_len,
             "shuffle_buffer": args.shuffle_buffer,
             "vocab_size": vocab_size,
             "eos_id": eos_id,
+            "bos_id": bos_id,
             "pad_id": pad_id,
             "mask_id": mask_id,
             "num_samples": total_samples,
@@ -1135,6 +1315,8 @@ def main() -> None:
             "pred_loss": args.pred_loss,
             "seq_loss_weight": args.seq_loss_weight,
             "span_loss_weight": args.span_loss_weight,
+            "decoder_loss_weight": args.decoder_loss_weight,
+            "decoder_span_batch": args.decoder_span_batch,
         },
         "optimizer": {
             "muon_lr": args.muon_lr,
@@ -1240,7 +1422,7 @@ def main() -> None:
         :param micro_step0: Starting micro-step index for RNG folding.
         :param micro_steps: Number of valid micro-steps in the batch.
         :returns: Tuple of (grads, total loss, seq rec loss, seq sigreg loss, span rec loss,
-            span sigreg loss, seq lejepa loss, span lejepa loss).
+            span sigreg loss, seq lejepa loss, span lejepa loss, decoder loss).
         """
 
         def _loss_fn(
@@ -1254,9 +1436,9 @@ def main() -> None:
             :param tokens: Token batch of shape (B, T).
             :param tokens_key: PRNG key for masking.
             :returns: Tuple of (total loss, (seq rec loss, seq sigreg loss, span rec loss,
-                span sigreg loss, seq lejepa loss, span lejepa loss, total loss)).
+                span sigreg loss, seq lejepa loss, span lejepa loss, decoder loss, total loss)).
             """
-            view_key, predictor_key, sigreg_key = jax.random.split(tokens_key, 3)
+            view_key, predictor_key, sigreg_key, decoder_key = jax.random.split(tokens_key, 4)
             (
                 pooled_post,
                 pooled_pre,
@@ -1304,61 +1486,6 @@ def main() -> None:
                 seed=args.sigreg_seed,
                 axis_name="data",
             )
-            sample_reps = token_pre[:, total_views, :, :]
-            sigreg_global_key, sigreg_local_key = jax.random.split(sigreg_key)
-
-            span_sigreg_loss = jnp.asarray(0.0, dtype=jnp.float32)
-            if args.num_global_views > 0 and args.num_local_views > 0:
-                span_targets_global = _select_span_targets(
-                    sample_reps,
-                    mask_positions[:, : args.num_global_views, :],
-                    base_norm=model_inner.final_norm,
-                    key=sigreg_global_key,
-                )
-                span_targets_local = _select_span_targets(
-                    sample_reps,
-                    mask_positions[:, args.num_global_views : total_views, :],
-                    base_norm=model_inner.final_norm,
-                    key=sigreg_local_key,
-                )
-                span_targets = jnp.stack([span_targets_global, span_targets_local], axis=1)
-                span_sigreg_loss = sigreg_loss_views(
-                    span_targets,
-                    global_step=global_step,
-                    num_slices=args.sigreg_slices,
-                    seed=args.sigreg_seed,
-                    axis_name="data",
-                )
-            elif args.num_global_views > 0:
-                span_targets_global = _select_span_targets(
-                    sample_reps,
-                    mask_positions[:, : args.num_global_views, :],
-                    base_norm=model_inner.final_norm,
-                    key=sigreg_global_key,
-                )
-                span_targets = span_targets_global[:, None, :]
-                span_sigreg_loss = sigreg_loss_views(
-                    span_targets,
-                    global_step=global_step,
-                    num_slices=args.sigreg_slices,
-                    seed=args.sigreg_seed,
-                    axis_name="data",
-                )
-            elif args.num_local_views > 0:
-                span_targets_local = _select_span_targets(
-                    sample_reps,
-                    mask_positions[:, args.num_global_views : total_views, :],
-                    base_norm=model_inner.final_norm,
-                    key=sigreg_local_key,
-                )
-                span_targets = span_targets_local[:, None, :]
-                span_sigreg_loss = sigreg_loss_views(
-                    span_targets,
-                    global_step=global_step,
-                    num_slices=args.sigreg_slices,
-                    seed=args.sigreg_seed,
-                    axis_name="data",
-                )
             seq_lejepa_loss = (1.0 - args.sigreg_weight) * seq_rec_loss + args.sigreg_weight * seq_sigreg_loss
 
             bsz, num_views, seq_len, dim = token_post.shape
@@ -1394,43 +1521,120 @@ def main() -> None:
             view_masks_sel = jnp.stack([view_masks_global, view_masks_local], axis=1)
             view_attn_sel = jnp.stack([view_attn_global, view_attn_local], axis=1)
 
-            predictor_attn = jnp.logical_or(view_attn_sel, view_masks_sel)
-            flat_tokens = view_tokens_sel.reshape((bsz * 2, seq_len, dim))
-            flat_attn = predictor_attn.reshape((bsz * 2, seq_len))
-            flat_mask = view_masks_sel.reshape((bsz * 2, seq_len))
+            span_sigreg_loss = jnp.asarray(0.0, dtype=jnp.float32)
+            span_rec_loss = jnp.asarray(0.0, dtype=jnp.float32)
+            span_lejepa_loss = jnp.asarray(0.0, dtype=jnp.float32)
+            decoder_loss = jnp.asarray(0.0, dtype=jnp.float32)
 
-            pred_reps = model_inner.predictor(
-                flat_tokens,
-                flat_attn,
-                flat_mask,
-                train=True,
-                key=predictor_key,
-            )
-            pred_reps = pred_reps.reshape((bsz, 2, seq_len, dim))
+            need_predictor = args.span_loss_weight > 0.0 or args.decoder_loss_weight > 0.0
+            if need_predictor:
+                predictor_attn = jnp.logical_or(view_attn_sel, view_masks_sel)
+                flat_tokens = view_tokens_sel.reshape((bsz * 2, seq_len, dim))
+                flat_attn = predictor_attn.reshape((bsz * 2, seq_len))
+                flat_mask = view_masks_sel.reshape((bsz * 2, seq_len))
 
-            sample_index = total_views
-            sample_reps = token_pre[:, sample_index, :, :]
-            view_pred_reps = pred_reps
-            view_masks = view_masks_sel
+                pred_reps = model_inner.predictor(
+                    flat_tokens,
+                    flat_attn,
+                    flat_mask,
+                    train=True,
+                    key=predictor_key,
+                )
+                pred_reps = pred_reps.reshape((bsz, 2, seq_len, dim))
 
-            span_rec_loss = _predictor_span_loss(
-                jax.lax.stop_gradient(sample_reps),
-                view_pred_reps,
-                view_masks,
-                base_norm=model_inner.final_norm,
-                predictor_norm=model_inner.predictor.final_norm,
-            )
+                sample_index = total_views
+                sample_reps = token_pre[:, sample_index, :, :]
+                view_pred_reps = pred_reps
+                view_masks = view_masks_sel
 
-            span_lejepa_loss = (
-                (1.0 - args.sigreg_weight) * span_rec_loss + args.sigreg_weight * span_sigreg_loss
-            )
+                if args.span_loss_weight > 0.0:
+                    sigreg_global_key, sigreg_local_key = jax.random.split(sigreg_key)
+                    if args.num_global_views > 0 and args.num_local_views > 0:
+                        span_targets_global = _select_span_targets(
+                            sample_reps,
+                            mask_positions[:, : args.num_global_views, :],
+                            base_norm=model_inner.final_norm,
+                            key=sigreg_global_key,
+                        )
+                        span_targets_local = _select_span_targets(
+                            sample_reps,
+                            mask_positions[:, args.num_global_views : total_views, :],
+                            base_norm=model_inner.final_norm,
+                            key=sigreg_local_key,
+                        )
+                        span_targets = jnp.stack([span_targets_global, span_targets_local], axis=1)
+                        span_sigreg_loss = sigreg_loss_views(
+                            span_targets,
+                            global_step=global_step,
+                            num_slices=args.sigreg_slices,
+                            seed=args.sigreg_seed,
+                            axis_name="data",
+                        )
+                    elif args.num_global_views > 0:
+                        span_targets_global = _select_span_targets(
+                            sample_reps,
+                            mask_positions[:, : args.num_global_views, :],
+                            base_norm=model_inner.final_norm,
+                            key=sigreg_global_key,
+                        )
+                        span_targets = span_targets_global[:, None, :]
+                        span_sigreg_loss = sigreg_loss_views(
+                            span_targets,
+                            global_step=global_step,
+                            num_slices=args.sigreg_slices,
+                            seed=args.sigreg_seed,
+                            axis_name="data",
+                        )
+                    elif args.num_local_views > 0:
+                        span_targets_local = _select_span_targets(
+                            sample_reps,
+                            mask_positions[:, args.num_global_views : total_views, :],
+                            base_norm=model_inner.final_norm,
+                            key=sigreg_local_key,
+                        )
+                        span_targets = span_targets_local[:, None, :]
+                        span_sigreg_loss = sigreg_loss_views(
+                            span_targets,
+                            global_step=global_step,
+                            num_slices=args.sigreg_slices,
+                            seed=args.sigreg_seed,
+                            axis_name="data",
+                        )
+
+                    span_rec_loss = _predictor_span_loss(
+                        sample_reps,
+                        view_pred_reps,
+                        view_masks,
+                        base_norm=model_inner.final_norm,
+                        predictor_norm=model_inner.predictor.final_norm,
+                    )
+                    span_lejepa_loss = (
+                        (1.0 - args.sigreg_weight) * span_rec_loss + args.sigreg_weight * span_sigreg_loss
+                    )
+
+                if args.decoder_loss_weight > 0.0:
+                    tokens_no_eos = jnp.where(tokens == eos_id, pad_id, tokens)
+                    decoder_loss = _decoder_loss(
+                        model_inner,
+                        tokens_no_eos,
+                        view_pred_reps,
+                        view_masks,
+                        bos_id=bos_id,
+                        eos_id=eos_id,
+                        pad_id=pad_id,
+                        span_batch=args.decoder_span_batch,
+                        key=decoder_key,
+                    )
+
             seq_weight = jnp.asarray(args.seq_loss_weight, dtype=jnp.float32)
             span_weight = jnp.asarray(args.span_loss_weight, dtype=jnp.float32)
-            weight_sum = seq_weight + span_weight
+            decoder_weight = jnp.asarray(args.decoder_loss_weight, dtype=jnp.float32)
+            weight_sum = seq_weight + span_weight + decoder_weight
             weight_sum = jnp.maximum(weight_sum, 1e-6)
             seq_frac = seq_weight / weight_sum
             span_frac = span_weight / weight_sum
-            total_loss = seq_frac * seq_lejepa_loss + span_frac * span_lejepa_loss
+            decoder_frac = decoder_weight / weight_sum
+            total_loss = seq_frac * seq_lejepa_loss + span_frac * span_lejepa_loss + decoder_frac * decoder_loss
             return (
                 total_loss,
                 (
@@ -1440,6 +1644,7 @@ def main() -> None:
                     span_sigreg_loss,
                     seq_lejepa_loss,
                     span_lejepa_loss,
+                    decoder_loss,
                     total_loss,
                 ),
             )
@@ -1457,17 +1662,18 @@ def main() -> None:
         span_sigreg_init = jnp.asarray(0.0, dtype=jnp.float32)
         seq_lejepa_init = jnp.asarray(0.0, dtype=jnp.float32)
         span_lejepa_init = jnp.asarray(0.0, dtype=jnp.float32)
+        decoder_loss_init = jnp.asarray(0.0, dtype=jnp.float32)
 
         step_indices = jnp.arange(batch_tokens.shape[0], dtype=jnp.int32)
 
         def _accum_body(
-            carry: tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array],
+            carry: tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array],
             inputs: tuple[Array, Array],
-        ) -> tuple[tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array], None]:
+        ) -> tuple[tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array], None]:
             """Accumulate gradients and metrics for one micro-step.
 
             :param carry: Tuple of (grads, total loss, seq rec loss, seq sigreg loss, span rec loss,
-                span sigreg loss, seq lejepa loss, span lejepa loss).
+                span sigreg loss, seq lejepa loss, span lejepa loss, decoder loss).
             :param inputs: Tuple of (micro step index, token batch).
             :returns: Updated carry and unused output.
             """
@@ -1480,12 +1686,13 @@ def main() -> None:
                 span_sigreg_acc,
                 seq_lejepa_acc,
                 span_lejepa_acc,
+                decoder_loss_acc,
             ) = carry
             step_idx, tokens = inputs
             step_idx_global = micro_step0 + step_idx
             tokens_key = jax.random.fold_in(key, step_idx_global)
 
-            def _do_compute(_: None) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array]:
+            def _do_compute(_: None) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array]:
                 (
                     loss,
                     (
@@ -1495,6 +1702,7 @@ def main() -> None:
                         span_sigreg_loss,
                         seq_lejepa_loss,
                         span_lejepa_loss,
+                        decoder_loss,
                         _total_loss,
                     ),
                 ), grads = value_and_grad(
@@ -1511,6 +1719,7 @@ def main() -> None:
                 span_sigreg_accum = span_sigreg_acc + span_sigreg_loss
                 seq_lejepa_accum = seq_lejepa_acc + seq_lejepa_loss
                 span_lejepa_accum = span_lejepa_acc + span_lejepa_loss
+                decoder_loss_accum = decoder_loss_acc + decoder_loss
                 return (
                     grads_accum,
                     loss_accum,
@@ -1520,9 +1729,10 @@ def main() -> None:
                     span_sigreg_accum,
                     seq_lejepa_accum,
                     span_lejepa_accum,
+                    decoder_loss_accum,
                 )
 
-            def _skip_compute(_: None) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array]:
+            def _skip_compute(_: None) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array]:
                 return (
                     grads_acc,
                     loss_acc,
@@ -1532,6 +1742,7 @@ def main() -> None:
                     span_sigreg_acc,
                     seq_lejepa_acc,
                     span_lejepa_acc,
+                    decoder_loss_acc,
                 )
 
             active = step_idx < micro_steps
@@ -1547,6 +1758,7 @@ def main() -> None:
             span_sigreg_loss,
             seq_lejepa_loss,
             span_lejepa_loss,
+            decoder_loss,
         ), _ = jax.lax.scan(
             _accum_body,
             (
@@ -1558,6 +1770,7 @@ def main() -> None:
                 span_sigreg_init,
                 seq_lejepa_init,
                 span_lejepa_init,
+                decoder_loss_init,
             ),
             (step_indices, batch_tokens),
         )
@@ -1575,6 +1788,7 @@ def main() -> None:
         span_sigreg_loss = span_sigreg_loss / scale
         seq_lejepa_loss = seq_lejepa_loss / scale
         span_lejepa_loss = span_lejepa_loss / scale
+        decoder_loss = decoder_loss / scale
 
         grads = jax.lax.pmean(grads, axis_name="data")
         loss = jax.lax.pmean(loss, axis_name="data")
@@ -1584,6 +1798,7 @@ def main() -> None:
         span_sigreg_loss = jax.lax.pmean(span_sigreg_loss, axis_name="data")
         seq_lejepa_loss = jax.lax.pmean(seq_lejepa_loss, axis_name="data")
         span_lejepa_loss = jax.lax.pmean(span_lejepa_loss, axis_name="data")
+        decoder_loss = jax.lax.pmean(decoder_loss, axis_name="data")
         return (
             grads,
             loss,
@@ -1593,6 +1808,7 @@ def main() -> None:
             span_sigreg_loss,
             seq_lejepa_loss,
             span_lejepa_loss,
+            decoder_loss,
         )
 
     def apply_step(
@@ -1644,6 +1860,7 @@ def main() -> None:
     last_span_sigreg_val = 0.0
     last_seq_lejepa_val = 0.0
     last_span_lejepa_val = 0.0
+    last_decoder_val = 0.0
     if total_samples <= 0:
         raise ValueError("no valid samples found in the dataset")
     epoch_steps = total_samples // global_batch
@@ -1720,6 +1937,7 @@ def main() -> None:
                     span_sigreg,
                     seq_lejepa,
                     span_lejepa,
+                    decoder_loss,
                 ) = grad_step_pmap(
                     train_repl,
                     batch_tokens,
@@ -1753,6 +1971,7 @@ def main() -> None:
                     span_sigreg_val = float(np.mean(jax.device_get(span_sigreg)))
                     seq_lejepa_val = float(np.mean(jax.device_get(seq_lejepa)))
                     span_lejepa_val = float(np.mean(jax.device_get(span_lejepa)))
+                    decoder_val = float(np.mean(jax.device_get(decoder_loss)))
                     last_loss_val = loss_val
                     last_seq_rec_val = seq_rec_val
                     last_seq_sigreg_val = seq_sigreg_val
@@ -1760,6 +1979,7 @@ def main() -> None:
                     last_span_sigreg_val = span_sigreg_val
                     last_seq_lejepa_val = seq_lejepa_val
                     last_span_lejepa_val = span_lejepa_val
+                    last_decoder_val = decoder_val
 
                     writer.add_scalar("train/total_loss", loss_val, global_step)
                     writer.add_scalar("train/seq_rec_loss", seq_rec_val, global_step)
@@ -1768,6 +1988,7 @@ def main() -> None:
                     writer.add_scalar("train/span_sigreg_loss", span_sigreg_val, global_step)
                     writer.add_scalar("train/seq_lejepa_loss", seq_lejepa_val, global_step)
                     writer.add_scalar("train/span_lejepa_loss", span_lejepa_val, global_step)
+                    writer.add_scalar("train/decoder_loss", decoder_val, global_step)
 
                 if log_this_step:
                     pbar.set_postfix(
@@ -1778,6 +1999,7 @@ def main() -> None:
                         span_sig=f"{last_span_sigreg_val:.4f}",
                         seq_ljp=f"{last_seq_lejepa_val:.4f}",
                         span_ljp=f"{last_span_lejepa_val:.4f}",
+                        dec=f"{last_decoder_val:.4f}",
                     )
                 pbar.update(1)
                 global_step += 1

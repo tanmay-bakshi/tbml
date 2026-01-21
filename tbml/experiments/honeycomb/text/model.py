@@ -6,7 +6,14 @@ import jax.numpy as jnp
 from jaxtyping import Array
 from pydantic import BaseModel, Field
 
-from tbml.nn import DropPath, PoPESelfAttention, RMSNorm, RoPESelfAttention, SwiGLUFeedForward
+from tbml.nn import (
+    CrossAttention,
+    DropPath,
+    PoPESelfAttention,
+    RMSNorm,
+    RoPESelfAttention,
+    SwiGLUFeedForward,
+)
 from tbml.nn.init import Initializer, truncated_normal_init
 
 
@@ -28,6 +35,7 @@ class TextTransformerConfig(BaseModel):
     :ivar embed_norm: Whether to apply RMSNorm to token embeddings and unembedding weights.
     :ivar embed_norm_scale: Scale applied after embedding RMSNorm.
     :ivar predictor_n_layers: Number of predictor blocks.
+    :ivar decoder_n_layers: Number of decoder blocks.
     """
 
     vocab_size: int = Field(default=50257)
@@ -45,6 +53,7 @@ class TextTransformerConfig(BaseModel):
     embed_norm: bool = Field(default=False)
     embed_norm_scale: float = Field(default=1.0)
     predictor_n_layers: int = Field(default=2)
+    decoder_n_layers: int = Field(default=2)
 
 
 class TokenEmbedding(eqx.Module):
@@ -524,14 +533,257 @@ class Predictor(eqx.Module):
         return x
 
 
+class DecoderBlock(eqx.Module):
+    """Decoder block with causal self-attention and cross-attention."""
+
+    norm1: RMSNorm
+    self_attn: PoPESelfAttention | RoPESelfAttention
+    drop_path1: DropPath
+    norm2: RMSNorm
+    cross_attn: CrossAttention
+    drop_path2: DropPath
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        *,
+        attn_dropout: float,
+        resid_dropout: float,
+        drop_path_prob: float,
+        pope_base: float,
+        attn_type: str,
+        dtype: jnp.dtype,
+        param_dtype: jnp.dtype,
+        qkv_kernel_init: Initializer,
+        o_kernel_init: Initializer,
+        key: Array,
+    ) -> None:
+        """Initialize the decoder block.
+
+        :param d_model: Model width.
+        :param n_heads: Number of attention heads.
+        :param attn_dropout: Attention dropout probability.
+        :param resid_dropout: Residual dropout probability.
+        :param drop_path_prob: DropPath probability for this block.
+        :param pope_base: Base for PoPE/RoPE frequencies.
+        :param attn_type: Attention type ("pope" or "rope").
+        :param dtype: Compute dtype.
+        :param param_dtype: Parameter dtype.
+        :param qkv_kernel_init: Initializer for Q/K/V projections.
+        :param o_kernel_init: Initializer for output projection.
+        :param key: PRNG key for parameter initialization.
+        """
+        norm1_key, norm2_key, self_key, cross_key = jax.random.split(key, 4)
+
+        self.norm1 = RMSNorm(d_model, dtype=dtype, param_dtype=param_dtype)
+        if attn_type == "pope":
+            self.self_attn = PoPESelfAttention(
+                d_model=d_model,
+                n_heads=n_heads,
+                n_kv_heads=n_heads,
+                attn_dropout=attn_dropout,
+                resid_dropout=resid_dropout,
+                is_causal=True,
+                base=pope_base,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                qkv_kernel_init=qkv_kernel_init,
+                o_kernel_init=o_kernel_init,
+                key=self_key,
+            )
+        elif attn_type == "rope":
+            self.self_attn = RoPESelfAttention(
+                d_model=d_model,
+                n_heads=n_heads,
+                n_kv_heads=n_heads,
+                attn_dropout=attn_dropout,
+                resid_dropout=resid_dropout,
+                is_causal=True,
+                base=pope_base,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                qkv_kernel_init=qkv_kernel_init,
+                o_kernel_init=o_kernel_init,
+                key=self_key,
+            )
+        else:
+            raise ValueError("attn_type must be 'pope' or 'rope'")
+        self.drop_path1 = DropPath(drop_path_prob)
+        self.norm2 = RMSNorm(d_model, dtype=dtype, param_dtype=param_dtype)
+        self.cross_attn = CrossAttention(
+            d_model=d_model,
+            n_heads=n_heads,
+            n_kv_heads=n_heads,
+            attn_dropout=attn_dropout,
+            resid_dropout=resid_dropout,
+            is_causal=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            qkv_kernel_init=qkv_kernel_init,
+            o_kernel_init=o_kernel_init,
+            key=cross_key,
+        )
+        self.drop_path2 = DropPath(drop_path_prob)
+        _ = norm1_key
+        _ = norm2_key
+
+    def __call__(
+        self,
+        x: Array,
+        memory: Array,
+        *,
+        self_mask: Array,
+        memory_mask: Array,
+        train: bool,
+        key: Array | None,
+    ) -> Array:
+        """Apply the decoder block.
+
+        :param x: Input tensor of shape (B, T, d_model).
+        :param memory: Cross-attention memory of shape (B, S, d_model).
+        :param self_mask: Self-attention mask of shape (B, T).
+        :param memory_mask: Memory mask of shape (B, S).
+        :param train: Whether to enable dropout.
+        :param key: PRNG key for dropout and DropPath.
+        :returns: Output tensor of shape (B, T, d_model).
+        """
+        if key is None:
+            self_key = None
+            cross_key = None
+            drop1_key = None
+            drop2_key = None
+        else:
+            self_key, cross_key, drop1_key, drop2_key = jax.random.split(key, 4)
+
+        attn_out = self.self_attn(self.norm1(x), train=train, key=self_key, attention_mask=self_mask)
+        attn_out = self.drop_path1(attn_out, train=train, key=drop1_key)
+        x = x + attn_out
+
+        cross_out = self.cross_attn(
+            self.norm2(x),
+            memory,
+            train=train,
+            key=cross_key,
+            query_mask=self_mask,
+            context_mask=memory_mask,
+        )
+        cross_out = self.drop_path2(cross_out, train=train, key=drop2_key)
+        return x + cross_out
+
+
+class Decoder(eqx.Module):
+    """Decoder stack for masked span autoregression."""
+
+    blocks: tuple[DecoderBlock, ...]
+    final_norm: RMSNorm
+
+    def __init__(
+        self,
+        config: TextTransformerConfig,
+        *,
+        dtype: jnp.dtype,
+        param_dtype: jnp.dtype,
+        qkv_kernel_init: Initializer,
+        o_kernel_init: Initializer,
+        key: Array,
+    ) -> None:
+        """Initialize the decoder stack.
+
+        :param config: Base model configuration.
+        :param dtype: Compute dtype.
+        :param param_dtype: Parameter dtype.
+        :param qkv_kernel_init: Initializer for Q/K/V projections.
+        :param o_kernel_init: Initializer for output projection.
+        :param key: PRNG key for parameter initialization.
+        """
+        if config.decoder_n_layers <= 0:
+            raise ValueError("decoder_n_layers must be > 0")
+
+        keys = jax.random.split(key, 1 + config.decoder_n_layers)
+        block_keys = keys[1:]
+
+        drop_rates = _build_drop_rates(config.drop_path_rate, config.decoder_n_layers)
+        blocks: list[DecoderBlock] = []
+        for idx in range(config.decoder_n_layers):
+            blocks.append(
+                DecoderBlock(
+                    d_model=config.d_model,
+                    n_heads=config.n_heads,
+                    attn_dropout=config.attn_dropout,
+                    resid_dropout=config.resid_dropout,
+                    drop_path_prob=drop_rates[idx],
+                    pope_base=config.pope_base,
+                    attn_type=config.attn_type,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    qkv_kernel_init=qkv_kernel_init,
+                    o_kernel_init=o_kernel_init,
+                    key=block_keys[idx],
+                )
+            )
+        self.blocks = tuple(blocks)
+        self.final_norm = RMSNorm(config.d_model, dtype=dtype, param_dtype=param_dtype)
+
+    def __call__(
+        self,
+        x: Array,
+        self_mask: Array,
+        memory: Array,
+        memory_mask: Array,
+        *,
+        train: bool,
+        key: Array | None,
+    ) -> Array:
+        """Apply the decoder stack.
+
+        :param x: Embedded decoder inputs of shape (B, T, d_model).
+        :param self_mask: Self-attention mask of shape (B, T).
+        :param memory: Cross-attention memory of shape (B, S, d_model).
+        :param memory_mask: Memory mask of shape (B, S).
+        :param train: Whether to enable dropout.
+        :param key: PRNG key for dropout and DropPath.
+        :returns: Decoder outputs after final norm of shape (B, T, d_model).
+        """
+        if x.ndim != 3:
+            raise ValueError("x must have shape (B, T, d_model)")
+        if self_mask.ndim != 2:
+            raise ValueError("self_mask must have shape (B, T)")
+        if memory.ndim != 3:
+            raise ValueError("memory must have shape (B, S, d_model)")
+        if memory_mask.ndim != 2:
+            raise ValueError("memory_mask must have shape (B, S)")
+        if x.shape[0] != memory.shape[0]:
+            raise ValueError("x and memory batch sizes must match")
+        if x.shape[0] != self_mask.shape[0] or memory.shape[0] != memory_mask.shape[0]:
+            raise ValueError("mask batch sizes must match inputs")
+
+        if key is None:
+            block_keys: list[Array | None] = [None] * len(self.blocks)
+        else:
+            block_keys = list(jax.random.split(key, len(self.blocks)))
+
+        for block, block_key in zip(self.blocks, block_keys):
+            x = block(
+                x,
+                memory,
+                self_mask=self_mask,
+                memory_mask=memory_mask,
+                train=train,
+                key=block_key,
+            )
+        return self.final_norm(x)
+
+
 class TextTransformer(eqx.Module):
-    """Text encoder for LeJEPA with positional attention."""
+    """Text encoder with predictor and decoder stacks."""
 
     MUON_PARAM_EXCLUSION_PATTERNS: ClassVar[list[str]] = [
         r"^token_embed\..*$",
         r"^.*norm\d*\..*$",
         r"^final_norm\..*$",
         r"^predictor\.final_norm\..*$",
+        r"^decoder\.final_norm\..*$",
         r"^.*attn\.delta$",
     ]
 
@@ -540,6 +792,7 @@ class TextTransformer(eqx.Module):
     blocks: tuple[TextTransformerBlock, ...]
     final_norm: RMSNorm
     predictor: Predictor
+    decoder: Decoder
 
     def __init__(
         self,
@@ -584,12 +837,15 @@ class TextTransformer(eqx.Module):
             raise ValueError("pope_base must be > 1.0")
         if config.attn_type not in ("pope", "rope"):
             raise ValueError("attn_type must be 'pope' or 'rope'")
+        if config.decoder_n_layers <= 0:
+            raise ValueError("decoder_n_layers must be > 0")
 
         init = truncated_normal_init(config.init_std)
-        keys = jax.random.split(key, 2 + config.n_layers)
+        keys = jax.random.split(key, 3 + config.n_layers)
         embed_key = keys[0]
         block_keys = keys[1 : 1 + config.n_layers]
-        final_key = keys[-1]
+        predictor_key = keys[-2]
+        decoder_key = keys[-1]
 
         self.config = config
         self.token_embed = TokenEmbedding(
@@ -639,7 +895,15 @@ class TextTransformer(eqx.Module):
             qkv_kernel_init=init,
             o_kernel_init=init,
             mlp_kernel_init=init,
-            key=final_key,
+            key=predictor_key,
+        )
+        self.decoder = Decoder(
+            config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            qkv_kernel_init=init,
+            o_kernel_init=init,
+            key=decoder_key,
         )
 
     def __call__(

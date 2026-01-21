@@ -1,4 +1,4 @@
-from .attention import GatedPositionalSelfAttention, PoPESelfAttention, RoPESelfAttention, SelfAttention
+from .attention import CrossAttention, GatedPositionalSelfAttention, PoPESelfAttention, RoPESelfAttention, SelfAttention
 from .droppath import DropPath
 from .gelu import GELUFeedForward
 from .identity import Identity
@@ -12,6 +12,7 @@ __all__ = [
     "AdaptiveRMSNorm",
     "DropPath",
     "GELUFeedForward",
+    "CrossAttention",
     "GatedPositionalSelfAttention",
     "PoPESelfAttention",
     "RoPESelfAttention",

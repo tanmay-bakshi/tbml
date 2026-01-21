@@ -37,7 +37,8 @@ implemented in the current code.
 
 ### Model architecture
 
-The base encoder is `TextTransformer` (see `tbml/experiments/honeycomb/text/model.py`).
+The base model is `TextTransformer` (see `tbml/experiments/honeycomb/text/model.py`). It is
+composed of an **encoder**, a **predictor**, and a **decoder**.
 
 - **Token embedding**
   - Embedding table of shape `(vocab_size, d_model)`.
@@ -58,13 +59,19 @@ The base encoder is `TextTransformer` (see `tbml/experiments/honeycomb/text/mode
     to the attention mask (i.e., the last non-masked, non-pad token).
 - **Predictor**
   - A separate non‑causal transformer stack that operates on token‑level representations
-    after the base model’s final norm.
+    after the encoder’s final norm.
   - Number of predictor layers is configurable independently (`predictor_n_layers`); other
-    hyperparameters (width, heads, MLP ratio, dropout, positional encoding) mirror the base model.
+    hyperparameters (width, heads, MLP ratio, dropout, positional encoding) mirror the encoder.
   - Each masked token position is replaced by a learned position‑specific embedding before
     entering the predictor.
   - The predictor outputs token representations **prior** to its own final RMSNorm; the
     final norm is applied only when forming the predictor reconstruction targets.
+- **Decoder**
+  - A transformer decoder stack trained to autoregressively reconstruct masked spans.
+  - Each decoder block interleaves causal RoPE/PoPE self‑attention and non‑causal cross‑attention
+    (no positional encoding) over predictor outputs for the masked span.
+  - The decoder consumes token embeddings that are tied to the encoder’s embedding table, and
+    its output logits are produced via the same shared embedding weights (`TokenEmbedding.unembed`).
 
 The model returns both per-token representations and the pooled representation on every call.
 
@@ -119,14 +126,30 @@ seq_lejepa_loss = (1 - sigreg_weight) * seq_rec_loss + sigreg_weight * seq_sigre
 span_lejepa_loss = (1 - sigreg_weight) * span_rec_loss + sigreg_weight * span_sigreg_loss
 ```
 
-7) **Total loss (`total_loss`)**
+7) **Decoder loss (`decoder_loss`)**
 
 ```
-total_loss = seq_fraction * seq_lejepa_loss + span_fraction * span_lejepa_loss
+decoder_loss = cross_entropy(decoder_logits, decoder_targets)
 ```
 
-The fractions are derived from the CLI flags `--seq-loss-weight` and `--span-loss-weight`
-by normalizing them to sum to 1.0.
+Each **masked span** is treated as an independent decoder sample:
+
+- Input sequence: `[BOS] + span_tokens`
+- Target sequence: `span_tokens + [EOS]`
+- Cross‑attention memory: predictor outputs for the masked span positions.
+- Loss is masked to valid (non‑pad) positions only.
+
+8) **Total loss (`total_loss`)**
+
+```
+total_loss = seq_frac * seq_lejepa_loss
+           + span_frac * span_lejepa_loss
+           + decoder_frac * decoder_loss
+```
+
+The fractions are derived from the CLI flags `--seq-loss-weight`, `--span-loss-weight`,
+and `--decoder-loss-weight` by normalizing them to sum to 1.0. When `span-loss-weight`
+is 0, the span losses are skipped entirely.
 
 ### Optimization and training loop
 

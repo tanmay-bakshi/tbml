@@ -233,6 +233,221 @@ class SelfAttention(eqx.Module):
         return y
 
 
+class CrossAttention(eqx.Module):
+    """Cross-attention with optional causality and grouped query attention.
+
+    :ivar d_model: Model width.
+    :ivar n_heads: Number of query heads.
+    :ivar n_kv_heads: Number of key/value heads for GQA.
+    :ivar attn_dropout: Attention dropout probability.
+    :ivar resid_dropout: Residual dropout probability.
+    :ivar is_causal: Whether to apply a causal attention mask.
+    :ivar dtype: Compute dtype.
+    :ivar param_dtype: Parameter dtype.
+    :ivar q_proj: Query projection.
+    :ivar k_proj: Key projection.
+    :ivar v_proj: Value projection.
+    :ivar o_proj: Output projection.
+    :ivar attn_dropout_layer: Dropout layer for attention weights.
+    :ivar resid_dropout_layer: Dropout layer for residual projections.
+    """
+
+    d_model: int
+    n_heads: int
+    n_kv_heads: int
+    attn_dropout: float
+    resid_dropout: float
+    is_causal: bool
+    dtype: jnp.dtype
+    param_dtype: jnp.dtype
+    q_proj: Linear
+    k_proj: Linear
+    v_proj: Linear
+    o_proj: Linear
+    attn_dropout_layer: eqx.nn.Dropout
+    resid_dropout_layer: eqx.nn.Dropout
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        n_kv_heads: int,
+        *,
+        attn_dropout: float = 0.0,
+        resid_dropout: float = 0.0,
+        is_causal: bool = False,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        qkv_kernel_init: Initializer = jax.nn.initializers.lecun_normal(),
+        o_kernel_init: Initializer = jax.nn.initializers.lecun_normal(),
+        key: Array,
+    ) -> None:
+        """Initialize cross-attention parameters.
+
+        :param d_model: Model width.
+        :param n_heads: Number of query heads.
+        :param n_kv_heads: Number of key/value heads for GQA.
+        :param attn_dropout: Attention dropout probability.
+        :param resid_dropout: Residual dropout probability.
+        :param is_causal: Whether to apply a causal attention mask.
+        :param dtype: Compute dtype.
+        :param param_dtype: Parameter dtype.
+        :param qkv_kernel_init: Initializer for Q/K/V projections.
+        :param o_kernel_init: Initializer for output projection.
+        :param key: PRNG key for parameter initialization.
+        """
+        if d_model <= 0:
+            raise ValueError("d_model must be > 0")
+        if n_heads <= 0:
+            raise ValueError("n_heads must be > 0")
+        if n_kv_heads <= 0:
+            raise ValueError("n_kv_heads must be > 0")
+        if d_model % n_heads != 0:
+            raise ValueError("d_model must be divisible by n_heads")
+        if not (1 <= n_kv_heads <= n_heads):
+            raise ValueError("n_kv_heads must be in [1, n_heads]")
+        if n_heads % n_kv_heads != 0:
+            raise ValueError("n_heads must be divisible by n_kv_heads (for GQA)")
+
+        head_dim = d_model // n_heads
+        q_key, k_key, v_key, o_key = jax.random.split(key, 4)
+
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.attn_dropout = attn_dropout
+        self.resid_dropout = resid_dropout
+        self.is_causal = is_causal
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+
+        self.q_proj = Linear(
+            in_features=d_model,
+            out_features=n_heads * head_dim,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=qkv_kernel_init,
+            key=q_key,
+        )
+        self.k_proj = Linear(
+            in_features=d_model,
+            out_features=n_kv_heads * head_dim,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=qkv_kernel_init,
+            key=k_key,
+        )
+        self.v_proj = Linear(
+            in_features=d_model,
+            out_features=n_kv_heads * head_dim,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=qkv_kernel_init,
+            key=v_key,
+        )
+        self.o_proj = Linear(
+            in_features=n_heads * head_dim,
+            out_features=d_model,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=o_kernel_init,
+            key=o_key,
+        )
+        self.attn_dropout_layer = eqx.nn.Dropout(attn_dropout)
+        self.resid_dropout_layer = eqx.nn.Dropout(resid_dropout)
+
+    def __call__(
+        self,
+        x: Array,
+        context: Array,
+        *,
+        train: bool,
+        key: Array | None,
+        query_mask: Array | None = None,
+        context_mask: Array | None = None,
+    ) -> Array:
+        """Compute cross-attention.
+
+        :param x: Query tensor of shape (B, Tq, d_model).
+        :param context: Context tensor of shape (B, Tk, d_model).
+        :param train: Whether to enable dropout.
+        :param key: PRNG key for dropout.
+        :param query_mask: Optional mask of shape (B, Tq) for valid queries.
+        :param context_mask: Optional mask of shape (B, Tk) for valid keys.
+        :returns: Output tensor of shape (B, Tq, d_model).
+        :raises ValueError: If dropout is enabled without a PRNG key.
+        """
+        if train is True and (self.attn_dropout > 0.0 or self.resid_dropout > 0.0) and key is None:
+            raise ValueError("dropout key must be provided when training with dropout")
+        if x.ndim != 3 or context.ndim != 3:
+            raise ValueError("x and context must be 3D tensors")
+        if x.shape[0] != context.shape[0]:
+            raise ValueError("x and context batch sizes must match")
+        if x.shape[2] != self.d_model or context.shape[2] != self.d_model:
+            raise ValueError("x and context must match d_model")
+        if query_mask is not None and query_mask.ndim != 2:
+            raise ValueError("query_mask must have shape (B, Tq)")
+        if context_mask is not None and context_mask.ndim != 2:
+            raise ValueError("context_mask must have shape (B, Tk)")
+
+        bsz, qlen, _ = x.shape
+        klen = context.shape[1]
+        head_dim = self.d_model // self.n_heads
+
+        q = self.q_proj(x)
+        k = self.k_proj(context)
+        v = self.v_proj(context)
+
+        q = q.reshape((bsz, qlen, self.n_heads, head_dim)).transpose((0, 2, 1, 3))
+        k = k.reshape((bsz, klen, self.n_kv_heads, head_dim)).transpose((0, 2, 1, 3))
+        v = v.reshape((bsz, klen, self.n_kv_heads, head_dim)).transpose((0, 2, 1, 3))
+
+        if self.n_kv_heads != self.n_heads:
+            repeat = self.n_heads // self.n_kv_heads
+            k = jnp.repeat(k, repeats=repeat, axis=1)
+            v = jnp.repeat(v, repeats=repeat, axis=1)
+
+        qf = q.astype(jnp.float32)
+        kf = k.astype(jnp.float32)
+        vf = v.astype(v.dtype)
+
+        att = jnp.matmul(qf, jnp.swapaxes(kf, -2, -1)) / math.sqrt(head_dim)
+
+        if self.is_causal is True:
+            if qlen != klen:
+                raise ValueError("causal cross-attention requires query and key lengths to match")
+            mask = jnp.triu(jnp.ones((qlen, klen), dtype=bool), k=1)
+            att = jnp.where(mask[None, None, :, :], -jnp.inf, att)
+
+        if context_mask is not None:
+            mask = context_mask.astype(bool)
+            any_valid = jnp.any(mask, axis=1)
+            fallback = jnp.zeros_like(mask)
+            fallback = fallback.at[:, 0].set(True)
+            mask = jnp.where(any_valid[:, None], mask, fallback)
+            att = jnp.where(mask[:, None, None, :], att, -jnp.inf)
+
+        att = jax.nn.softmax(att, axis=-1)
+        if self.attn_dropout > 0.0 and key is not None:
+            key, attn_key = jax.random.split(key)
+            att = self.attn_dropout_layer(att, key=attn_key, inference=train is False)
+
+        y = jnp.matmul(att, vf).astype(q.dtype)
+        if query_mask is not None:
+            mask = query_mask.astype(y.dtype)
+            y = y * mask[:, None, :, None]
+        y = y.transpose((0, 2, 1, 3)).reshape((bsz, qlen, self.n_heads * head_dim))
+        y = self.o_proj(y)
+        if self.resid_dropout > 0.0 and key is not None:
+            key, resid_key = jax.random.split(key)
+            y = self.resid_dropout_layer(y, key=resid_key, inference=train is False)
+        return y
+
+
 def _pope_frequencies(head_dim: int, *, base: float) -> jnp.ndarray:
     """Compute PoPE angular frequencies.
 
