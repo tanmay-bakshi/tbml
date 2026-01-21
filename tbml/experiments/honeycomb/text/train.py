@@ -1503,13 +1503,14 @@ def main() -> None:
                     cos_sim = jnp.sum(emb_norm * ctr_norm[:, None, :], axis=-1)
                     seq_rec_loss = jnp.mean(1.0 - cos_sim)
 
-                seq_sigreg_loss = sigreg_loss_views(
-                    pooled_post_views,
-                    global_step=global_step,
-                    num_slices=args.sigreg_slices,
-                    seed=args.sigreg_seed,
-                    axis_name="data",
-                )
+                if args.sigreg_weight > 0.0:
+                    seq_sigreg_loss = sigreg_loss_views(
+                        pooled_post_views,
+                        global_step=global_step,
+                        num_slices=args.sigreg_slices,
+                        seed=args.sigreg_seed,
+                        axis_name="data",
+                    )
                 seq_lejepa_loss = (1.0 - args.sigreg_weight) * seq_rec_loss + args.sigreg_weight * seq_sigreg_loss
 
             bsz, num_views, seq_len, dim = token_post.shape
@@ -1577,19 +1578,20 @@ def main() -> None:
                 if args.span_loss_weight > 0.0:
                     sample_index = total_views
                     sample_reps = token_pre[:, sample_index, :, :]
-                    span_targets = _select_span_targets_per_view(
-                        sample_reps,
-                        mask_positions[:, :total_views, :],
-                        base_norm=model_inner.final_norm,
-                        key=sigreg_key,
-                    )
-                    span_sigreg_loss = sigreg_loss_views(
-                        span_targets,
-                        global_step=global_step,
-                        num_slices=args.sigreg_slices,
-                        seed=args.sigreg_seed,
-                        axis_name="data",
-                    )
+                    if args.sigreg_weight > 0.0:
+                        span_targets = _select_span_targets_per_view(
+                            sample_reps,
+                            mask_positions[:, :total_views, :],
+                            base_norm=model_inner.final_norm,
+                            key=sigreg_key,
+                        )
+                        span_sigreg_loss = sigreg_loss_views(
+                            span_targets,
+                            global_step=global_step,
+                            num_slices=args.sigreg_slices,
+                            seed=args.sigreg_seed,
+                            axis_name="data",
+                        )
 
                     if args.span_tokenwise is False:
                         span_rec_loss = _predictor_span_loss(
