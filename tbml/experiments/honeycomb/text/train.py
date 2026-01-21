@@ -78,7 +78,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-loss-weight", type=float, default=0.5)
     parser.add_argument("--span-loss-weight", type=float, default=0.0)
     parser.add_argument("--decoder-loss-weight", type=float, default=0.5)
-    parser.add_argument("--decoder-span-batch", type=int, default=256)
 
     parser.add_argument("--muon-lr", type=float, default=1e-3)
     parser.add_argument("--muon-momentum", type=float, default=0.95)
@@ -850,7 +849,6 @@ def _decoder_loss(
     bos_id: int,
     eos_id: int,
     pad_id: int,
-    span_batch: int,
     key: Array,
 ) -> Array:
     """Compute decoder autoregressive loss over sampled masked spans.
@@ -862,7 +860,6 @@ def _decoder_loss(
     :param bos_id: BOS token id.
     :param eos_id: EOS token id.
     :param pad_id: Padding token id.
-    :param span_batch: Number of spans to process per decoder batch.
     :param key: PRNG key for decoder dropout.
     :returns: Scalar decoder loss.
     """
@@ -878,9 +875,6 @@ def _decoder_loss(
         raise ValueError("batch sizes must match")
     if sample_tokens.shape[1] != view_pred_reps.shape[2]:
         raise ValueError("sequence lengths must match")
-    if span_batch <= 0:
-        raise ValueError("span_batch must be > 0")
-
     bsz, num_views, seq_len, dim = view_pred_reps.shape
     flat_masks = view_masks.reshape((bsz * num_views, seq_len))
     flat_pred = view_pred_reps.reshape((bsz * num_views, seq_len, dim))
@@ -914,90 +908,56 @@ def _decoder_loss(
         return jax.lax.cond(count > 0, _choose, _fallback)
 
     span_starts, span_lengths, span_valid = jax.vmap(_pick_span)(flat_masks, flat_keys)
-    view_idx = jnp.arange(flat_masks.shape[0], dtype=jnp.int32)
-
-    total_spans = int(span_starts.shape[0])
-    pad_needed = (-total_spans) % span_batch
-    if pad_needed != 0:
-        span_starts = jnp.pad(span_starts, (0, pad_needed))
-        span_lengths = jnp.pad(span_lengths, (0, pad_needed))
-        view_idx = jnp.pad(view_idx, (0, pad_needed))
-        span_valid = jnp.pad(span_valid, (0, pad_needed))
-
-    span_total_padded = int(span_starts.shape[0])
-    num_chunks = span_total_padded // span_batch
     offsets = jnp.arange(seq_len, dtype=jnp.int32)
     offsets_with_bos = jnp.arange(seq_len + 1, dtype=jnp.int32)
-    chunk_keys = jax.random.split(key, num_chunks)
+    chunk_key = jax.random.split(key, 1)[0]
+    tokens_view = sample_tokens_flat
+    pred_view = flat_pred
+    idxs = span_starts[:, None] + offsets[None, :]
+    idxs = jnp.clip(idxs, 0, seq_len - 1)
+    span_tokens = jnp.take_along_axis(tokens_view, idxs, axis=1)
+    span_mem = jnp.take_along_axis(pred_view, idxs[:, :, None], axis=1)
 
-    def _chunk_step(
-        carry: tuple[Array, Array],
-        inputs: tuple[Array, Array],
-    ) -> tuple[tuple[Array, Array], None]:
-        loss_sum, count_sum = carry
-        chunk_idx, chunk_key = inputs
-        start_idx = chunk_idx * span_batch
-        span_st = jax.lax.dynamic_slice(span_starts, (start_idx,), (span_batch,))
-        span_ln = jax.lax.dynamic_slice(span_lengths, (start_idx,), (span_batch,))
-        span_vi = jax.lax.dynamic_slice(view_idx, (start_idx,), (span_batch,))
-        span_ok = jax.lax.dynamic_slice(span_valid, (start_idx,), (span_batch,))
+    span_mask = offsets[None, :] < span_lengths[:, None]
+    span_tokens = jnp.where(span_mask, span_tokens, pad_id)
+    span_mem = jnp.where(span_mask[:, :, None], span_mem, jnp.zeros_like(span_mem))
 
-        tokens_view = sample_tokens_flat[span_vi]
-        pred_view = flat_pred[span_vi]
-        idxs = span_st[:, None] + offsets[None, :]
-        idxs = jnp.clip(idxs, 0, seq_len - 1)
-        span_tokens = jnp.take_along_axis(tokens_view, idxs, axis=1)
-        span_mem = jnp.take_along_axis(pred_view, idxs[:, :, None], axis=1)
+    bos_col = jnp.full((span_tokens.shape[0], 1), bos_id, dtype=span_tokens.dtype)
+    dec_in = jnp.concatenate([bos_col, span_tokens], axis=1)
+    dec_mask = offsets_with_bos[None, :] < (span_lengths + 1)[:, None]
+    dec_mask = jnp.logical_and(dec_mask, span_valid[:, None])
 
-        span_mask = offsets[None, :] < span_ln[:, None]
-        span_tokens = jnp.where(span_mask, span_tokens, pad_id)
-        span_mem = jnp.where(span_mask[:, :, None], span_mem, jnp.zeros_like(span_mem))
+    dec_targets = jnp.full((span_tokens.shape[0], seq_len + 1), pad_id, dtype=span_tokens.dtype)
+    dec_targets = dec_targets.at[:, :seq_len].set(span_tokens)
+    eos_pos = jnp.clip(span_lengths, 0, seq_len)
+    row_idx = jnp.arange(span_tokens.shape[0], dtype=jnp.int32)
+    dec_targets = dec_targets.at[row_idx, eos_pos].set(eos_id)
 
-        bos_col = jnp.full((span_batch, 1), bos_id, dtype=span_tokens.dtype)
-        dec_in = jnp.concatenate([bos_col, span_tokens], axis=1)
-        dec_mask = offsets_with_bos[None, :] < (span_ln + 1)[:, None]
-        dec_mask = jnp.logical_and(dec_mask, span_ok[:, None])
+    target_mask = offsets_with_bos[None, :] < (span_lengths + 1)[:, None]
+    target_mask = jnp.logical_and(target_mask, span_valid[:, None])
 
-        dec_targets = jnp.full((span_batch, seq_len + 1), pad_id, dtype=span_tokens.dtype)
-        dec_targets = dec_targets.at[:, :seq_len].set(span_tokens)
-        eos_pos = jnp.clip(span_ln, 0, seq_len)
-        row_idx = jnp.arange(span_batch, dtype=jnp.int32)
-        dec_targets = dec_targets.at[row_idx, eos_pos].set(eos_id)
+    mem_mask = jnp.logical_and(span_mask, span_valid[:, None])
+    any_mem = jnp.any(mem_mask, axis=1)
+    fallback = jnp.zeros_like(mem_mask)
+    fallback = fallback.at[:, 0].set(True)
+    mem_mask = jnp.where(any_mem[:, None], mem_mask, fallback)
 
-        target_mask = offsets_with_bos[None, :] < (span_ln + 1)[:, None]
-        target_mask = jnp.logical_and(target_mask, span_ok[:, None])
-
-        mem_mask = jnp.logical_and(span_mask, span_ok[:, None])
-        any_mem = jnp.any(mem_mask, axis=1)
-        fallback = jnp.zeros_like(mem_mask)
-        fallback = fallback.at[:, 0].set(True)
-        mem_mask = jnp.where(any_mem[:, None], mem_mask, fallback)
-
-        dec_embed = model.token_embed(dec_in)
-        dec_out = model.decoder(
-            dec_embed,
-            dec_mask,
-            span_mem,
-            mem_mask,
-            train=True,
-            key=chunk_key,
-        )
-        logits = model.token_embed.unembed(dec_out).astype(jnp.float32)
-        log_probs = jax.nn.log_softmax(logits, axis=-1)
-        target_idx = dec_targets.astype(jnp.int32)
-        token_logp = jnp.take_along_axis(log_probs, target_idx[..., None], axis=-1).squeeze(-1)
-        loss = -token_logp * target_mask.astype(jnp.float32)
-        loss_sum = loss_sum + jnp.sum(loss)
-        count_sum = count_sum + jnp.sum(target_mask.astype(jnp.float32))
-        return (loss_sum, count_sum), None
-
-    init_loss = jnp.asarray(0.0, dtype=jnp.float32)
-    init_count = jnp.asarray(0.0, dtype=jnp.float32)
-    (loss_sum, count_sum), _ = jax.lax.scan(
-        _chunk_step,
-        (init_loss, init_count),
-        (jnp.arange(num_chunks, dtype=jnp.int32), chunk_keys),
+    dec_embed = model.token_embed(dec_in)
+    dec_out = model.decoder(
+        dec_embed,
+        dec_mask,
+        span_mem,
+        mem_mask,
+        train=True,
+        key=chunk_key,
     )
+    logits = model.token_embed.unembed(dec_out).astype(jnp.float32)
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    target_idx = dec_targets.astype(jnp.int32)
+    token_logp = jnp.take_along_axis(log_probs, target_idx[..., None], axis=-1).squeeze(-1)
+    loss = -token_logp * target_mask.astype(jnp.float32)
+    loss_sum = jnp.sum(loss)
+    count_sum = jnp.sum(target_mask.astype(jnp.float32))
 
     def _with_count() -> Array:
         return loss_sum / count_sum
@@ -1147,8 +1107,6 @@ def main() -> None:
         raise ValueError("span-loss-weight must be >= 0")
     if args.decoder_loss_weight < 0.0:
         raise ValueError("decoder-loss-weight must be >= 0")
-    if args.decoder_span_batch <= 0:
-        raise ValueError("decoder-span-batch must be > 0")
     if args.seq_loss_weight + args.span_loss_weight + args.decoder_loss_weight <= 0.0:
         raise ValueError("at least one loss weight must be > 0")
     if args.num_global_views + args.num_local_views <= 0:
@@ -1327,7 +1285,6 @@ def main() -> None:
             "seq_loss_weight": args.seq_loss_weight,
             "span_loss_weight": args.span_loss_weight,
             "decoder_loss_weight": args.decoder_loss_weight,
-            "decoder_span_batch": args.decoder_span_batch,
         },
         "optimizer": {
             "muon_lr": args.muon_lr,
@@ -1633,7 +1590,6 @@ def main() -> None:
                         bos_id=bos_id,
                         eos_id=eos_id,
                         pad_id=pad_id,
-                        span_batch=args.decoder_span_batch,
                         key=decoder_key,
                     )
 
