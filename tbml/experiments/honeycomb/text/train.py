@@ -74,6 +74,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sigreg-slices", type=int, default=256)
     parser.add_argument("--sigreg-seed", type=int, default=0)
     parser.add_argument("--pred-loss", type=str, default="mse", choices=["mse", "cosine"])
+    parser.add_argument("--seq-loss-weight", type=float, default=0.5)
+    parser.add_argument("--span-loss-weight", type=float, default=0.5)
 
     parser.add_argument("--muon-lr", type=float, default=1e-3)
     parser.add_argument("--muon-momentum", type=float, default=0.95)
@@ -969,6 +971,10 @@ def main() -> None:
         raise ValueError("sigreg-weight must be in [0, 1]")
     if args.pred_loss not in ("mse", "cosine"):
         raise ValueError("pred-loss must be 'mse' or 'cosine'")
+    if args.seq_loss_weight < 0.0:
+        raise ValueError("seq-loss-weight must be >= 0")
+    if args.span_loss_weight < 0.0:
+        raise ValueError("span-loss-weight must be >= 0")
     if args.num_global_views + args.num_local_views <= 0:
         raise ValueError("at least one view must be requested")
 
@@ -1127,6 +1133,8 @@ def main() -> None:
             "sigreg_slices": args.sigreg_slices,
             "sigreg_seed": args.sigreg_seed,
             "pred_loss": args.pred_loss,
+            "seq_loss_weight": args.seq_loss_weight,
+            "span_loss_weight": args.span_loss_weight,
         },
         "optimizer": {
             "muon_lr": args.muon_lr,
@@ -1416,7 +1424,13 @@ def main() -> None:
             span_lejepa_loss = (
                 (1.0 - args.sigreg_weight) * span_rec_loss + args.sigreg_weight * span_sigreg_loss
             )
-            total_loss = 0.5 * (seq_lejepa_loss + span_lejepa_loss)
+            seq_weight = jnp.asarray(args.seq_loss_weight, dtype=jnp.float32)
+            span_weight = jnp.asarray(args.span_loss_weight, dtype=jnp.float32)
+            weight_sum = seq_weight + span_weight
+            weight_sum = jnp.maximum(weight_sum, 1e-6)
+            seq_frac = seq_weight / weight_sum
+            span_frac = span_weight / weight_sum
+            total_loss = seq_frac * seq_lejepa_loss + span_frac * span_lejepa_loss
             return (
                 total_loss,
                 (

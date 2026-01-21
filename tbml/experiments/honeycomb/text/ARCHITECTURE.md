@@ -122,8 +122,11 @@ span_lejepa_loss = (1 - sigreg_weight) * span_rec_loss + sigreg_weight * span_si
 7) **Total loss (`total_loss`)**
 
 ```
-total_loss = mean(seq_lejepa_loss, span_lejepa_loss)
+total_loss = seq_fraction * seq_lejepa_loss + span_fraction * span_lejepa_loss
 ```
+
+The fractions are derived from the CLI flags `--seq-loss-weight` and `--span-loss-weight`
+by normalizing them to sum to 1.0.
 
 ### Optimization and training loop
 
