@@ -381,6 +381,14 @@ class TextInference:
         return self._model.config
 
     @property
+    def model(self) -> TextTransformer:
+        """Return the loaded TextTransformer model.
+
+        :returns: TextTransformer instance.
+        """
+        return self._model
+
+    @property
     def max_seq_len(self) -> int:
         """Return the configured maximum sequence length.
 
