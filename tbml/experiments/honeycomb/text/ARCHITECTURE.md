@@ -90,6 +90,9 @@ The model produces a tensor of pooled view embeddings with shape `(B, V, K)`.
   (see `tbml/experiments/honeycomb/loss.py`).
 - The random directions are synchronized across devices via the global step and seed.
 - SIGReg is computed on the **post‑final‑norm** pooled view embeddings.
+- An additional SIGReg term is computed on a batch of span‑target vectors: for each sample,
+  one masked‑span target (computed from the sample view) is selected across the global/local
+  views and used as a single‑view batch for SIGReg. This term is added to the view SIGReg.
 
 3) **LeJEPA total loss**
 

@@ -836,6 +836,68 @@ def _predictor_span_loss(
     return jnp.mean(losses)
 
 
+def _select_span_targets(
+    sample_reps: Array,
+    mask_positions: Array,
+    *,
+    base_norm: RMSNorm,
+    key: Array,
+) -> Array:
+    """Select one masked-span target vector per sample for SIGReg.
+
+    :param sample_reps: Sample token reps of shape (B, T, D) pre-base-norm.
+    :param mask_positions: Mask positions of shape (B, V, T) for global/local views.
+    :param base_norm: Base model RMSNorm module.
+    :param key: PRNG key for sampling.
+    :returns: Array of shape (B, D) with one selected target per sample.
+    """
+    if sample_reps.ndim != 3:
+        raise ValueError("sample_reps must have shape (B, T, D)")
+    if mask_positions.ndim != 3:
+        raise ValueError("mask_positions must have shape (B, V, T)")
+    if sample_reps.shape[0] != mask_positions.shape[0]:
+        raise ValueError("batch sizes must match")
+    if sample_reps.shape[1] != mask_positions.shape[2]:
+        raise ValueError("sequence lengths must match")
+
+    num_segments = sample_reps.shape[1] + 1
+
+    def _per_sample(
+        sample_rep: Array,
+        view_masks: Array,
+        sample_key: Array,
+    ) -> Array:
+        def _per_view(mask: Array) -> tuple[Array, Array]:
+            span_ids = _span_ids(mask)
+            sum_sample = jax.ops.segment_sum(sample_rep, span_ids, num_segments)
+            counts = jax.ops.segment_sum(mask.astype(jnp.float32), span_ids, num_segments)
+            denom = jnp.maximum(counts[:, None], 1.0)
+            mean_sample = sum_sample / denom
+            mean_sample = base_norm(mean_sample)
+            valid = counts > 0
+            valid = valid.at[0].set(False)
+            return mean_sample, valid
+
+        means, valids = jax.vmap(_per_view)(view_masks)
+        candidates = means.reshape((-1, means.shape[-1]))
+        valid_flat = valids.reshape((-1,))
+        valid_count = jnp.sum(valid_flat)
+
+        def _pick() -> Array:
+            probs = valid_flat.astype(jnp.float32)
+            probs = probs / jnp.sum(probs)
+            idx = jax.random.choice(sample_key, candidates.shape[0], p=probs)
+            return candidates[idx]
+
+        def _fallback() -> Array:
+            return jnp.zeros((candidates.shape[-1],), dtype=candidates.dtype)
+
+        return jax.lax.cond(valid_count > 0, _pick, _fallback)
+
+    keys = jax.random.split(key, sample_reps.shape[0])
+    return jax.vmap(_per_sample)(sample_reps, mask_positions, keys)
+
+
 def _save_checkpoint(
     run_dir: str,
     step: int,
@@ -1184,7 +1246,7 @@ def main() -> None:
             :param tokens_key: PRNG key for masking.
             :returns: Tuple of (full loss, (total loss, pred loss, sigreg loss, predictor loss)).
             """
-            view_key, predictor_key = jax.random.split(tokens_key)
+            view_key, predictor_key, sigreg_key = jax.random.split(tokens_key, 3)
             (
                 pooled_post,
                 pooled_pre,
@@ -1225,13 +1287,28 @@ def main() -> None:
                 cos_sim = jnp.sum(emb_norm * ctr_norm[:, None, :], axis=-1)
                 pred_loss = jnp.mean(1.0 - cos_sim)
 
-            sigreg = sigreg_loss_views(
+            sigreg_views = sigreg_loss_views(
                 pooled_post_views,
                 global_step=global_step,
                 num_slices=args.sigreg_slices,
                 seed=args.sigreg_seed,
                 axis_name="data",
             )
+            span_targets = _select_span_targets(
+                token_pre[:, total_views, :, :],
+                mask_positions[:, :total_views, :],
+                base_norm=model_inner.final_norm,
+                key=sigreg_key,
+            )
+            span_targets = span_targets[:, None, :]
+            sigreg_spans = sigreg_loss_views(
+                span_targets,
+                global_step=global_step,
+                num_slices=args.sigreg_slices,
+                seed=args.sigreg_seed,
+                axis_name="data",
+            )
+            sigreg = sigreg_views + sigreg_spans
 
             total_loss = (1.0 - args.sigreg_weight) * pred_loss + args.sigreg_weight * sigreg
 
