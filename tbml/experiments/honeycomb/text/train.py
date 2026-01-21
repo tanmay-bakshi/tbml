@@ -930,6 +930,7 @@ def _decoder_loss(
         raise ValueError("batch sizes must match")
     if sample_tokens.shape[1] != view_pred_reps.shape[2]:
         raise ValueError("sequence lengths must match")
+    view_pred_reps = model.predictor.final_norm(view_pred_reps)
     bsz, num_views, seq_len, dim = view_pred_reps.shape
     flat_masks = view_masks.reshape((bsz * num_views, seq_len))
     flat_pred = view_pred_reps.reshape((bsz * num_views, seq_len, dim))
