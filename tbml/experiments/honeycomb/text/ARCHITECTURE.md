@@ -73,7 +73,7 @@ The model returns both per-token representations and the pooled representation o
 Let `B` be batch size, `V` be total number of views, and `K` the embedding dimension.
 The model produces a tensor of pooled view embeddings with shape `(B, V, K)`.
 
-1) **Prediction (reconstruction) loss**
+1) **Sequence reconstruction loss (`seq_rec_loss`)**
 
 - For each sample, the **global center** is computed as:
   - take the pooled *pre‑final‑norm* representations of the global views,
@@ -84,23 +84,20 @@ The model produces a tensor of pooled view embeddings with shape `(B, V, K)`.
   - Mean squared error (MSE), or
   - Cosine distance (1 − cosine similarity).
 
-2) **SIGReg**
+2) **Sequence SIGReg (`seq_sigreg_loss`)**
 
 - A regularization term computed from random projections of the view embeddings
   (see `tbml/experiments/honeycomb/loss.py`).
 - The random directions are synchronized across devices via the global step and seed.
 - SIGReg is computed on the **post‑final‑norm** pooled view embeddings.
-- An additional SIGReg term is computed on a batch of span‑target vectors: for each sample,
-  one masked‑span target (computed from the sample view) is selected across the global/local
-  views and used as a single‑view batch for SIGReg. This term is added to the view SIGReg.
 
-3) **LeJEPA total loss**
+3) **Sequence LeJEPA loss (`seq_lejepa_loss`)**
 
 ```
-total = (1 - sigreg_weight) * pred_loss + sigreg_weight * sigreg_loss
+seq_lejepa_loss = (1 - sigreg_weight) * seq_rec_loss + sigreg_weight * seq_sigreg_loss
 ```
 
-4) **Predictor masked span reconstruction loss**
+4) **Span reconstruction loss (`span_rec_loss`)**
 
 - For each global/local view, every masked span is reconstructed by comparing:
   - the base model’s *pre‑final‑norm* sample view representations averaged over that span
@@ -109,10 +106,20 @@ total = (1 - sigreg_weight) * pred_loss + sigreg_weight * sigreg_loss
     final RMSNorm.
 - Mean squared error is applied over these span averages, then averaged across spans and views.
 
-5) **Full loss**
+5) **Span SIGReg (`span_sigreg_loss`)**
+
+- A SIGReg term computed on a batch of one randomly selected masked‑span target per sample.
+
+6) **Span LeJEPA loss (`span_lejepa_loss`)**
 
 ```
-full_loss = total + predictor_loss
+span_lejepa_loss = (1 - sigreg_weight) * span_rec_loss + sigreg_weight * span_sigreg_loss
+```
+
+7) **Total loss (`total_loss`)**
+
+```
+total_loss = mean(seq_lejepa_loss, span_lejepa_loss)
 ```
 
 ### Optimization and training loop

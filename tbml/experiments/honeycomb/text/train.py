@@ -1222,7 +1222,7 @@ def main() -> None:
         global_step: Array,
         micro_step0: Array,
         micro_steps: Array,
-    ) -> tuple[eqx.Module, Array, Array, Array, Array, Array]:
+    ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array]:
         """Compute accumulated gradients and metrics across micro-steps.
 
         :param model_in: Replicated model.
@@ -1231,20 +1231,22 @@ def main() -> None:
         :param global_step: Global step index for loss scheduling.
         :param micro_step0: Starting micro-step index for RNG folding.
         :param micro_steps: Number of valid micro-steps in the batch.
-        :returns: Tuple of (grads, total loss, pred loss, sigreg loss, predictor loss, full loss).
+        :returns: Tuple of (grads, total loss, seq rec loss, seq sigreg loss, span rec loss,
+            span sigreg loss, seq lejepa loss, span lejepa loss).
         """
 
         def _loss_fn(
             model_inner: TextTransformer,
             tokens: Array,
             tokens_key: Array,
-        ) -> tuple[Array, tuple[Array, Array, Array, Array]]:
+        ) -> tuple[Array, tuple[Array, Array, Array, Array, Array, Array, Array]]:
             """Compute the total loss and its components.
 
             :param model_inner: Model replica used for the loss computation.
             :param tokens: Token batch of shape (B, T).
             :param tokens_key: PRNG key for masking.
-            :returns: Tuple of (full loss, (total loss, pred loss, sigreg loss, predictor loss)).
+            :returns: Tuple of (total loss, (seq rec loss, seq sigreg loss, span rec loss,
+                span sigreg loss, seq lejepa loss, span lejepa loss, total loss)).
             """
             view_key, predictor_key, sigreg_key = jax.random.split(tokens_key, 3)
             (
@@ -1279,15 +1281,15 @@ def main() -> None:
 
             if args.pred_loss == "mse":
                 diffs = pooled_post_views - center[:, None, :]
-                pred_loss = jnp.mean(jnp.square(diffs))
+                seq_rec_loss = jnp.mean(jnp.square(diffs))
             else:
                 eps = jnp.asarray(1e-8, dtype=pooled_post_views.dtype)
                 emb_norm = pooled_post_views / (jnp.linalg.norm(pooled_post_views, axis=-1, keepdims=True) + eps)
                 ctr_norm = center / (jnp.linalg.norm(center, axis=-1, keepdims=True) + eps)
                 cos_sim = jnp.sum(emb_norm * ctr_norm[:, None, :], axis=-1)
-                pred_loss = jnp.mean(1.0 - cos_sim)
+                seq_rec_loss = jnp.mean(1.0 - cos_sim)
 
-            sigreg_views = sigreg_loss_views(
+            seq_sigreg_loss = sigreg_loss_views(
                 pooled_post_views,
                 global_step=global_step,
                 num_slices=args.sigreg_slices,
@@ -1301,16 +1303,14 @@ def main() -> None:
                 key=sigreg_key,
             )
             span_targets = span_targets[:, None, :]
-            sigreg_spans = sigreg_loss_views(
+            span_sigreg_loss = sigreg_loss_views(
                 span_targets,
                 global_step=global_step,
                 num_slices=args.sigreg_slices,
                 seed=args.sigreg_seed,
                 axis_name="data",
             )
-            sigreg = sigreg_views + sigreg_spans
-
-            total_loss = (1.0 - args.sigreg_weight) * pred_loss + args.sigreg_weight * sigreg
+            seq_lejepa_loss = (1.0 - args.sigreg_weight) * seq_rec_loss + args.sigreg_weight * seq_sigreg_loss
 
             predictor_attn = jnp.logical_or(view_attn, mask_positions)
             bsz, num_views, seq_len, dim = token_post.shape
@@ -1332,7 +1332,7 @@ def main() -> None:
             view_pred_reps = pred_reps[:, :total_views, :, :]
             view_masks = mask_positions[:, :total_views, :]
 
-            predictor_loss = _predictor_span_loss(
+            span_rec_loss = _predictor_span_loss(
                 sample_reps,
                 view_pred_reps,
                 view_masks,
@@ -1340,8 +1340,22 @@ def main() -> None:
                 predictor_norm=model_inner.predictor.final_norm,
             )
 
-            full_loss = total_loss + predictor_loss
-            return full_loss, (total_loss, pred_loss, sigreg, predictor_loss)
+            span_lejepa_loss = (
+                (1.0 - args.sigreg_weight) * span_rec_loss + args.sigreg_weight * span_sigreg_loss
+            )
+            total_loss = 0.5 * (seq_lejepa_loss + span_lejepa_loss)
+            return (
+                total_loss,
+                (
+                    seq_rec_loss,
+                    seq_sigreg_loss,
+                    span_rec_loss,
+                    span_sigreg_loss,
+                    seq_lejepa_loss,
+                    span_lejepa_loss,
+                    total_loss,
+                ),
+            )
 
         value_and_grad = eqx.filter_value_and_grad(_loss_fn, has_aux=True)
         params_only = eqx.filter(model_in, eqx.is_array)
@@ -1350,30 +1364,53 @@ def main() -> None:
             params_only,
         )
         loss_init = jnp.asarray(0.0, dtype=jnp.float32)
-        pred_init = jnp.asarray(0.0, dtype=jnp.float32)
-        sigreg_init = jnp.asarray(0.0, dtype=jnp.float32)
-        predictor_init = jnp.asarray(0.0, dtype=jnp.float32)
-        full_init = jnp.asarray(0.0, dtype=jnp.float32)
+        seq_rec_init = jnp.asarray(0.0, dtype=jnp.float32)
+        seq_sigreg_init = jnp.asarray(0.0, dtype=jnp.float32)
+        span_rec_init = jnp.asarray(0.0, dtype=jnp.float32)
+        span_sigreg_init = jnp.asarray(0.0, dtype=jnp.float32)
+        seq_lejepa_init = jnp.asarray(0.0, dtype=jnp.float32)
+        span_lejepa_init = jnp.asarray(0.0, dtype=jnp.float32)
 
         step_indices = jnp.arange(batch_tokens.shape[0], dtype=jnp.int32)
 
         def _accum_body(
-            carry: tuple[eqx.Module, Array, Array, Array, Array, Array],
+            carry: tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array],
             inputs: tuple[Array, Array],
-        ) -> tuple[tuple[eqx.Module, Array, Array, Array, Array, Array], None]:
+        ) -> tuple[tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array], None]:
             """Accumulate gradients and metrics for one micro-step.
 
-            :param carry: Tuple of (grads, loss, pred loss, sigreg loss, predictor loss, full loss).
+            :param carry: Tuple of (grads, total loss, seq rec loss, seq sigreg loss, span rec loss,
+                span sigreg loss, seq lejepa loss, span lejepa loss).
             :param inputs: Tuple of (micro step index, token batch).
             :returns: Updated carry and unused output.
             """
-            grads_acc, loss_acc, pred_acc, sigreg_acc, predictor_acc, full_acc = carry
+            (
+                grads_acc,
+                loss_acc,
+                seq_rec_acc,
+                seq_sigreg_acc,
+                span_rec_acc,
+                span_sigreg_acc,
+                seq_lejepa_acc,
+                span_lejepa_acc,
+            ) = carry
             step_idx, tokens = inputs
             step_idx_global = micro_step0 + step_idx
             tokens_key = jax.random.fold_in(key, step_idx_global)
 
-            def _do_compute(_: None) -> tuple[eqx.Module, Array, Array, Array, Array, Array]:
-                (full_loss, (loss, pred_loss, sigreg_loss, predictor_loss)), grads = value_and_grad(
+            def _do_compute(_: None) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array]:
+                (
+                    loss,
+                    (
+                        seq_rec_loss,
+                        seq_sigreg_loss,
+                        span_rec_loss,
+                        span_sigreg_loss,
+                        seq_lejepa_loss,
+                        span_lejepa_loss,
+                        _total_loss,
+                    ),
+                ), grads = value_and_grad(
                     model_in,
                     tokens,
                     tokens_key,
@@ -1381,22 +1418,60 @@ def main() -> None:
                 grads = _cast_tree_dtype(grads, jnp.float32)
                 grads_accum = _add_trees(grads_acc, grads)
                 loss_accum = loss_acc + loss
-                pred_accum = pred_acc + pred_loss
-                sigreg_accum = sigreg_acc + sigreg_loss
-                predictor_accum = predictor_acc + predictor_loss
-                full_accum = full_acc + full_loss
-                return grads_accum, loss_accum, pred_accum, sigreg_accum, predictor_accum, full_accum
+                seq_rec_accum = seq_rec_acc + seq_rec_loss
+                seq_sigreg_accum = seq_sigreg_acc + seq_sigreg_loss
+                span_rec_accum = span_rec_acc + span_rec_loss
+                span_sigreg_accum = span_sigreg_acc + span_sigreg_loss
+                seq_lejepa_accum = seq_lejepa_acc + seq_lejepa_loss
+                span_lejepa_accum = span_lejepa_acc + span_lejepa_loss
+                return (
+                    grads_accum,
+                    loss_accum,
+                    seq_rec_accum,
+                    seq_sigreg_accum,
+                    span_rec_accum,
+                    span_sigreg_accum,
+                    seq_lejepa_accum,
+                    span_lejepa_accum,
+                )
 
-            def _skip_compute(_: None) -> tuple[eqx.Module, Array, Array, Array, Array, Array]:
-                return grads_acc, loss_acc, pred_acc, sigreg_acc, predictor_acc, full_acc
+            def _skip_compute(_: None) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array]:
+                return (
+                    grads_acc,
+                    loss_acc,
+                    seq_rec_acc,
+                    seq_sigreg_acc,
+                    span_rec_acc,
+                    span_sigreg_acc,
+                    seq_lejepa_acc,
+                    span_lejepa_acc,
+                )
 
             active = step_idx < micro_steps
             new_carry = jax.lax.cond(active, _do_compute, _skip_compute, operand=None)
             return new_carry, None
 
-        (grads, loss, pred_loss, sigreg_loss, predictor_loss, full_loss), _ = jax.lax.scan(
+        (
+            grads,
+            loss,
+            seq_rec_loss,
+            seq_sigreg_loss,
+            span_rec_loss,
+            span_sigreg_loss,
+            seq_lejepa_loss,
+            span_lejepa_loss,
+        ), _ = jax.lax.scan(
             _accum_body,
-            (grad_init, loss_init, pred_init, sigreg_init, predictor_init, full_init),
+            (
+                grad_init,
+                loss_init,
+                seq_rec_init,
+                seq_sigreg_init,
+                span_rec_init,
+                span_sigreg_init,
+                seq_lejepa_init,
+                span_lejepa_init,
+            ),
             (step_indices, batch_tokens),
         )
 
@@ -1407,18 +1482,31 @@ def main() -> None:
             grads,
         )
         loss = loss / scale
-        pred_loss = pred_loss / scale
-        sigreg_loss = sigreg_loss / scale
-        predictor_loss = predictor_loss / scale
-        full_loss = full_loss / scale
+        seq_rec_loss = seq_rec_loss / scale
+        seq_sigreg_loss = seq_sigreg_loss / scale
+        span_rec_loss = span_rec_loss / scale
+        span_sigreg_loss = span_sigreg_loss / scale
+        seq_lejepa_loss = seq_lejepa_loss / scale
+        span_lejepa_loss = span_lejepa_loss / scale
 
         grads = jax.lax.pmean(grads, axis_name="data")
         loss = jax.lax.pmean(loss, axis_name="data")
-        pred_loss = jax.lax.pmean(pred_loss, axis_name="data")
-        sigreg_loss = jax.lax.pmean(sigreg_loss, axis_name="data")
-        predictor_loss = jax.lax.pmean(predictor_loss, axis_name="data")
-        full_loss = jax.lax.pmean(full_loss, axis_name="data")
-        return grads, loss, pred_loss, sigreg_loss, predictor_loss, full_loss
+        seq_rec_loss = jax.lax.pmean(seq_rec_loss, axis_name="data")
+        seq_sigreg_loss = jax.lax.pmean(seq_sigreg_loss, axis_name="data")
+        span_rec_loss = jax.lax.pmean(span_rec_loss, axis_name="data")
+        span_sigreg_loss = jax.lax.pmean(span_sigreg_loss, axis_name="data")
+        seq_lejepa_loss = jax.lax.pmean(seq_lejepa_loss, axis_name="data")
+        span_lejepa_loss = jax.lax.pmean(span_lejepa_loss, axis_name="data")
+        return (
+            grads,
+            loss,
+            seq_rec_loss,
+            seq_sigreg_loss,
+            span_rec_loss,
+            span_sigreg_loss,
+            seq_lejepa_loss,
+            span_lejepa_loss,
+        )
 
     def apply_step(
         model_in: TextTransformer,
@@ -1463,10 +1551,12 @@ def main() -> None:
     perf_log_time = 0.0
     perf_warmup = args.profile_warmup_steps
     last_loss_val = 0.0
-    last_pred_val = 0.0
-    last_sig_val = 0.0
-    last_predictor_val = 0.0
-    last_full_val = 0.0
+    last_seq_rec_val = 0.0
+    last_seq_sigreg_val = 0.0
+    last_span_rec_val = 0.0
+    last_span_sigreg_val = 0.0
+    last_seq_lejepa_val = 0.0
+    last_span_lejepa_val = 0.0
     if total_samples <= 0:
         raise ValueError("no valid samples found in the dataset")
     epoch_steps = total_samples // global_batch
@@ -1534,7 +1624,16 @@ def main() -> None:
                 device_keys = jax.device_put(device_keys, device=data_sharding)
 
                 compute_start = time.perf_counter()
-                grads, loss, pred, sigreg, predictor_loss, full_loss = grad_step_pmap(
+                (
+                    grads,
+                    loss,
+                    seq_rec,
+                    seq_sigreg,
+                    span_rec,
+                    span_sigreg,
+                    seq_lejepa,
+                    span_lejepa,
+                ) = grad_step_pmap(
                     train_repl,
                     batch_tokens,
                     device_keys,
@@ -1561,29 +1660,37 @@ def main() -> None:
                 log_this_step = (global_step % args.log_every) == 0
                 if log_this_step:
                     loss_val = float(np.mean(jax.device_get(loss)))
-                    pred_val = float(np.mean(jax.device_get(pred)))
-                    sig_val = float(np.mean(jax.device_get(sigreg)))
-                    predictor_val = float(np.mean(jax.device_get(predictor_loss)))
-                    full_val = float(np.mean(jax.device_get(full_loss)))
+                    seq_rec_val = float(np.mean(jax.device_get(seq_rec)))
+                    seq_sigreg_val = float(np.mean(jax.device_get(seq_sigreg)))
+                    span_rec_val = float(np.mean(jax.device_get(span_rec)))
+                    span_sigreg_val = float(np.mean(jax.device_get(span_sigreg)))
+                    seq_lejepa_val = float(np.mean(jax.device_get(seq_lejepa)))
+                    span_lejepa_val = float(np.mean(jax.device_get(span_lejepa)))
                     last_loss_val = loss_val
-                    last_pred_val = pred_val
-                    last_sig_val = sig_val
-                    last_predictor_val = predictor_val
-                    last_full_val = full_val
+                    last_seq_rec_val = seq_rec_val
+                    last_seq_sigreg_val = seq_sigreg_val
+                    last_span_rec_val = span_rec_val
+                    last_span_sigreg_val = span_sigreg_val
+                    last_seq_lejepa_val = seq_lejepa_val
+                    last_span_lejepa_val = span_lejepa_val
 
                     writer.add_scalar("train/total_loss", loss_val, global_step)
-                    writer.add_scalar("train/pred_loss", pred_val, global_step)
-                    writer.add_scalar("train/sigreg_loss", sig_val, global_step)
-                    writer.add_scalar("train/predictor_loss", predictor_val, global_step)
-                    writer.add_scalar("train/full_loss", full_val, global_step)
+                    writer.add_scalar("train/seq_rec_loss", seq_rec_val, global_step)
+                    writer.add_scalar("train/seq_sigreg_loss", seq_sigreg_val, global_step)
+                    writer.add_scalar("train/span_rec_loss", span_rec_val, global_step)
+                    writer.add_scalar("train/span_sigreg_loss", span_sigreg_val, global_step)
+                    writer.add_scalar("train/seq_lejepa_loss", seq_lejepa_val, global_step)
+                    writer.add_scalar("train/span_lejepa_loss", span_lejepa_val, global_step)
 
                 if log_this_step:
                     pbar.set_postfix(
                         total=f"{last_loss_val:.4f}",
-                        pred=f"{last_pred_val:.4f}",
-                        sigreg=f"{last_sig_val:.4f}",
-                        predictor=f"{last_predictor_val:.4f}",
-                        full=f"{last_full_val:.4f}",
+                        seq_rec=f"{last_seq_rec_val:.4f}",
+                        span_rec=f"{last_span_rec_val:.4f}",
+                        seq_sig=f"{last_seq_sigreg_val:.4f}",
+                        span_sig=f"{last_span_sigreg_val:.4f}",
+                        seq_ljp=f"{last_seq_lejepa_val:.4f}",
+                        span_ljp=f"{last_span_lejepa_val:.4f}",
                     )
                 pbar.update(1)
                 global_step += 1
