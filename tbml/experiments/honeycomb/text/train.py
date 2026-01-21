@@ -1296,27 +1296,79 @@ def main() -> None:
                 seed=args.sigreg_seed,
                 axis_name="data",
             )
-            span_targets = _select_span_targets(
-                token_pre[:, total_views, :, :],
-                mask_positions[:, :total_views, :],
-                base_norm=model_inner.final_norm,
-                key=sigreg_key,
-            )
-            span_targets = span_targets[:, None, :]
-            span_sigreg_loss = sigreg_loss_views(
-                span_targets,
-                global_step=global_step,
-                num_slices=args.sigreg_slices,
-                seed=args.sigreg_seed,
-                axis_name="data",
-            )
+            sample_reps = token_pre[:, total_views, :, :]
+            sigreg_global_key, sigreg_local_key = jax.random.split(sigreg_key)
+
+            span_sigreg_loss = jnp.asarray(0.0, dtype=jnp.float32)
+            if args.num_global_views > 0:
+                span_targets_global = _select_span_targets(
+                    sample_reps,
+                    mask_positions[:, : args.num_global_views, :],
+                    base_norm=model_inner.final_norm,
+                    key=sigreg_global_key,
+                )
+                span_targets_global = span_targets_global[:, None, :]
+                span_sigreg_loss = span_sigreg_loss + sigreg_loss_views(
+                    span_targets_global,
+                    global_step=global_step,
+                    num_slices=args.sigreg_slices,
+                    seed=args.sigreg_seed,
+                    axis_name="data",
+                )
+            if args.num_local_views > 0:
+                span_targets_local = _select_span_targets(
+                    sample_reps,
+                    mask_positions[:, args.num_global_views : total_views, :],
+                    base_norm=model_inner.final_norm,
+                    key=sigreg_local_key,
+                )
+                span_targets_local = span_targets_local[:, None, :]
+                span_sigreg_loss = span_sigreg_loss + sigreg_loss_views(
+                    span_targets_local,
+                    global_step=global_step,
+                    num_slices=args.sigreg_slices,
+                    seed=args.sigreg_seed,
+                    axis_name="data",
+                )
             seq_lejepa_loss = (1.0 - args.sigreg_weight) * seq_rec_loss + args.sigreg_weight * seq_sigreg_loss
 
-            predictor_attn = jnp.logical_or(view_attn, mask_positions)
             bsz, num_views, seq_len, dim = token_post.shape
-            flat_tokens = token_post.reshape((bsz * num_views, seq_len, dim))
-            flat_attn = predictor_attn.reshape((bsz * num_views, seq_len))
-            flat_mask = mask_positions.reshape((bsz * num_views, seq_len))
+            if args.num_global_views <= 0:
+                raise ValueError("predictor requires at least one global view")
+            if args.num_local_views <= 0:
+                raise ValueError("predictor requires at least one local view")
+
+            global_key, local_key = jax.random.split(predictor_key)
+            global_idx = jax.random.randint(
+                global_key,
+                shape=(bsz,),
+                minval=0,
+                maxval=args.num_global_views,
+            )
+            local_idx = jax.random.randint(
+                local_key,
+                shape=(bsz,),
+                minval=0,
+                maxval=args.num_local_views,
+            )
+            local_idx = local_idx + args.num_global_views
+
+            batch_idx = jnp.arange(bsz, dtype=jnp.int32)
+            view_tokens_global = token_post[batch_idx, global_idx, :, :]
+            view_tokens_local = token_post[batch_idx, local_idx, :, :]
+            view_masks_global = mask_positions[batch_idx, global_idx, :]
+            view_masks_local = mask_positions[batch_idx, local_idx, :]
+            view_attn_global = view_attn[batch_idx, global_idx, :]
+            view_attn_local = view_attn[batch_idx, local_idx, :]
+
+            view_tokens_sel = jnp.stack([view_tokens_global, view_tokens_local], axis=1)
+            view_masks_sel = jnp.stack([view_masks_global, view_masks_local], axis=1)
+            view_attn_sel = jnp.stack([view_attn_global, view_attn_local], axis=1)
+
+            predictor_attn = jnp.logical_or(view_attn_sel, view_masks_sel)
+            flat_tokens = view_tokens_sel.reshape((bsz * 2, seq_len, dim))
+            flat_attn = predictor_attn.reshape((bsz * 2, seq_len))
+            flat_mask = view_masks_sel.reshape((bsz * 2, seq_len))
 
             pred_reps = model_inner.predictor(
                 flat_tokens,
@@ -1325,12 +1377,12 @@ def main() -> None:
                 train=True,
                 key=predictor_key,
             )
-            pred_reps = pred_reps.reshape((bsz, num_views, seq_len, dim))
+            pred_reps = pred_reps.reshape((bsz, 2, seq_len, dim))
 
             sample_index = total_views
             sample_reps = token_pre[:, sample_index, :, :]
-            view_pred_reps = pred_reps[:, :total_views, :, :]
-            view_masks = mask_positions[:, :total_views, :]
+            view_pred_reps = pred_reps
+            view_masks = view_masks_sel
 
             span_rec_loss = _predictor_span_loss(
                 sample_reps,
