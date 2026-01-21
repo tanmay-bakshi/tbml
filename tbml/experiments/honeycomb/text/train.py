@@ -18,13 +18,14 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec, Sharding
 from tensorboardX import SummaryWriter  # type: ignore[import-untyped]
 from tqdm import tqdm  # type: ignore[import-untyped]
 
-from tbml.experiments.honeycomb.loss import lejepa_loss, sigreg_loss_views
+from tbml.experiments.honeycomb.loss import sigreg_loss_views
 from tbml.experiments.honeycomb.text.dataset import (
     MMapTokenDataset,
     _build_tokenizer,
     iter_text_batches,
 )
 from tbml.experiments.honeycomb.text.model import TextTransformer, TextTransformerConfig
+from tbml.nn import RMSNorm
 from tbml.optimizers import MuonWithAdamWFallback, MuonWithAdamWFallbackState, build_muon_masks
 
 
@@ -53,6 +54,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--d-model", type=int, default=768)
     parser.add_argument("--n-heads", type=int, default=12)
     parser.add_argument("--n-layers", type=int, default=12)
+    parser.add_argument("--predictor-n-layers", type=int, default=None)
     parser.add_argument("--mlp-ratio", type=float, default=4.0)
     parser.add_argument("--attn-dropout", type=float, default=0.0)
     parser.add_argument("--resid-dropout", type=float, default=0.0)
@@ -395,7 +397,7 @@ def _mask_spans(
 ) -> tuple[Array, Array, Array]:
     """Apply span masking to tokens using BART-style text infilling.
 
-    Spans are replaced by a single mask token and the sequence is compacted.
+    Masked tokens are excluded from attention but the sequence length is unchanged.
 
     :param tokens: Token ids of shape (B, T).
     :param key: PRNG key.
@@ -637,6 +639,34 @@ def _combine_views(
     return views, mask_positions, view_attn
 
 
+def _pool_last(
+    reps: Array,
+    attention_mask: Array,
+) -> Array:
+    """Pool the last valid token representation.
+
+    :param reps: Token representations of shape (B, T, D).
+    :param attention_mask: Attention mask of shape (B, T).
+    :returns: Pooled representations of shape (B, D).
+    """
+    if reps.ndim != 3:
+        raise ValueError("reps must have shape (B, T, D)")
+    if attention_mask.ndim != 2:
+        raise ValueError("attention_mask must have shape (B, T)")
+    if reps.shape[:2] != attention_mask.shape:
+        raise ValueError("reps and attention_mask must align on (B, T)")
+
+    mask = attention_mask.astype(bool)
+    positions = jnp.arange(reps.shape[1], dtype=jnp.int32)
+    positions = jnp.broadcast_to(positions[None, :], mask.shape)
+    masked_positions = jnp.where(mask, positions, jnp.full_like(positions, -1))
+    last_idx = jnp.max(masked_positions, axis=1)
+    last_idx = jnp.maximum(last_idx, 0)
+    idx = last_idx[:, None, None]
+    idx = jnp.broadcast_to(idx, (idx.shape[0], 1, reps.shape[-1]))
+    return jnp.take_along_axis(reps, idx, axis=1).squeeze(axis=1)
+
+
 def _encode_views(
     model: TextTransformer,
     tokens: Array,
@@ -651,8 +681,8 @@ def _encode_views(
     local_mask_max: float,
     pad_id: int,
     eos_id: int,
-) -> Array:
-    """Encode masked views into pooled embeddings.
+) -> tuple[Array, Array, Array, Array, Array, Array]:
+    """Encode masked views into pooled embeddings and token representations.
 
     :param model: Text transformer encoder.
     :param tokens: Token ids of shape (B, T).
@@ -666,7 +696,7 @@ def _encode_views(
     :param local_mask_max: Maximum local masking ratio.
     :param pad_id: Padding token id.
     :param eos_id: EOS token id.
-    :returns: Pooled embeddings of shape (B, V, d_model).
+    :returns: Tuple of (pooled_post, pooled_pre, token_post, token_pre, mask_positions, view_attn).
     """
     if num_global_views + num_local_views <= 0:
         raise ValueError("at least one view must be requested")
@@ -702,11 +732,108 @@ def _encode_views(
         local_attn,
     )
 
+    sample_view = tokens[:, None, :]
+    sample_mask = jnp.zeros_like(sample_view, dtype=jnp.bool_)
+    sample_attn = tokens != pad_id
+    sample_attn = sample_attn[:, None, :]
+
+    views = jnp.concatenate([views, sample_view], axis=1)
+    mask_positions = jnp.concatenate([_mask_positions, sample_mask], axis=1)
+    view_attn = jnp.concatenate([view_attn, sample_attn], axis=1)
+
     bsz, num_views, seq_len = views.shape
     flat_views = views.reshape((bsz * num_views, seq_len))
     flat_mask = view_attn.reshape((bsz * num_views, seq_len))
-    _token_reps, pooled = model(flat_views, flat_mask, train=train, key=model_key)
-    return pooled.reshape((bsz, num_views, pooled.shape[-1]))
+    reps_pre, reps_post, pooled_post = model.forward_with_intermediates(
+        flat_views,
+        flat_mask,
+        train=train,
+        key=model_key,
+    )
+    pooled_pre = _pool_last(reps_pre, flat_mask)
+    token_pre = reps_pre.reshape((bsz, num_views, seq_len, reps_pre.shape[-1]))
+    token_post = reps_post.reshape((bsz, num_views, seq_len, reps_post.shape[-1]))
+    pooled_post = pooled_post.reshape((bsz, num_views, pooled_post.shape[-1]))
+    pooled_pre = pooled_pre.reshape((bsz, num_views, pooled_pre.shape[-1]))
+    return pooled_post, pooled_pre, token_post, token_pre, mask_positions, view_attn
+
+
+def _span_ids(mask: Array) -> Array:
+    """Assign a span id to each masked position.
+
+    :param mask: Boolean mask of shape (T,).
+    :returns: Integer span ids of shape (T,), 0 for unmasked positions.
+    """
+    if mask.ndim != 1:
+        raise ValueError("mask must be 1D")
+    mask_int = mask.astype(jnp.int32)
+    prev = jnp.concatenate([jnp.zeros((1,), dtype=jnp.int32), mask_int[:-1]])
+    start = jnp.logical_and(mask_int == 1, prev == 0)
+    span_ids = jnp.cumsum(start.astype(jnp.int32)) * mask_int
+    return span_ids
+
+
+def _predictor_span_loss(
+    sample_reps: Array,
+    view_reps: Array,
+    mask_positions: Array,
+    *,
+    base_norm: RMSNorm,
+    predictor_norm: RMSNorm,
+) -> Array:
+    """Compute predictor span reconstruction loss for a batch of views.
+
+    :param sample_reps: Sample token reps of shape (B, T, D) pre-base-norm.
+    :param view_reps: Predictor reps of shape (B, V, T, D) pre-predictor-norm.
+    :param mask_positions: Mask positions of shape (B, V, T).
+    :param base_norm: Base model RMSNorm module.
+    :param predictor_norm: Predictor RMSNorm module.
+    :returns: Scalar loss.
+    """
+    if sample_reps.ndim != 3:
+        raise ValueError("sample_reps must have shape (B, T, D)")
+    if view_reps.ndim != 4:
+        raise ValueError("view_reps must have shape (B, V, T, D)")
+    if mask_positions.ndim != 3:
+        raise ValueError("mask_positions must have shape (B, V, T)")
+    if view_reps.shape[:3] != mask_positions.shape:
+        raise ValueError("view_reps and mask_positions must align on (B, V, T)")
+    if sample_reps.shape[0] != view_reps.shape[0]:
+        raise ValueError("batch sizes must match")
+    if sample_reps.shape[1] != view_reps.shape[2]:
+        raise ValueError("sequence lengths must match")
+
+    num_segments = sample_reps.shape[1] + 1
+
+    def _loss_for_view(
+        sample_rep: Array,
+        view_rep: Array,
+        mask: Array,
+    ) -> Array:
+        span_ids = _span_ids(mask)
+        sum_sample = jax.ops.segment_sum(sample_rep, span_ids, num_segments)
+        sum_view = jax.ops.segment_sum(view_rep, span_ids, num_segments)
+        counts = jax.ops.segment_sum(mask.astype(jnp.float32), span_ids, num_segments)
+        denom = jnp.maximum(counts[:, None], 1.0)
+        mean_sample = sum_sample / denom
+        mean_view = sum_view / denom
+        mean_sample = base_norm(mean_sample).astype(jnp.float32)
+        mean_view = predictor_norm(mean_view).astype(jnp.float32)
+        mse = jnp.mean(jnp.square(mean_sample - mean_view), axis=-1)
+        valid = counts > 0
+        valid_count = jnp.sum(valid)
+        return jnp.where(valid_count > 0, jnp.sum(mse * valid) / valid_count, 0.0)
+
+    def _loss_for_sample(
+        sample_rep: Array,
+        view_rep: Array,
+        mask: Array,
+    ) -> Array:
+        view_losses = jax.vmap(_loss_for_view, in_axes=(None, 0, 0))(sample_rep, view_rep, mask)
+        return jnp.mean(view_losses)
+
+    losses = jax.vmap(_loss_for_sample, in_axes=(0, 0, 0))(sample_reps, view_reps, mask_positions)
+    return jnp.mean(losses)
 
 
 def _save_checkpoint(
@@ -884,12 +1011,19 @@ def main() -> None:
 
     run_dir = _build_run_dir(args.runs_folder)
 
+    predictor_layers = args.predictor_n_layers
+    if predictor_layers is None:
+        predictor_layers = args.n_layers
+    if predictor_layers <= 0:
+        raise ValueError("predictor-n-layers must be > 0")
+
     model_config = TextTransformerConfig(
         vocab_size=vocab_size,
         max_seq_len=max_seq_len,
         d_model=args.d_model,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
+        predictor_n_layers=int(predictor_layers),
         mlp_ratio=args.mlp_ratio,
         attn_dropout=args.attn_dropout,
         resid_dropout=args.resid_dropout,
@@ -1026,7 +1160,7 @@ def main() -> None:
         global_step: Array,
         micro_step0: Array,
         micro_steps: Array,
-    ) -> tuple[eqx.Module, Array, Array, Array]:
+    ) -> tuple[eqx.Module, Array, Array, Array, Array, Array]:
         """Compute accumulated gradients and metrics across micro-steps.
 
         :param model_in: Replicated model.
@@ -1035,26 +1169,34 @@ def main() -> None:
         :param global_step: Global step index for loss scheduling.
         :param micro_step0: Starting micro-step index for RNG folding.
         :param micro_steps: Number of valid micro-steps in the batch.
-        :returns: Tuple of (grads, model loss, pred loss, sigreg loss).
+        :returns: Tuple of (grads, total loss, pred loss, sigreg loss, predictor loss, full loss).
         """
 
         def _loss_fn(
             model_inner: TextTransformer,
             tokens: Array,
             tokens_key: Array,
-        ) -> tuple[Array, tuple[Array, Array]]:
+        ) -> tuple[Array, tuple[Array, Array, Array, Array]]:
             """Compute the total loss and its components.
 
             :param model_inner: Model replica used for the loss computation.
             :param tokens: Token batch of shape (B, T).
             :param tokens_key: PRNG key for masking.
-            :returns: Tuple of (total loss, (prediction loss, sigreg loss)).
+            :returns: Tuple of (full loss, (total loss, pred loss, sigreg loss, predictor loss)).
             """
-            emb = _encode_views(
+            view_key, predictor_key = jax.random.split(tokens_key)
+            (
+                pooled_post,
+                pooled_pre,
+                token_post,
+                token_pre,
+                mask_positions,
+                view_attn,
+            ) = _encode_views(
                 model_inner,
                 tokens,
                 train=True,
-                key=tokens_key,
+                key=view_key,
                 num_global_views=args.num_global_views,
                 num_local_views=args.num_local_views,
                 global_mask_min=args.global_mask_min,
@@ -1064,18 +1206,65 @@ def main() -> None:
                 pad_id=pad_id,
                 eos_id=eos_id,
             )
-            emb = emb.astype(jnp.float32)
-            total, pred, sigreg = lejepa_loss(
-                emb,
-                args.num_global_views,
-                sigreg_weight=args.sigreg_weight,
-                pred_loss_type=args.pred_loss,
+
+            total_views = args.num_global_views + args.num_local_views
+            pooled_post_views = pooled_post[:, :total_views, :]
+            pooled_pre_global = pooled_pre[:, : args.num_global_views, :]
+            center_pre = jnp.mean(pooled_pre_global, axis=1)
+            center = model_inner.final_norm(center_pre)
+            pooled_post_views = pooled_post_views.astype(jnp.float32)
+            center = center.astype(jnp.float32)
+
+            if args.pred_loss == "mse":
+                diffs = pooled_post_views - center[:, None, :]
+                pred_loss = jnp.mean(jnp.square(diffs))
+            else:
+                eps = jnp.asarray(1e-8, dtype=pooled_post_views.dtype)
+                emb_norm = pooled_post_views / (jnp.linalg.norm(pooled_post_views, axis=-1, keepdims=True) + eps)
+                ctr_norm = center / (jnp.linalg.norm(center, axis=-1, keepdims=True) + eps)
+                cos_sim = jnp.sum(emb_norm * ctr_norm[:, None, :], axis=-1)
+                pred_loss = jnp.mean(1.0 - cos_sim)
+
+            sigreg = sigreg_loss_views(
+                pooled_post_views,
                 global_step=global_step,
                 num_slices=args.sigreg_slices,
                 seed=args.sigreg_seed,
                 axis_name="data",
             )
-            return total, (pred, sigreg)
+
+            total_loss = (1.0 - args.sigreg_weight) * pred_loss + args.sigreg_weight * sigreg
+
+            predictor_attn = jnp.logical_or(view_attn, mask_positions)
+            bsz, num_views, seq_len, dim = token_post.shape
+            flat_tokens = token_post.reshape((bsz * num_views, seq_len, dim))
+            flat_attn = predictor_attn.reshape((bsz * num_views, seq_len))
+            flat_mask = mask_positions.reshape((bsz * num_views, seq_len))
+
+            pred_reps = model_inner.predictor(
+                flat_tokens,
+                flat_attn,
+                flat_mask,
+                train=True,
+                key=predictor_key,
+            )
+            pred_reps = pred_reps.reshape((bsz, num_views, seq_len, dim))
+
+            sample_index = total_views
+            sample_reps = token_pre[:, sample_index, :, :]
+            view_pred_reps = pred_reps[:, :total_views, :, :]
+            view_masks = mask_positions[:, :total_views, :]
+
+            predictor_loss = _predictor_span_loss(
+                sample_reps,
+                view_pred_reps,
+                view_masks,
+                base_norm=model_inner.final_norm,
+                predictor_norm=model_inner.predictor.final_norm,
+            )
+
+            full_loss = total_loss + predictor_loss
+            return full_loss, (total_loss, pred_loss, sigreg, predictor_loss)
 
         value_and_grad = eqx.filter_value_and_grad(_loss_fn, has_aux=True)
         params_only = eqx.filter(model_in, eqx.is_array)
@@ -1086,26 +1275,28 @@ def main() -> None:
         loss_init = jnp.asarray(0.0, dtype=jnp.float32)
         pred_init = jnp.asarray(0.0, dtype=jnp.float32)
         sigreg_init = jnp.asarray(0.0, dtype=jnp.float32)
+        predictor_init = jnp.asarray(0.0, dtype=jnp.float32)
+        full_init = jnp.asarray(0.0, dtype=jnp.float32)
 
         step_indices = jnp.arange(batch_tokens.shape[0], dtype=jnp.int32)
 
         def _accum_body(
-            carry: tuple[eqx.Module, Array, Array, Array],
+            carry: tuple[eqx.Module, Array, Array, Array, Array, Array],
             inputs: tuple[Array, Array],
-        ) -> tuple[tuple[eqx.Module, Array, Array, Array], None]:
+        ) -> tuple[tuple[eqx.Module, Array, Array, Array, Array, Array], None]:
             """Accumulate gradients and metrics for one micro-step.
 
-            :param carry: Tuple of (grads, loss, pred loss, sigreg loss).
+            :param carry: Tuple of (grads, loss, pred loss, sigreg loss, predictor loss, full loss).
             :param inputs: Tuple of (micro step index, token batch).
             :returns: Updated carry and unused output.
             """
-            grads_acc, loss_acc, pred_acc, sigreg_acc = carry
+            grads_acc, loss_acc, pred_acc, sigreg_acc, predictor_acc, full_acc = carry
             step_idx, tokens = inputs
             step_idx_global = micro_step0 + step_idx
             tokens_key = jax.random.fold_in(key, step_idx_global)
 
-            def _do_compute(_: None) -> tuple[eqx.Module, Array, Array, Array]:
-                (loss, (pred_loss, sigreg_loss)), grads = value_and_grad(
+            def _do_compute(_: None) -> tuple[eqx.Module, Array, Array, Array, Array, Array]:
+                (full_loss, (loss, pred_loss, sigreg_loss, predictor_loss)), grads = value_and_grad(
                     model_in,
                     tokens,
                     tokens_key,
@@ -1115,18 +1306,20 @@ def main() -> None:
                 loss_accum = loss_acc + loss
                 pred_accum = pred_acc + pred_loss
                 sigreg_accum = sigreg_acc + sigreg_loss
-                return grads_accum, loss_accum, pred_accum, sigreg_accum
+                predictor_accum = predictor_acc + predictor_loss
+                full_accum = full_acc + full_loss
+                return grads_accum, loss_accum, pred_accum, sigreg_accum, predictor_accum, full_accum
 
-            def _skip_compute(_: None) -> tuple[eqx.Module, Array, Array, Array]:
-                return grads_acc, loss_acc, pred_acc, sigreg_acc
+            def _skip_compute(_: None) -> tuple[eqx.Module, Array, Array, Array, Array, Array]:
+                return grads_acc, loss_acc, pred_acc, sigreg_acc, predictor_acc, full_acc
 
             active = step_idx < micro_steps
             new_carry = jax.lax.cond(active, _do_compute, _skip_compute, operand=None)
             return new_carry, None
 
-        (grads, loss, pred_loss, sigreg_loss), _ = jax.lax.scan(
+        (grads, loss, pred_loss, sigreg_loss, predictor_loss, full_loss), _ = jax.lax.scan(
             _accum_body,
-            (grad_init, loss_init, pred_init, sigreg_init),
+            (grad_init, loss_init, pred_init, sigreg_init, predictor_init, full_init),
             (step_indices, batch_tokens),
         )
 
@@ -1139,12 +1332,16 @@ def main() -> None:
         loss = loss / scale
         pred_loss = pred_loss / scale
         sigreg_loss = sigreg_loss / scale
+        predictor_loss = predictor_loss / scale
+        full_loss = full_loss / scale
 
         grads = jax.lax.pmean(grads, axis_name="data")
         loss = jax.lax.pmean(loss, axis_name="data")
         pred_loss = jax.lax.pmean(pred_loss, axis_name="data")
         sigreg_loss = jax.lax.pmean(sigreg_loss, axis_name="data")
-        return grads, loss, pred_loss, sigreg_loss
+        predictor_loss = jax.lax.pmean(predictor_loss, axis_name="data")
+        full_loss = jax.lax.pmean(full_loss, axis_name="data")
+        return grads, loss, pred_loss, sigreg_loss, predictor_loss, full_loss
 
     def apply_step(
         model_in: TextTransformer,
@@ -1191,6 +1388,8 @@ def main() -> None:
     last_loss_val = 0.0
     last_pred_val = 0.0
     last_sig_val = 0.0
+    last_predictor_val = 0.0
+    last_full_val = 0.0
     if total_samples <= 0:
         raise ValueError("no valid samples found in the dataset")
     epoch_steps = total_samples // global_batch
@@ -1258,7 +1457,7 @@ def main() -> None:
                 device_keys = jax.device_put(device_keys, device=data_sharding)
 
                 compute_start = time.perf_counter()
-                grads, loss, pred, sigreg = grad_step_pmap(
+                grads, loss, pred, sigreg, predictor_loss, full_loss = grad_step_pmap(
                     train_repl,
                     batch_tokens,
                     device_keys,
@@ -1287,19 +1486,27 @@ def main() -> None:
                     loss_val = float(np.mean(jax.device_get(loss)))
                     pred_val = float(np.mean(jax.device_get(pred)))
                     sig_val = float(np.mean(jax.device_get(sigreg)))
+                    predictor_val = float(np.mean(jax.device_get(predictor_loss)))
+                    full_val = float(np.mean(jax.device_get(full_loss)))
                     last_loss_val = loss_val
                     last_pred_val = pred_val
                     last_sig_val = sig_val
+                    last_predictor_val = predictor_val
+                    last_full_val = full_val
 
                     writer.add_scalar("train/total_loss", loss_val, global_step)
                     writer.add_scalar("train/pred_loss", pred_val, global_step)
                     writer.add_scalar("train/sigreg_loss", sig_val, global_step)
+                    writer.add_scalar("train/predictor_loss", predictor_val, global_step)
+                    writer.add_scalar("train/full_loss", full_val, global_step)
 
                 if log_this_step:
                     pbar.set_postfix(
                         total=f"{last_loss_val:.4f}",
                         pred=f"{last_pred_val:.4f}",
                         sigreg=f"{last_sig_val:.4f}",
+                        predictor=f"{last_predictor_val:.4f}",
+                        full=f"{last_full_val:.4f}",
                     )
                 pbar.update(1)
                 global_step += 1

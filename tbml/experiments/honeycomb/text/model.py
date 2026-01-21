@@ -27,6 +27,7 @@ class TextTransformerConfig(BaseModel):
     :ivar attn_type: Attention type ("pope" or "rope").
     :ivar embed_norm: Whether to apply RMSNorm to token embeddings and unembedding weights.
     :ivar embed_norm_scale: Scale applied after embedding RMSNorm.
+    :ivar predictor_n_layers: Number of predictor blocks.
     """
 
     vocab_size: int = Field(default=50257)
@@ -43,6 +44,7 @@ class TextTransformerConfig(BaseModel):
     attn_type: str = Field(default="pope")
     embed_norm: bool = Field(default=False)
     embed_norm_scale: float = Field(default=1.0)
+    predictor_n_layers: int = Field(default=2)
 
 
 class TokenEmbedding(eqx.Module):
@@ -274,6 +276,254 @@ class TextTransformerBlock(eqx.Module):
         return x + mlp_out
 
 
+class PredictorBlock(eqx.Module):
+    """Transformer block for the predictor network."""
+
+    norm1: RMSNorm
+    attn: PoPESelfAttention | RoPESelfAttention
+    drop_path1: DropPath
+    norm2: RMSNorm
+    mlp: SwiGLUFeedForward
+    drop_path2: DropPath
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        mlp_hidden_dim: int,
+        *,
+        attn_dropout: float,
+        resid_dropout: float,
+        drop_path_prob: float,
+        pope_base: float,
+        attn_type: str,
+        dtype: jnp.dtype,
+        param_dtype: jnp.dtype,
+        qkv_kernel_init: Initializer,
+        o_kernel_init: Initializer,
+        mlp_kernel_init: Initializer,
+        key: Array,
+    ) -> None:
+        """Initialize the predictor transformer block.
+
+        :param d_model: Model width.
+        :param n_heads: Number of attention heads.
+        :param mlp_hidden_dim: Hidden dimension of the MLP.
+        :param attn_dropout: Attention dropout probability.
+        :param resid_dropout: Residual dropout probability.
+        :param drop_path_prob: DropPath probability for this block.
+        :param pope_base: Base for PoPE/RoPE frequencies.
+        :param attn_type: Attention type ("pope" or "rope").
+        :param dtype: Compute dtype.
+        :param param_dtype: Parameter dtype.
+        :param qkv_kernel_init: Initializer for Q/K/V projections.
+        :param o_kernel_init: Initializer for output projection.
+        :param mlp_kernel_init: Initializer for MLP projections.
+        :param key: PRNG key for parameter initialization.
+        """
+        norm1_key, norm2_key, attn_key, mlp_key = jax.random.split(key, 4)
+
+        self.norm1 = RMSNorm(d_model, dtype=dtype, param_dtype=param_dtype)
+        if attn_type == "pope":
+            self.attn = PoPESelfAttention(
+                d_model=d_model,
+                n_heads=n_heads,
+                n_kv_heads=n_heads,
+                attn_dropout=attn_dropout,
+                resid_dropout=resid_dropout,
+                is_causal=False,
+                base=pope_base,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                qkv_kernel_init=qkv_kernel_init,
+                o_kernel_init=o_kernel_init,
+                key=attn_key,
+            )
+        elif attn_type == "rope":
+            self.attn = RoPESelfAttention(
+                d_model=d_model,
+                n_heads=n_heads,
+                n_kv_heads=n_heads,
+                attn_dropout=attn_dropout,
+                resid_dropout=resid_dropout,
+                is_causal=False,
+                base=pope_base,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                qkv_kernel_init=qkv_kernel_init,
+                o_kernel_init=o_kernel_init,
+                key=attn_key,
+            )
+        else:
+            raise ValueError("attn_type must be 'pope' or 'rope'")
+        self.drop_path1 = DropPath(drop_path_prob)
+        self.norm2 = RMSNorm(d_model, dtype=dtype, param_dtype=param_dtype)
+        self.mlp = SwiGLUFeedForward(
+            d_model=d_model,
+            hidden_dim=mlp_hidden_dim,
+            resid_dropout=resid_dropout,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            gate_up_kernel_init=mlp_kernel_init,
+            down_kernel_init=mlp_kernel_init,
+            key=mlp_key,
+        )
+        self.drop_path2 = DropPath(drop_path_prob)
+        _ = norm1_key
+        _ = norm2_key
+
+    def __call__(
+        self,
+        x: Array,
+        *,
+        attention_mask: Array,
+        train: bool,
+        key: Array | None,
+    ) -> Array:
+        """Apply the predictor block.
+
+        :param x: Input tensor of shape (B, T, d_model).
+        :param attention_mask: Attention mask of shape (B, T).
+        :param train: Whether to enable dropout.
+        :param key: PRNG key for dropout and DropPath.
+        :returns: Output tensor of shape (B, T, d_model).
+        """
+        if key is None:
+            attn_key = None
+            mlp_key = None
+            drop1_key = None
+            drop2_key = None
+        else:
+            attn_key, mlp_key, drop1_key, drop2_key = jax.random.split(key, 4)
+
+        attn_out = self.attn(self.norm1(x), train=train, key=attn_key, attention_mask=attention_mask)
+        attn_out = self.drop_path1(attn_out, train=train, key=drop1_key)
+        x = x + attn_out
+
+        mlp_out = self.mlp(self.norm2(x), train=train, key=mlp_key)
+        mlp_out = self.drop_path2(mlp_out, train=train, key=drop2_key)
+        return x + mlp_out
+
+
+class Predictor(eqx.Module):
+    """Predictor network applied to token-level representations."""
+
+    dtype: jnp.dtype = eqx.field(static=True)
+    max_seq_len: int
+    mask_tokens: Array
+    blocks: tuple[PredictorBlock, ...]
+    final_norm: RMSNorm
+
+    def __init__(
+        self,
+        config: TextTransformerConfig,
+        *,
+        dtype: jnp.dtype,
+        param_dtype: jnp.dtype,
+        qkv_kernel_init: Initializer,
+        o_kernel_init: Initializer,
+        mlp_kernel_init: Initializer,
+        key: Array,
+    ) -> None:
+        """Initialize the predictor network.
+
+        :param config: Base model configuration.
+        :param dtype: Compute dtype.
+        :param param_dtype: Parameter dtype.
+        :param qkv_kernel_init: Initializer for Q/K/V projections.
+        :param o_kernel_init: Initializer for output projection.
+        :param mlp_kernel_init: Initializer for MLP projections.
+        :param key: PRNG key for parameter initialization.
+        """
+        if config.predictor_n_layers <= 0:
+            raise ValueError("predictor_n_layers must be > 0")
+        if config.max_seq_len <= 0:
+            raise ValueError("max_seq_len must be > 0")
+
+        self.dtype = dtype
+        self.max_seq_len = config.max_seq_len
+
+        init = truncated_normal_init(config.init_std)
+        keys = jax.random.split(key, 2 + config.predictor_n_layers)
+        mask_key = keys[0]
+        block_keys = keys[1 : 1 + config.predictor_n_layers]
+        norm_key = keys[-1]
+
+        self.mask_tokens = init(mask_key, (config.max_seq_len, config.d_model), param_dtype)
+
+        mlp_hidden_dim = int(config.d_model * config.mlp_ratio)
+        if mlp_hidden_dim <= 0:
+            raise ValueError("mlp_hidden_dim must be > 0")
+
+        drop_rates = _build_drop_rates(config.drop_path_rate, config.predictor_n_layers)
+        blocks: list[PredictorBlock] = []
+        for idx in range(config.predictor_n_layers):
+            blocks.append(
+                PredictorBlock(
+                    d_model=config.d_model,
+                    n_heads=config.n_heads,
+                    mlp_hidden_dim=mlp_hidden_dim,
+                    attn_dropout=config.attn_dropout,
+                    resid_dropout=config.resid_dropout,
+                    drop_path_prob=drop_rates[idx],
+                    pope_base=config.pope_base,
+                    attn_type=config.attn_type,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    qkv_kernel_init=qkv_kernel_init,
+                    o_kernel_init=o_kernel_init,
+                    mlp_kernel_init=mlp_kernel_init,
+                    key=block_keys[idx],
+                )
+            )
+        self.blocks = tuple(blocks)
+        self.final_norm = RMSNorm(config.d_model, dtype=dtype, param_dtype=param_dtype)
+        _ = norm_key
+
+    def __call__(
+        self,
+        reps: Array,
+        attention_mask: Array,
+        mask_positions: Array,
+        *,
+        train: bool,
+        key: Array | None,
+    ) -> Array:
+        """Apply the predictor to token representations.
+
+        :param reps: Token representations of shape (B, T, d_model).
+        :param attention_mask: Attention mask of shape (B, T).
+        :param mask_positions: Boolean mask positions of shape (B, T).
+        :param train: Whether to enable dropout.
+        :param key: PRNG key for dropout and DropPath.
+        :returns: Predictor outputs prior to final norm, shape (B, T, d_model).
+        """
+        if reps.ndim != 3:
+            raise ValueError("reps must have shape (B, T, d_model)")
+        if attention_mask.ndim != 2:
+            raise ValueError("attention_mask must have shape (B, T)")
+        if mask_positions.ndim != 2:
+            raise ValueError("mask_positions must have shape (B, T)")
+        if reps.shape[:2] != attention_mask.shape or reps.shape[:2] != mask_positions.shape:
+            raise ValueError("inputs must agree on batch and sequence dimensions")
+        if reps.shape[1] > self.max_seq_len:
+            raise ValueError("sequence length exceeds predictor max_seq_len")
+
+        seq_len = reps.shape[1]
+        mask_tokens = self.mask_tokens[:seq_len].astype(reps.dtype)
+        mask_tokens = jnp.broadcast_to(mask_tokens[None, :, :], reps.shape)
+        x = jnp.where(mask_positions[..., None], mask_tokens, reps)
+
+        if key is None:
+            block_keys: list[Array | None] = [None] * len(self.blocks)
+        else:
+            block_keys = list(jax.random.split(key, len(self.blocks)))
+
+        for block, block_key in zip(self.blocks, block_keys):
+            x = block(x, attention_mask=attention_mask, train=train, key=block_key)
+        return x
+
+
 class TextTransformer(eqx.Module):
     """Text encoder for LeJEPA with positional attention."""
 
@@ -281,6 +531,7 @@ class TextTransformer(eqx.Module):
         r"^token_embed\..*$",
         r"^.*norm\d*\..*$",
         r"^final_norm\..*$",
+        r"^predictor\.final_norm\..*$",
         r"^.*attn\.delta$",
     ]
 
@@ -288,6 +539,7 @@ class TextTransformer(eqx.Module):
     token_embed: TokenEmbedding
     blocks: tuple[TextTransformerBlock, ...]
     final_norm: RMSNorm
+    predictor: Predictor
 
     def __init__(
         self,
@@ -380,7 +632,15 @@ class TextTransformer(eqx.Module):
 
         self.blocks = tuple(blocks)
         self.final_norm = RMSNorm(config.d_model, dtype=dtype, param_dtype=param_dtype)
-        _ = final_key
+        self.predictor = Predictor(
+            config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            qkv_kernel_init=init,
+            o_kernel_init=init,
+            mlp_kernel_init=init,
+            key=final_key,
+        )
 
     def __call__(
         self,
@@ -407,6 +667,39 @@ class TextTransformer(eqx.Module):
         if tokens.shape[1] > self.config.max_seq_len:
             raise ValueError("sequence length exceeds max_seq_len")
 
+        _reps_pre, reps_post, pooled = self.forward_with_intermediates(
+            tokens,
+            attention_mask,
+            train=train,
+            key=key,
+        )
+        return reps_post, pooled
+
+    def forward_with_intermediates(
+        self,
+        tokens: Array,
+        attention_mask: Array,
+        *,
+        train: bool,
+        key: Array | None,
+    ) -> tuple[Array, Array, Array]:
+        """Compute pre-norm tokens, post-norm tokens, and pooled embeddings.
+
+        :param tokens: Token ids of shape (B, T).
+        :param attention_mask: Attention mask of shape (B, T).
+        :param train: Whether to enable dropout.
+        :param key: PRNG key for dropout and DropPath.
+        :returns: Tuple of (pre_norm_tokens, post_norm_tokens, pooled).
+        """
+        if tokens.ndim != 2:
+            raise ValueError("tokens must have shape (B, T)")
+        if attention_mask.ndim != 2:
+            raise ValueError("attention_mask must have shape (B, T)")
+        if tokens.shape != attention_mask.shape:
+            raise ValueError("tokens and attention_mask must have the same shape")
+        if tokens.shape[1] > self.config.max_seq_len:
+            raise ValueError("sequence length exceeds max_seq_len")
+
         reps = self.token_embed(tokens)
         if key is None:
             block_keys: list[Array | None] = [None] * len(self.blocks)
@@ -416,18 +709,19 @@ class TextTransformer(eqx.Module):
         for block, block_key in zip(self.blocks, block_keys):
             reps = block(reps, attention_mask=attention_mask, train=train, key=block_key)
 
-        reps = self.final_norm(reps)
+        reps_pre = reps
+        reps_post = self.final_norm(reps_pre)
 
         mask = attention_mask.astype(bool)
-        positions = jnp.arange(reps.shape[1], dtype=jnp.int32)
+        positions = jnp.arange(reps_post.shape[1], dtype=jnp.int32)
         positions = jnp.broadcast_to(positions[None, :], mask.shape)
         masked_positions = jnp.where(mask, positions, jnp.full_like(positions, -1))
         last_idx = jnp.max(masked_positions, axis=1)
         last_idx = jnp.maximum(last_idx, 0)
         idx = last_idx[:, None, None]
-        idx = jnp.broadcast_to(idx, (idx.shape[0], 1, reps.shape[-1]))
-        pooled = jnp.take_along_axis(reps, idx, axis=1).squeeze(axis=1)
-        return reps, pooled
+        idx = jnp.broadcast_to(idx, (idx.shape[0], 1, reps_post.shape[-1]))
+        pooled = jnp.take_along_axis(reps_post, idx, axis=1).squeeze(axis=1)
+        return reps_pre, reps_post, pooled
 
 
 def _build_drop_rates(drop_path_rate: float, total_layers: int) -> list[float]:
