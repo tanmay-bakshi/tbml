@@ -1406,7 +1406,7 @@ def main() -> None:
             view_masks = view_masks_sel
 
             span_rec_loss = _predictor_span_loss(
-                sample_reps,
+                jax.lax.stop_gradient(sample_reps),
                 view_pred_reps,
                 view_masks,
                 base_norm=model_inner.final_norm,
