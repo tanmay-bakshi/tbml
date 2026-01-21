@@ -183,16 +183,11 @@ def _prepare_batch(
         token_ids = list(encoding.ids)
         if len(token_ids) > max_seq_len - 1:
             token_ids = token_ids[: max_seq_len - 1]
-        token_ids.append(int(eos_id))
         token_ids_per_sample.append(token_ids)
         length = min(len(token_ids), max_seq_len)
         if length > 0:
             tokens[row, :length] = np.asarray(token_ids[:length], dtype=np.int32)
             attention_mask[row, :length] = True
-    eos_positions = tokens == eos_id
-    if eos_positions.any():
-        tokens = np.where(eos_positions, pad_id, tokens)
-        attention_mask = np.where(eos_positions, False, attention_mask)
     return tokens, attention_mask, labels, token_ids_per_sample
 
 
