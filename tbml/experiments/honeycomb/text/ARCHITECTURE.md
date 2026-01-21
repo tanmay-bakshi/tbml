@@ -132,7 +132,7 @@ span_lejepa_loss = (1 - sigreg_weight) * span_rec_loss + sigreg_weight * span_si
 decoder_loss = cross_entropy(decoder_logits, decoder_targets)
 ```
 
-Each **masked span** is treated as an independent decoder sample:
+Each view contributes **one randomly selected masked span** as an independent decoder sample:
 
 - Input sequence: `[BOS] + span_tokens`
 - Target sequence: `span_tokens + [EOS]`

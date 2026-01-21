@@ -853,7 +853,7 @@ def _decoder_loss(
     span_batch: int,
     key: Array,
 ) -> Array:
-    """Compute decoder autoregressive loss over masked spans.
+    """Compute decoder autoregressive loss over sampled masked spans.
 
     :param model: TextTransformer containing the decoder and embeddings.
     :param sample_tokens: Token ids of shape (B, T) with EOS removed.
@@ -888,8 +888,9 @@ def _decoder_loss(
     sample_tokens_flat = jnp.repeat(sample_tokens, repeats=num_views, axis=0)
 
     positions = jnp.arange(seq_len, dtype=jnp.int32)
+    flat_keys = jax.random.split(key, flat_masks.shape[0])
 
-    def _span_meta(mask: Array) -> tuple[Array, Array]:
+    def _pick_span(mask: Array, span_key: Array) -> tuple[Array, Array, Array]:
         span_ids = _span_ids(mask)
         pos_for_min = jnp.where(span_ids > 0, positions, jnp.full_like(positions, seq_len))
         pos_for_max = jnp.where(span_ids > 0, positions, jnp.full_like(positions, -1))
@@ -897,13 +898,23 @@ def _decoder_loss(
         end = jax.ops.segment_max(pos_for_max, span_ids, seq_len + 1)
         length = jnp.where(end >= start, end - start + 1, 0)
         length = length.at[0].set(0)
-        return start, length
+        valid = length > 0
+        valid = valid.at[0].set(False)
+        count = jnp.sum(valid)
 
-    starts, lengths = jax.vmap(_span_meta)(flat_masks)
-    span_starts = starts.reshape((-1,))
-    span_lengths = lengths.reshape((-1,))
-    view_idx = jnp.repeat(jnp.arange(flat_masks.shape[0], dtype=jnp.int32), seq_len + 1)
-    span_valid = span_lengths > 0
+        def _choose() -> tuple[Array, Array, Array]:
+            probs = valid.astype(jnp.float32)
+            probs = probs / jnp.sum(probs)
+            idx = jax.random.choice(span_key, valid.shape[0], p=probs)
+            return start[idx], length[idx], jnp.asarray(True)
+
+        def _fallback() -> tuple[Array, Array, Array]:
+            return jnp.asarray(0, dtype=jnp.int32), jnp.asarray(0, dtype=jnp.int32), jnp.asarray(False)
+
+        return jax.lax.cond(count > 0, _choose, _fallback)
+
+    span_starts, span_lengths, span_valid = jax.vmap(_pick_span)(flat_masks, flat_keys)
+    view_idx = jnp.arange(flat_masks.shape[0], dtype=jnp.int32)
 
     total_spans = int(span_starts.shape[0])
     pad_needed = (-total_spans) % span_batch
