@@ -52,6 +52,7 @@ class MuonWithAdamWFallback:
     :ivar muon_nesterov: Whether to use Nesterov momentum in Muon.
     :ivar muon_n_steps: Number of Newton-Schulz steps.
     :ivar muon_ns_eps: Epsilon for Newton-Schulz normalization.
+    :ivar muon_target_update_rms: Target RMS for Muon updates.
     :ivar adamw_learning_rate: Learning rate for AdamW fallback.
     :ivar adamw_betas: AdamW beta coefficients for fallback.
     :ivar adamw_eps: AdamW epsilon for fallback.
@@ -67,6 +68,7 @@ class MuonWithAdamWFallback:
     muon_nesterov: bool = True
     muon_n_steps: int = 5
     muon_ns_eps: float = 1e-7
+    muon_target_update_rms: float = 0.2
 
     adamw_learning_rate: float = 1e-3
     adamw_betas: tuple[float, float] = (0.9, 0.999)
@@ -123,15 +125,28 @@ class MuonWithAdamWFallback:
         bias_correction2 = jnp.asarray(1.0, dtype=jnp.float32) - jnp.power(b2, step_f)
 
         def _muon_orthogonalize(update: Array, use_qkv: bool) -> Array:
+            """Orthogonalize with Newton–Schulz and apply Moonshot RMS-matching scaling.
+
+            :param update: Raw (Nesterov) update matrix.
+            :param use_qkv: Whether to apply the QKV special-casing.
+            :returns: Orthogonalized update with RMS-matching scaling applied.
+            :raises ValueError: If update is not 2D.
+            """
             if update.ndim != 2:
                 raise ValueError("Muon orthogonalization expects 2D matrices.")
+
+            def _ortho_and_scale(mat: Array) -> Array:
+                ortho = _newton_schulz_5(mat, steps=self.muon_n_steps, eps=self.muon_ns_eps)
+                mult = _muon_match_rms_multiplier(mat.shape, self.muon_target_update_rms)
+                return ortho * mult
+
             if use_qkv is True and update.shape[0] % 3 == 0:
                 parts = jnp.split(update, 3, axis=0)
-                out0 = _newton_schulz_5(parts[0], steps=self.muon_n_steps, eps=self.muon_ns_eps)
-                out1 = _newton_schulz_5(parts[1], steps=self.muon_n_steps, eps=self.muon_ns_eps)
-                out2 = _newton_schulz_5(parts[2], steps=self.muon_n_steps, eps=self.muon_ns_eps)
+                out0 = _ortho_and_scale(parts[0])
+                out1 = _ortho_and_scale(parts[1])
+                out2 = _ortho_and_scale(parts[2])
                 return jnp.concatenate([out0, out1, out2], axis=0)
-            return _newton_schulz_5(update, steps=self.muon_n_steps, eps=self.muon_ns_eps)
+            return _ortho_and_scale(update)
 
         def _update_one(
             param: Array | None,
@@ -260,6 +275,22 @@ def _newton_schulz_5(matrix: Array, *, steps: int, eps: float) -> Array:
         work = jnp.swapaxes(work, 0, 1)
 
     return work
+
+
+def _muon_match_rms_multiplier(shape: tuple[int, int], target_rms: float) -> Array:
+    """Compute Moonshot RMS-matching multiplier for a 2D matrix.
+
+    This returns the factor ``target_rms * sqrt(max(A, B))`` for a matrix of
+    shape ``(A, B)``.
+
+    :param shape: Matrix shape ``(rows, cols)``.
+    :param target_rms: Target RMS for the (pre-LR) Muon update (Moonshot uses 0.2).
+    :returns: Scalar multiplier as a float32 JAX array.
+    """
+    rows, cols = shape
+    max_dim_f = float(max(int(rows), int(cols)))
+    max_dim = jnp.asarray(max_dim_f, dtype=jnp.float32)
+    return jnp.asarray(target_rms, dtype=jnp.float32) * jnp.sqrt(max_dim)
 
 
 def build_muon_masks(
