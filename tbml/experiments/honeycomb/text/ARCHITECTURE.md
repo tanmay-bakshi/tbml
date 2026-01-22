@@ -58,6 +58,8 @@ composed of an **encoder**, a **predictor**, and a **decoder**.
   - DropPath is applied with a linear schedule over depth.
 - **Final normalization**
   - A final RMSNorm is applied to all token representations.
+  - The encoder outputs are then passed through an additional SwiGLU feed‑forward layer
+    followed by a second RMSNorm before being used downstream.
 - **Pooling**
   - The pooled sequence embedding is the representation of the **last valid position** according
     to the attention mask (i.e., the last non-masked, non-pad token).

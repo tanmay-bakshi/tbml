@@ -25,7 +25,7 @@ from tbml.experiments.honeycomb.text.dataset import (
     iter_text_batches,
 )
 from tbml.experiments.honeycomb.text.model import TextTransformer, TextTransformerConfig
-from tbml.nn import RMSNorm
+from tbml.nn import RMSNorm, SwiGLUFeedForward
 from tbml.optimizers import MuonWithAdamWFallback, MuonWithAdamWFallbackState, build_muon_masks
 
 
@@ -714,6 +714,31 @@ def _pool_last(
     return jnp.take_along_axis(reps, idx, axis=1).squeeze(axis=1)
 
 
+def _apply_encoder_head(
+    reps: Array,
+    *,
+    base_norm: RMSNorm,
+    output_ffn: SwiGLUFeedForward,
+    output_norm: RMSNorm,
+    train: bool,
+    key: Array | None,
+) -> Array:
+    """Apply the encoder output head (norm -> FFN -> norm).
+
+    :param reps: Input representations.
+    :param base_norm: Transformer final RMSNorm.
+    :param output_ffn: Output feed-forward layer.
+    :param output_norm: Output RMSNorm.
+    :param train: Whether to enable dropout in the output FFN.
+    :param key: PRNG key for FFN dropout.
+    :returns: Transformed representations.
+    """
+    reps = base_norm(reps)
+    reps = output_ffn(reps, train=train, key=key)
+    reps = output_norm(reps)
+    return reps
+
+
 def _encode_views(
     model: TextTransformer,
     tokens: Array,
@@ -838,6 +863,8 @@ def _predictor_span_loss(
     mask_positions: Array,
     *,
     base_norm: RMSNorm,
+    output_ffn: SwiGLUFeedForward,
+    output_norm: RMSNorm,
     predictor_norm: RMSNorm,
 ) -> Array:
     """Compute predictor span reconstruction loss for a batch of views.
@@ -846,6 +873,8 @@ def _predictor_span_loss(
     :param view_reps: Predictor reps of shape (B, V, T, D) pre-predictor-norm.
     :param mask_positions: Mask positions of shape (B, V, T).
     :param base_norm: Base model RMSNorm module.
+    :param output_ffn: Encoder output feed-forward layer.
+    :param output_norm: Encoder output RMSNorm.
     :param predictor_norm: Predictor RMSNorm module.
     :returns: Scalar loss.
     """
@@ -876,7 +905,14 @@ def _predictor_span_loss(
         denom = jnp.maximum(counts[:, None], 1.0)
         mean_sample = sum_sample / denom
         mean_view = sum_view / denom
-        mean_sample = base_norm(mean_sample).astype(jnp.float32)
+        mean_sample = _apply_encoder_head(
+            mean_sample,
+            base_norm=base_norm,
+            output_ffn=output_ffn,
+            output_norm=output_norm,
+            train=False,
+            key=None,
+        ).astype(jnp.float32)
         mean_view = predictor_norm(mean_view).astype(jnp.float32)
         mse = jnp.mean(jnp.square(mean_sample - mean_view), axis=-1)
         valid = counts > 0
@@ -901,6 +937,8 @@ def _predictor_span_loss_tokenwise(
     mask_positions: Array,
     *,
     base_norm: RMSNorm,
+    output_ffn: SwiGLUFeedForward,
+    output_norm: RMSNorm,
     predictor_norm: RMSNorm,
 ) -> Array:
     """Compute predictor span loss using per-token reconstruction.
@@ -909,6 +947,8 @@ def _predictor_span_loss_tokenwise(
     :param view_reps: Predictor reps of shape (B, V, T, D) pre-predictor-norm.
     :param mask_positions: Mask positions of shape (B, V, T).
     :param base_norm: Base model RMSNorm module.
+    :param output_ffn: Encoder output feed-forward layer.
+    :param output_norm: Encoder output RMSNorm.
     :param predictor_norm: Predictor RMSNorm module.
     :returns: Scalar loss.
     """
@@ -929,7 +969,14 @@ def _predictor_span_loss_tokenwise(
 
     def _loss_for_view(sample_rep: Array, view_rep: Array, mask: Array) -> Array:
         span_ids = _span_ids(mask)
-        sample_post = base_norm(sample_rep).astype(jnp.float32)
+        sample_post = _apply_encoder_head(
+            sample_rep,
+            base_norm=base_norm,
+            output_ffn=output_ffn,
+            output_norm=output_norm,
+            train=False,
+            key=None,
+        ).astype(jnp.float32)
         sample_post = jax.lax.stop_gradient(sample_post)
         view_post = predictor_norm(view_rep).astype(jnp.float32)
         mse = jnp.mean(jnp.square(sample_post - view_post), axis=-1)
@@ -1088,6 +1135,8 @@ def _select_span_targets_per_view(
     mask_positions: Array,
     *,
     base_norm: RMSNorm,
+    output_ffn: SwiGLUFeedForward,
+    output_norm: RMSNorm,
     key: Array,
 ) -> Array:
     """Select one masked-span target vector per sample and per view for SIGReg.
@@ -1095,6 +1144,8 @@ def _select_span_targets_per_view(
     :param sample_reps: Sample token reps of shape (B, T, D) pre-base-norm.
     :param mask_positions: Mask positions of shape (B, V, T) for global/local views.
     :param base_norm: Base model RMSNorm module.
+    :param output_ffn: Encoder output feed-forward layer.
+    :param output_norm: Encoder output RMSNorm.
     :param key: PRNG key for sampling.
     :returns: Array of shape (B, V, D) with one selected target per sample per view.
     """
@@ -1115,7 +1166,14 @@ def _select_span_targets_per_view(
         counts = jax.ops.segment_sum(mask.astype(jnp.float32), span_ids, num_segments)
         denom = jnp.maximum(counts[:, None], 1.0)
         mean_sample = sum_sample / denom
-        mean_sample = base_norm(mean_sample)
+        mean_sample = _apply_encoder_head(
+            mean_sample,
+            base_norm=base_norm,
+            output_ffn=output_ffn,
+            output_norm=output_norm,
+            train=False,
+            key=None,
+        )
         valid = counts > 0
         valid = valid.at[0].set(False)
         valid_count = jnp.sum(valid)
@@ -1595,7 +1653,11 @@ def main() -> None:
                 pooled_post_views = pooled_post[:, :total_views, :]
                 pooled_pre_global = pooled_pre[:, : args.num_global_views, :]
                 center_pre = jnp.mean(pooled_pre_global, axis=1)
+                model_key = jax.random.split(view_key, 3)[0]
+                head_key = jax.random.split(model_key, len(model_inner.blocks) + 1)[-1]
                 center = model_inner.final_norm(center_pre)
+                center = model_inner.output_ffn(center, train=True, key=head_key)
+                center = model_inner.output_norm(center)
                 pooled_post_views = pooled_post_views.astype(jnp.float32)
                 center = center.astype(jnp.float32)
 
@@ -1730,6 +1792,8 @@ def main() -> None:
                             sample_reps,
                             mask_positions[:, :total_views, :],
                             base_norm=model_inner.final_norm,
+                            output_ffn=model_inner.output_ffn,
+                            output_norm=model_inner.output_norm,
                             key=sigreg_key,
                         )
                         span_sigreg_loss = sigreg_loss_views(
@@ -1746,6 +1810,8 @@ def main() -> None:
                             view_pred_reps,
                             view_masks,
                             base_norm=model_inner.final_norm,
+                            output_ffn=model_inner.output_ffn,
+                            output_norm=model_inner.output_norm,
                             predictor_norm=model_inner.predictor.final_norm,
                         )
                     else:
@@ -1754,6 +1820,8 @@ def main() -> None:
                             view_pred_reps,
                             view_masks,
                             base_norm=model_inner.final_norm,
+                            output_ffn=model_inner.output_ffn,
+                            output_norm=model_inner.output_norm,
                             predictor_norm=model_inner.predictor.final_norm,
                         )
                     span_lejepa_loss = (

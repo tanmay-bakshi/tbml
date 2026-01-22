@@ -527,8 +527,11 @@ class Predictor(eqx.Module):
 
         if key is None:
             block_keys: list[Array | None] = [None] * len(self.blocks)
+            head_key = None
         else:
-            block_keys = list(jax.random.split(key, len(self.blocks)))
+            keys = list(jax.random.split(key, len(self.blocks) + 1))
+            block_keys = keys[:-1]
+            head_key = keys[-1]
 
         for block, block_key in zip(self.blocks, block_keys):
             x = block(x, attention_mask=attention_mask, train=train, key=block_key)
@@ -794,6 +797,8 @@ class TextTransformer(eqx.Module):
     token_embed: TokenEmbedding
     blocks: tuple[TextTransformerBlock, ...]
     final_norm: RMSNorm
+    output_ffn: SwiGLUFeedForward
+    output_norm: RMSNorm
     predictor: Predictor | None
     decoder: Decoder | None
 
@@ -846,9 +851,10 @@ class TextTransformer(eqx.Module):
             raise ValueError("predictor_n_layers must be >= 0")
 
         init = truncated_normal_init(config.init_std)
-        keys = jax.random.split(key, 3 + config.n_layers)
+        keys = jax.random.split(key, 4 + config.n_layers)
         embed_key = keys[0]
-        block_keys = keys[1 : 1 + config.n_layers]
+        output_key = keys[1]
+        block_keys = keys[2 : 2 + config.n_layers]
         predictor_key = keys[-2]
         decoder_key = keys[-1]
 
@@ -893,6 +899,17 @@ class TextTransformer(eqx.Module):
 
         self.blocks = tuple(blocks)
         self.final_norm = RMSNorm(config.d_model, dtype=dtype, param_dtype=param_dtype)
+        self.output_ffn = SwiGLUFeedForward(
+            d_model=config.d_model,
+            hidden_dim=mlp_hidden_dim,
+            resid_dropout=config.resid_dropout,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            gate_up_kernel_init=init,
+            down_kernel_init=init,
+            key=output_key,
+        )
+        self.output_norm = RMSNorm(config.d_model, dtype=dtype, param_dtype=param_dtype)
         if config.predictor_n_layers > 0:
             self.predictor = Predictor(
                 config,
@@ -958,13 +975,13 @@ class TextTransformer(eqx.Module):
         train: bool,
         key: Array | None,
     ) -> tuple[Array, Array, Array]:
-        """Compute pre-norm tokens, post-norm tokens, and pooled embeddings.
+        """Compute pre-norm tokens, post-head tokens, and pooled embeddings.
 
         :param tokens: Token ids of shape (B, T).
         :param attention_mask: Attention mask of shape (B, T).
         :param train: Whether to enable dropout.
         :param key: PRNG key for dropout and DropPath.
-        :returns: Tuple of (pre_norm_tokens, post_norm_tokens, pooled).
+        :returns: Tuple of (pre_norm_tokens, post_head_tokens, pooled).
         """
         if tokens.ndim != 2:
             raise ValueError("tokens must have shape (B, T)")
@@ -985,7 +1002,9 @@ class TextTransformer(eqx.Module):
             reps = block(reps, attention_mask=attention_mask, train=train, key=block_key)
 
         reps_pre = reps
-        reps_post = self.final_norm(reps_pre)
+        reps_norm = self.final_norm(reps_pre)
+        reps_head = self.output_ffn(reps_norm, train=train, key=head_key)
+        reps_post = self.output_norm(reps_head)
 
         mask = attention_mask.astype(bool)
         positions = jnp.arange(reps_post.shape[1], dtype=jnp.int32)

@@ -259,6 +259,8 @@ def main() -> None:
     suffix_mask[:, len(prefix_ids) :] = True
     cand_span = _masked_mean(cand_pre, jnp.asarray(suffix_mask))
     cand_span = model.final_norm(cand_span)
+    cand_span = model.output_ffn(cand_span, train=False, key=None)
+    cand_span = model.output_norm(cand_span)
     cand_span = jax.device_get(cand_span)
 
     diffs = cand_span - pred_span[None, :]
