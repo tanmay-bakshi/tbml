@@ -79,7 +79,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-loss-weight", type=float, default=0.5)
     parser.add_argument("--span-loss-weight", type=float, default=0.0)
     parser.add_argument("--decoder-loss-weight", type=float, default=0.5)
-    parser.add_argument("--encoder-mlm-weight", type=float, default=0.0)
+    parser.add_argument("--encoder-mlm-loss-weight", type=float, default=0.0)
     parser.add_argument("--span-tokenwise", action="store_true")
     parser.add_argument("--mask-token-input", action="store_true")
 
@@ -1397,7 +1397,7 @@ def main() -> None:
             "seq_loss_weight": args.seq_loss_weight,
             "span_loss_weight": args.span_loss_weight,
             "decoder_loss_weight": args.decoder_loss_weight,
-            "encoder_mlm_weight": args.encoder_mlm_weight,
+            "encoder_mlm_weight": args.encoder_mlm_loss_weight,
             "span_tokenwise": args.span_tokenwise,
         },
         "optimizer": {
@@ -1616,7 +1616,7 @@ def main() -> None:
             encoder_mlm_loss = jnp.asarray(0.0, dtype=jnp.float32)
             encoder_mlm_acc1 = jnp.asarray(0.0, dtype=jnp.float32)
             encoder_mlm_acc5 = jnp.asarray(0.0, dtype=jnp.float32)
-            if args.encoder_mlm_weight > 0.0:
+            if args.encoder_mlm_loss_weight > 0.0:
                 total_views = args.num_global_views + args.num_local_views
                 if total_views > 0:
                     mlm_reps = token_post[:, :total_views, :, :]
@@ -1760,7 +1760,7 @@ def main() -> None:
             seq_weight = jnp.asarray(args.seq_loss_weight, dtype=jnp.float32)
             span_weight = jnp.asarray(args.span_loss_weight, dtype=jnp.float32)
             decoder_weight = jnp.asarray(args.decoder_loss_weight, dtype=jnp.float32)
-            mlm_weight = jnp.asarray(args.encoder_mlm_weight, dtype=jnp.float32)
+            mlm_weight = jnp.asarray(args.encoder_mlm_loss_weight, dtype=jnp.float32)
             weight_sum = seq_weight + span_weight + decoder_weight + mlm_weight
             weight_sum = jnp.maximum(weight_sum, 1e-6)
             seq_frac = seq_weight / weight_sum
