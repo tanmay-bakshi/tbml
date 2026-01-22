@@ -148,7 +148,9 @@ class TokenEmbedding(eqx.Module):
         if embeddings.shape[-1] != self.d_model:
             raise ValueError("embeddings last dimension must match d_model")
         weight = self.weight.astype(self.dtype)
-        return jnp.matmul(embeddings.astype(self.dtype), weight.T)
+        logits = jnp.matmul(embeddings.astype(self.dtype), weight.T)
+        scale = jnp.asarray(self.d_model, dtype=logits.dtype) ** -0.5
+        return logits * scale
 
 
 class TextTransformerBlock(eqx.Module):
