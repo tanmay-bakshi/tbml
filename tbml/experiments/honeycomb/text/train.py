@@ -26,7 +26,12 @@ from tbml.experiments.honeycomb.text.dataset import (
 )
 from tbml.experiments.honeycomb.text.model import TextTransformer, TextTransformerConfig
 from tbml.nn import RMSNorm, SwiGLUFeedForward
-from tbml.optimizers import MuonWithAdamWFallback, MuonWithAdamWFallbackState, build_muon_masks
+from tbml.optimizers import (
+    MuonWithAdamWFallback,
+    MuonWithAdamWFallbackState,
+    build_muon_masks,
+    build_weight_decay_mask,
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -1422,6 +1427,13 @@ def main() -> None:
         causal_attention=causal_attention,
     )
     exclusion_patterns = list(TextTransformer.MUON_PARAM_EXCLUSION_PATTERNS)
+    weight_decay_exclusions = [
+        r"^token_embed\..*$",
+        r"^.*norm\d*\..*$",
+        r"^final_norm\..*$",
+        r"^predictor\.final_norm\..*$",
+        r"^decoder\.final_norm\..*$",
+    ]
 
     run_config: dict[str, object] = {
         "model": model_config.model_dump(),
@@ -1508,22 +1520,27 @@ def main() -> None:
     model_static = static
     flat_names = _flatten_param_names(params)
     muon_mask, qkv_mask = build_muon_masks(params, flat_names, exclusion_patterns)
+    weight_decay_mask = build_weight_decay_mask(params, flat_names, weight_decay_exclusions)
 
     flat_params, _ = jax.tree_util.tree_flatten(params)
     flat_muon, _ = jax.tree_util.tree_flatten(muon_mask)
     if len(flat_params) != len(flat_muon):
         raise ValueError("muon_mask must align with params")
 
-    muon_names = [
-        name
-        for name, param, flag in zip(flat_names, flat_params, flat_muon, strict=True)
-        if isinstance(param, jax.Array) and flag
-    ]
-    adamw_names = [
-        name
-        for name, param, flag in zip(flat_names, flat_params, flat_muon, strict=True)
-        if isinstance(param, jax.Array) and flag is False
-    ]
+    flat_wd, _ = jax.tree_util.tree_flatten(weight_decay_mask)
+    if len(flat_wd) != len(flat_params):
+        raise ValueError("weight_decay_mask must align with params")
+
+    muon_names: list[str] = []
+    adamw_names: list[str] = []
+    for name, param, use_muon, use_wd in zip(flat_names, flat_params, flat_muon, flat_wd, strict=True):
+        if isinstance(param, jax.Array) is False:
+            continue
+        suffix = " (weight decay on)" if use_wd is True else " (weight decay off)"
+        if use_muon is True:
+            muon_names.append(f"{name}{suffix}")
+        else:
+            adamw_names.append(f"{name}{suffix}")
     total_params = sum(int(param.size) for param in flat_params if isinstance(param, jax.Array))
 
     print(f"Total parameters: {total_params}")
@@ -1545,6 +1562,7 @@ def main() -> None:
         adamw_weight_decay=args.adamw_weight_decay,
         muon_mask=muon_mask,
         qkv_mask=qkv_mask,
+        weight_decay_mask=weight_decay_mask,
     )
 
     opt_state: MuonWithAdamWFallbackState = optimizer.init(params)

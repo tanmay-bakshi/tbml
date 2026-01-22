@@ -58,6 +58,7 @@ class MuonWithAdamWFallback:
     :ivar adamw_weight_decay: AdamW weight decay for fallback.
     :ivar muon_mask: PyTree of bools indicating Muon parameters.
     :ivar qkv_mask: PyTree of bools indicating QKV special-case parameters.
+    :ivar weight_decay_mask: PyTree of bools indicating parameters that use weight decay.
     """
 
     muon_learning_rate: float
@@ -74,6 +75,7 @@ class MuonWithAdamWFallback:
 
     muon_mask: PyTree | None = None
     qkv_mask: PyTree | None = None
+    weight_decay_mask: PyTree | None = None
 
     def init(self, params: PyTree) -> MuonWithAdamWFallbackState:
         """Initialize optimizer state.
@@ -107,6 +109,10 @@ class MuonWithAdamWFallback:
             raise ValueError("muon_mask must be provided for MuonWithAdamWFallback")
         if self.qkv_mask is None:
             raise ValueError("qkv_mask must be provided for MuonWithAdamWFallback")
+        if self.weight_decay_mask is None:
+            weight_decay_mask = jax.tree_util.tree_map(lambda _: True, params)
+        else:
+            weight_decay_mask = self.weight_decay_mask
 
         b1, b2 = self.adamw_betas
         if len(self.adamw_betas) != 2:
@@ -135,6 +141,7 @@ class MuonWithAdamWFallback:
             v: Array | None,
             use_muon: bool,
             use_qkv: bool,
+            apply_weight_decay: bool,
         ) -> tuple[Array | None, Array | None, Array | None, Array | None]:
             if param is None or grad is None:
                 return None, velocity, m, v
@@ -157,7 +164,7 @@ class MuonWithAdamWFallback:
                     raw_update = new_velocity
                 ortho_update = _muon_orthogonalize(raw_update, use_qkv)
                 update = -self.muon_learning_rate * ortho_update
-                if self.muon_weight_decay != 0.0:
+                if self.muon_weight_decay != 0.0 and apply_weight_decay is True:
                     update = update - (self.muon_learning_rate * self.muon_weight_decay) * param_f32
                 return update, new_velocity, m_f32, v_f32
 
@@ -167,7 +174,7 @@ class MuonWithAdamWFallback:
             v_hat = new_v / bias_correction2
             denom = jnp.sqrt(v_hat) + self.adamw_eps
             update = -self.adamw_learning_rate * m_hat / denom
-            if self.adamw_weight_decay != 0.0 and param_f32.ndim >= 2:
+            if self.adamw_weight_decay != 0.0 and param_f32.ndim >= 2 and apply_weight_decay is True:
                 update = update - (self.adamw_learning_rate * self.adamw_weight_decay) * param_f32
             return update, velocity_f32, new_m, new_v
 
@@ -180,6 +187,7 @@ class MuonWithAdamWFallback:
             state.adam_v,
             self.muon_mask,
             self.qkv_mask,
+            weight_decay_mask,
         )
 
         def _is_update_tuple(value: object) -> bool:
@@ -294,3 +302,34 @@ def build_muon_masks(
     muon_mask = jax.tree_util.tree_unflatten(tree_def, muon_flags)
     qkv_mask = jax.tree_util.tree_unflatten(tree_def, qkv_flags)
     return muon_mask, qkv_mask
+
+
+def build_weight_decay_mask(
+    params: PyTree,
+    flat_names: list[str],
+    exclusion_patterns: Iterable[str],
+) -> PyTree:
+    """Build a weight-decay mask from parameter names.
+
+    :param params: Parameter PyTree.
+    :param flat_names: Flat list of parameter names aligned to ``params`` leaves.
+    :param exclusion_patterns: Regex patterns to exclude from weight decay.
+    :returns: PyTree of bools indicating parameters that should use weight decay.
+    :raises ValueError: If the name list does not match the parameter leaves.
+    """
+    compiled = [re.compile(pattern) for pattern in exclusion_patterns]
+    flat_params, tree_def = jax.tree_util.tree_flatten(params)
+    if len(flat_params) != len(flat_names):
+        raise ValueError("flat_names must align with params leaves.")
+
+    flags: list[bool] = []
+    for name, param in zip(flat_names, flat_params, strict=True):
+        apply_decay = False
+        if isinstance(param, jax.Array) is True:
+            apply_decay = True
+            for pattern in compiled:
+                if pattern.search(name) is not None:
+                    apply_decay = False
+                    break
+        flags.append(apply_decay)
+    return jax.tree_util.tree_unflatten(tree_def, flags)
