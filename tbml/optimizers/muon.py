@@ -33,11 +33,13 @@ class MuonWithAdamWFallbackState(eqx.Module):
     :ivar muon_momentum: Momentum buffers for Muon parameters.
     :ivar adam_m: First-moment buffers for AdamW fallback.
     :ivar adam_v: Second-moment buffers for AdamW fallback.
+    :ivar step: Optimization step counter.
     """
 
     muon_momentum: PyTree
     adam_m: PyTree
     adam_v: PyTree
+    step: Array
 
 
 @dataclass(frozen=True)
@@ -80,7 +82,12 @@ class MuonWithAdamWFallback:
         :returns: Initialized optimizer state.
         """
         zeros = jax.tree_util.tree_map(_zeros_like_or_none, params)
-        return MuonWithAdamWFallbackState(muon_momentum=zeros, adam_m=zeros, adam_v=zeros)
+        return MuonWithAdamWFallbackState(
+            muon_momentum=zeros,
+            adam_m=zeros,
+            adam_v=zeros,
+            step=jnp.asarray(0, dtype=jnp.int32),
+        )
 
     def update(
         self,
@@ -104,6 +111,10 @@ class MuonWithAdamWFallback:
         b1, b2 = self.adamw_betas
         if len(self.adamw_betas) != 2:
             raise ValueError("adamw_betas must have exactly two values.")
+        step = state.step + jnp.asarray(1, dtype=jnp.int32)
+        step_f = step.astype(jnp.float32)
+        bias_correction1 = jnp.asarray(1.0, dtype=jnp.float32) - jnp.power(b1, step_f)
+        bias_correction2 = jnp.asarray(1.0, dtype=jnp.float32) - jnp.power(b2, step_f)
 
         def _muon_orthogonalize(update: Array, use_qkv: bool) -> Array:
             if update.ndim != 2:
@@ -152,8 +163,10 @@ class MuonWithAdamWFallback:
 
             new_m = b1 * m_f32 + (1.0 - b1) * grad_f32
             new_v = b2 * v_f32 + (1.0 - b2) * grad_f32 * grad_f32
-            denom = jnp.sqrt(new_v) + self.adamw_eps
-            update = -self.adamw_learning_rate * new_m / denom
+            m_hat = new_m / bias_correction1
+            v_hat = new_v / bias_correction2
+            denom = jnp.sqrt(v_hat) + self.adamw_eps
+            update = -self.adamw_learning_rate * m_hat / denom
             if self.adamw_weight_decay != 0.0 and param_f32.ndim >= 2:
                 update = update - (self.adamw_learning_rate * self.adamw_weight_decay) * param_f32
             return update, velocity_f32, new_m, new_v
@@ -195,6 +208,7 @@ class MuonWithAdamWFallback:
             muon_momentum=new_velocity,
             adam_m=new_m,
             adam_v=new_v,
+            step=step,
         )
         return updates, new_state
 
