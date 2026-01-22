@@ -45,8 +45,7 @@ composed of an **encoder**, a **predictor**, and a **decoder**.
   - Embedding normalization is enabled in `train.py` (`embed_norm=True`): embeddings are passed
     through RMSNorm immediately after lookup.
   - The embedding module exposes an `unembed()` method that can project embeddings back to
-    vocabulary logits using the embedding weights.
-  - Logits are scaled by a fixed factor of `1 / sqrt(d_model)` after projection.
+    vocabulary logits using the (optionally normalized) embedding weights.
 - **Transformer blocks**
   - Pre-norm RMSNorm.
   - Self-attention with PoPE or RoPE positional encoding (configured via `attn_type`).

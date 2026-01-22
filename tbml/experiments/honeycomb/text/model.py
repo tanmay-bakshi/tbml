@@ -150,8 +150,7 @@ class TokenEmbedding(eqx.Module):
         embeddings_f = embeddings.astype(jnp.float32)
         weight = self.weight.astype(jnp.float32)
         logits = jnp.matmul(embeddings_f, weight.T)
-        scale = jnp.asarray(self.d_model, dtype=logits.dtype) ** -0.5
-        return logits * scale
+        return logits
 
 
 class TextTransformerBlock(eqx.Module):
