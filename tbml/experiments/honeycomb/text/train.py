@@ -719,7 +719,6 @@ def _apply_encoder_head(
     *,
     base_norm: RMSNorm,
     output_ffn: SwiGLUFeedForward,
-    output_norm: RMSNorm,
     train: bool,
     key: Array | None,
 ) -> Array:
@@ -728,14 +727,12 @@ def _apply_encoder_head(
     :param reps: Input representations.
     :param base_norm: Transformer final RMSNorm.
     :param output_ffn: Output feed-forward layer.
-    :param output_norm: Output RMSNorm.
     :param train: Whether to enable dropout in the output FFN.
     :param key: PRNG key for FFN dropout.
     :returns: Transformed representations.
     """
     reps = base_norm(reps)
     reps = output_ffn(reps, train=train, key=key)
-    reps = output_norm(reps)
     return reps
 
 
@@ -864,7 +861,6 @@ def _predictor_span_loss(
     *,
     base_norm: RMSNorm,
     output_ffn: SwiGLUFeedForward,
-    output_norm: RMSNorm,
     predictor_norm: RMSNorm,
 ) -> Array:
     """Compute predictor span reconstruction loss for a batch of views.
@@ -874,7 +870,6 @@ def _predictor_span_loss(
     :param mask_positions: Mask positions of shape (B, V, T).
     :param base_norm: Base model RMSNorm module.
     :param output_ffn: Encoder output feed-forward layer.
-    :param output_norm: Encoder output RMSNorm.
     :param predictor_norm: Predictor RMSNorm module.
     :returns: Scalar loss.
     """
@@ -909,7 +904,6 @@ def _predictor_span_loss(
             mean_sample,
             base_norm=base_norm,
             output_ffn=output_ffn,
-            output_norm=output_norm,
             train=False,
             key=None,
         ).astype(jnp.float32)
@@ -938,7 +932,6 @@ def _predictor_span_loss_tokenwise(
     *,
     base_norm: RMSNorm,
     output_ffn: SwiGLUFeedForward,
-    output_norm: RMSNorm,
     predictor_norm: RMSNorm,
 ) -> Array:
     """Compute predictor span loss using per-token reconstruction.
@@ -948,7 +941,6 @@ def _predictor_span_loss_tokenwise(
     :param mask_positions: Mask positions of shape (B, V, T).
     :param base_norm: Base model RMSNorm module.
     :param output_ffn: Encoder output feed-forward layer.
-    :param output_norm: Encoder output RMSNorm.
     :param predictor_norm: Predictor RMSNorm module.
     :returns: Scalar loss.
     """
@@ -973,7 +965,6 @@ def _predictor_span_loss_tokenwise(
             sample_rep,
             base_norm=base_norm,
             output_ffn=output_ffn,
-            output_norm=output_norm,
             train=False,
             key=None,
         ).astype(jnp.float32)
@@ -1136,7 +1127,6 @@ def _select_span_targets_per_view(
     *,
     base_norm: RMSNorm,
     output_ffn: SwiGLUFeedForward,
-    output_norm: RMSNorm,
     key: Array,
 ) -> Array:
     """Select one masked-span target vector per sample and per view for SIGReg.
@@ -1145,7 +1135,6 @@ def _select_span_targets_per_view(
     :param mask_positions: Mask positions of shape (B, V, T) for global/local views.
     :param base_norm: Base model RMSNorm module.
     :param output_ffn: Encoder output feed-forward layer.
-    :param output_norm: Encoder output RMSNorm.
     :param key: PRNG key for sampling.
     :returns: Array of shape (B, V, D) with one selected target per sample per view.
     """
@@ -1170,7 +1159,6 @@ def _select_span_targets_per_view(
             mean_sample,
             base_norm=base_norm,
             output_ffn=output_ffn,
-            output_norm=output_norm,
             train=False,
             key=None,
         )
@@ -1657,7 +1645,6 @@ def main() -> None:
                 head_key = jax.random.split(model_key, len(model_inner.blocks) + 1)[-1]
                 center = model_inner.final_norm(center_pre)
                 center = model_inner.output_ffn(center, train=True, key=head_key)
-                center = model_inner.output_norm(center)
                 pooled_post_views = pooled_post_views.astype(jnp.float32)
                 center = center.astype(jnp.float32)
 
@@ -1793,7 +1780,6 @@ def main() -> None:
                             mask_positions[:, :total_views, :],
                             base_norm=model_inner.final_norm,
                             output_ffn=model_inner.output_ffn,
-                            output_norm=model_inner.output_norm,
                             key=sigreg_key,
                         )
                         span_sigreg_loss = sigreg_loss_views(
@@ -1811,7 +1797,6 @@ def main() -> None:
                             view_masks,
                             base_norm=model_inner.final_norm,
                             output_ffn=model_inner.output_ffn,
-                            output_norm=model_inner.output_norm,
                             predictor_norm=model_inner.predictor.final_norm,
                         )
                     else:
@@ -1821,7 +1806,6 @@ def main() -> None:
                             view_masks,
                             base_norm=model_inner.final_norm,
                             output_ffn=model_inner.output_ffn,
-                            output_norm=model_inner.output_norm,
                             predictor_norm=model_inner.predictor.final_norm,
                         )
                     span_lejepa_loss = (

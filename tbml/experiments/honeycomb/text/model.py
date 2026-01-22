@@ -68,6 +68,7 @@ class TokenEmbedding(eqx.Module):
     :ivar use_norm: Whether to apply RMSNorm to embeddings.
     :ivar embed_scale: Scale applied after embedding RMSNorm.
     :ivar weight: Embedding matrix of shape (vocab_size, d_model).
+    :ivar bias: Output bias of shape (vocab_size,).
     :ivar norm: RMSNorm module applied to embeddings when enabled.
     """
 
@@ -78,6 +79,7 @@ class TokenEmbedding(eqx.Module):
     use_norm: bool
     embed_scale: float
     weight: Array
+    bias: Array
     norm: RMSNorm | None
 
     def __init__(
@@ -117,6 +119,7 @@ class TokenEmbedding(eqx.Module):
         self.use_norm = use_norm
         self.embed_scale = embed_scale
         self.weight = kernel_init(key, (vocab_size, d_model), param_dtype)
+        self.bias = jnp.zeros((vocab_size,), dtype=param_dtype)
         if use_norm is True:
             self.norm = RMSNorm(d_model, dtype=dtype, param_dtype=param_dtype)
         else:
@@ -151,7 +154,8 @@ class TokenEmbedding(eqx.Module):
             raise ValueError("embeddings last dimension must match d_model")
         embeddings_f = embeddings.astype(jnp.float32)
         weight = self.weight.astype(jnp.float32)
-        logits = jnp.matmul(embeddings_f, weight.T)
+        bias = self.bias.astype(jnp.float32)
+        logits = jnp.matmul(embeddings_f, weight.T) + bias
         return logits
 
 
@@ -798,7 +802,6 @@ class TextTransformer(eqx.Module):
     blocks: tuple[TextTransformerBlock, ...]
     final_norm: RMSNorm
     output_ffn: SwiGLUFeedForward
-    output_norm: RMSNorm
     predictor: Predictor | None
     decoder: Decoder | None
 
@@ -909,7 +912,6 @@ class TextTransformer(eqx.Module):
             down_kernel_init=init,
             key=output_key,
         )
-        self.output_norm = RMSNorm(config.d_model, dtype=dtype, param_dtype=param_dtype)
         if config.predictor_n_layers > 0:
             self.predictor = Predictor(
                 config,
@@ -1006,8 +1008,7 @@ class TextTransformer(eqx.Module):
 
         reps_pre = reps
         reps_norm = self.final_norm(reps_pre)
-        reps_head = self.output_ffn(reps_norm, train=train, key=head_key)
-        reps_post = self.output_norm(reps_head)
+        reps_post = self.output_ffn(reps_norm, train=train, key=head_key)
 
         mask = attention_mask.astype(bool)
         positions = jnp.arange(reps_post.shape[1], dtype=jnp.int32)
