@@ -147,8 +147,9 @@ class TokenEmbedding(eqx.Module):
             raise ValueError("embeddings must have shape (..., d_model)")
         if embeddings.shape[-1] != self.d_model:
             raise ValueError("embeddings last dimension must match d_model")
-        weight = self.weight.astype(self.dtype)
-        logits = jnp.matmul(embeddings.astype(self.dtype), weight.T)
+        embeddings_f = embeddings.astype(jnp.float32)
+        weight = self.weight.astype(jnp.float32)
+        logits = jnp.matmul(embeddings_f, weight.T)
         scale = jnp.asarray(self.d_model, dtype=logits.dtype) ** -0.5
         return logits * scale
 
