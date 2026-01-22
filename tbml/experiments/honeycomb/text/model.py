@@ -418,6 +418,8 @@ class Predictor(eqx.Module):
     dtype: jnp.dtype = eqx.field(static=True)
     max_seq_len: int
     mask_tokens: Array
+    token_norm: RMSNorm
+    token_scale: float
     blocks: tuple[PredictorBlock, ...]
     final_norm: RMSNorm
 
@@ -457,6 +459,8 @@ class Predictor(eqx.Module):
         norm_key = keys[-1]
 
         self.mask_tokens = init(mask_key, (config.max_seq_len, config.d_model), param_dtype)
+        self.token_norm = RMSNorm(config.d_model, dtype=dtype, param_dtype=param_dtype)
+        self.token_scale = config.init_std
 
         mlp_hidden_dim = int(config.d_model * config.mlp_ratio)
         if mlp_hidden_dim <= 0:
@@ -520,6 +524,7 @@ class Predictor(eqx.Module):
         mask_tokens = self.mask_tokens[:seq_len].astype(reps.dtype)
         mask_tokens = jnp.broadcast_to(mask_tokens[None, :, :], reps.shape)
         x = jnp.where(mask_positions[..., None], mask_tokens, reps)
+        x = self.token_norm(x) * self.token_scale
 
         if key is None:
             block_keys: list[Array | None] = [None] * len(self.blocks)
