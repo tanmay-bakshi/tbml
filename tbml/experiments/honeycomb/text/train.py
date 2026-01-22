@@ -1217,7 +1217,15 @@ def main() -> None:
         raise ValueError("span-loss-weight must be >= 0")
     if args.decoder_loss_weight < 0.0:
         raise ValueError("decoder-loss-weight must be >= 0")
-    if args.seq_loss_weight + args.span_loss_weight + args.decoder_loss_weight <= 0.0:
+    if args.encoder_mlm_loss_weight < 0.0:
+        raise ValueError("encoder-mlm-loss-weight must be >= 0")
+    if (
+        args.seq_loss_weight
+        + args.span_loss_weight
+        + args.decoder_loss_weight
+        + args.encoder_mlm_loss_weight
+        <= 0.0
+    ):
         raise ValueError("at least one loss weight must be > 0")
     if args.num_global_views + args.num_local_views <= 0:
         raise ValueError("at least one view must be requested")
