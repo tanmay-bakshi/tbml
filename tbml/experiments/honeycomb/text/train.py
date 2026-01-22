@@ -1601,11 +1601,16 @@ def main() -> None:
 
             need_predictor = args.span_loss_weight > 0.0 or args.decoder_loss_weight > 0.0
             if need_predictor:
-                predictor_attn = jnp.logical_or(view_attn_sel, view_masks_sel)
+                if args.mask_token_input is True:
+                    predictor_attn = view_attn_sel
+                    predictor_mask = jnp.zeros_like(view_masks_sel)
+                else:
+                    predictor_attn = jnp.logical_or(view_attn_sel, view_masks_sel)
+                    predictor_mask = view_masks_sel
                 num_sel = view_tokens_sel.shape[1]
                 flat_tokens = view_tokens_sel.reshape((bsz * num_sel, seq_len, dim))
                 flat_attn = predictor_attn.reshape((bsz * num_sel, seq_len))
-                flat_mask = view_masks_sel.reshape((bsz * num_sel, seq_len))
+                flat_mask = predictor_mask.reshape((bsz * num_sel, seq_len))
 
                 pred_reps = model_inner.predictor(
                     flat_tokens,
