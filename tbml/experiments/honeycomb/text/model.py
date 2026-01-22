@@ -794,8 +794,8 @@ class TextTransformer(eqx.Module):
     token_embed: TokenEmbedding
     blocks: tuple[TextTransformerBlock, ...]
     final_norm: RMSNorm
-    predictor: Predictor
-    decoder: Decoder
+    predictor: Predictor | None
+    decoder: Decoder | None
 
     def __init__(
         self,
@@ -840,8 +840,10 @@ class TextTransformer(eqx.Module):
             raise ValueError("pope_base must be > 1.0")
         if config.attn_type not in ("pope", "rope"):
             raise ValueError("attn_type must be 'pope' or 'rope'")
-        if config.decoder_n_layers <= 0:
-            raise ValueError("decoder_n_layers must be > 0")
+        if config.decoder_n_layers < 0:
+            raise ValueError("decoder_n_layers must be >= 0")
+        if config.predictor_n_layers < 0:
+            raise ValueError("predictor_n_layers must be >= 0")
 
         init = truncated_normal_init(config.init_std)
         keys = jax.random.split(key, 3 + config.n_layers)
@@ -891,23 +893,29 @@ class TextTransformer(eqx.Module):
 
         self.blocks = tuple(blocks)
         self.final_norm = RMSNorm(config.d_model, dtype=dtype, param_dtype=param_dtype)
-        self.predictor = Predictor(
-            config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            qkv_kernel_init=init,
-            o_kernel_init=init,
-            mlp_kernel_init=init,
-            key=predictor_key,
-        )
-        self.decoder = Decoder(
-            config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            qkv_kernel_init=init,
-            o_kernel_init=init,
-            key=decoder_key,
-        )
+        if config.predictor_n_layers > 0:
+            self.predictor = Predictor(
+                config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                qkv_kernel_init=init,
+                o_kernel_init=init,
+                mlp_kernel_init=init,
+                key=predictor_key,
+            )
+        else:
+            self.predictor = None
+        if config.decoder_n_layers > 0:
+            self.decoder = Decoder(
+                config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                qkv_kernel_init=init,
+                o_kernel_init=init,
+                key=decoder_key,
+            )
+        else:
+            self.decoder = None
 
     def __call__(
         self,

@@ -985,6 +985,10 @@ def _decoder_loss(
         raise ValueError("batch sizes must match")
     if sample_tokens.shape[1] != view_pred_reps.shape[2]:
         raise ValueError("sequence lengths must match")
+    if model.predictor is None:
+        raise ValueError("predictor is required for decoder loss")
+    if model.decoder is None:
+        raise ValueError("decoder is required for decoder loss")
     view_pred_reps = model.predictor.final_norm(view_pred_reps)
     bsz, num_views, seq_len, dim = view_pred_reps.shape
     flat_masks = view_masks.reshape((bsz * num_views, seq_len))
@@ -1333,13 +1337,13 @@ def main() -> None:
     predictor_layers = args.predictor_n_layers
     if predictor_layers is None:
         predictor_layers = args.n_layers
-    if predictor_layers <= 0:
-        raise ValueError("predictor-n-layers must be > 0")
+    if predictor_layers < 0:
+        raise ValueError("predictor-n-layers must be >= 0")
     decoder_layers = args.decoder_n_layers
     if decoder_layers is None:
         decoder_layers = args.n_layers
-    if decoder_layers <= 0:
-        raise ValueError("decoder-n-layers must be > 0")
+    if decoder_layers < 0:
+        raise ValueError("decoder-n-layers must be >= 0")
 
     model_config = TextTransformerConfig(
         vocab_size=vocab_size,
@@ -1683,6 +1687,10 @@ def main() -> None:
 
             need_predictor = args.span_loss_weight > 0.0 or args.decoder_loss_weight > 0.0
             if need_predictor:
+                if model_inner.predictor is None:
+                    raise ValueError("predictor must be enabled when span or decoder losses are active")
+                if args.decoder_loss_weight > 0.0 and model_inner.decoder is None:
+                    raise ValueError("decoder must be enabled when decoder loss is active")
                 if args.mask_token_input is True:
                     predictor_attn = view_attn_sel
                     predictor_mask = jnp.zeros_like(view_masks_sel)
