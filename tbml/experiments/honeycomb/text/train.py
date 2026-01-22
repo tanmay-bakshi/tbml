@@ -80,6 +80,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--span-loss-weight", type=float, default=0.0)
     parser.add_argument("--decoder-loss-weight", type=float, default=0.5)
     parser.add_argument("--encoder-mlm-loss-weight", type=float, default=0.0)
+    parser.add_argument("--encoder-mlm-keep-prob", type=float, default=0.0)
     parser.add_argument("--span-tokenwise", action="store_true")
     parser.add_argument("--mask-token-input", action="store_true")
 
@@ -1265,6 +1266,8 @@ def main() -> None:
         raise ValueError("decoder-loss-weight must be >= 0")
     if args.encoder_mlm_loss_weight < 0.0:
         raise ValueError("encoder-mlm-loss-weight must be >= 0")
+    if args.encoder_mlm_keep_prob < 0.0 or args.encoder_mlm_keep_prob > 1.0:
+        raise ValueError("encoder-mlm-keep-prob must be in [0, 1]")
     if (
         args.seq_loss_weight
         + args.span_loss_weight
@@ -1456,6 +1459,7 @@ def main() -> None:
             "span_loss_weight": args.span_loss_weight,
             "decoder_loss_weight": args.decoder_loss_weight,
             "encoder_mlm_weight": args.encoder_mlm_loss_weight,
+            "encoder_mlm_keep_prob": args.encoder_mlm_keep_prob,
             "span_tokenwise": args.span_tokenwise,
         },
         "optimizer": {
@@ -1608,7 +1612,7 @@ def main() -> None:
                 span sigreg loss, seq lejepa loss, span lejepa loss, decoder loss,
                 encoder mlm loss, encoder mlm acc1, encoder mlm acc5, total loss)).
             """
-            view_key, predictor_key, sigreg_key, decoder_key = jax.random.split(tokens_key, 4)
+            view_key, predictor_key, sigreg_key, decoder_key, mlm_key = jax.random.split(tokens_key, 5)
             (
                 pooled_post,
                 pooled_pre,
@@ -1687,10 +1691,20 @@ def main() -> None:
                     mask = mlm_masks.reshape((bsz * total_views, seq_len))
                     targets = jnp.repeat(tokens_no_eos, repeats=total_views, axis=0)
 
+                    if args.encoder_mlm_keep_prob > 0.0:
+                        keep_key, mlm_key = jax.random.split(mlm_key)
+                        keep_noise = jax.random.uniform(keep_key, shape=mask.shape)
+                        keep_mask = keep_noise < args.encoder_mlm_keep_prob
+                        keep_mask = jnp.logical_and(keep_mask, jnp.logical_not(mask))
+                        loss_mask = jnp.logical_or(mask, keep_mask)
+                    else:
+                        keep_mask = jnp.zeros_like(mask)
+                        loss_mask = mask
+
                     logits = model_inner.token_embed.unembed(reps)
                     log_probs = jax.nn.log_softmax(logits, axis=-1)
                     target_logp = jnp.take_along_axis(log_probs, targets[..., None], axis=-1).squeeze(-1)
-                    mask_f = mask.astype(jnp.float32)
+                    mask_f = loss_mask.astype(jnp.float32)
                     count = jnp.sum(mask_f)
                     loss_sum = -jnp.sum(target_logp * mask_f)
                     encoder_mlm_loss = jnp.where(count > 0.0, loss_sum / count, 0.0)
@@ -1698,13 +1712,14 @@ def main() -> None:
                     preds = jnp.argmax(logits, axis=-1)
                     correct1 = jnp.logical_and(preds == targets, mask)
                     acc1_sum = jnp.sum(correct1.astype(jnp.float32))
-                    encoder_mlm_acc1 = jnp.where(count > 0.0, acc1_sum / count, 0.0)
+                    acc_count = jnp.sum(mask.astype(jnp.float32))
+                    encoder_mlm_acc1 = jnp.where(acc_count > 0.0, acc1_sum / acc_count, 0.0)
 
                     top5 = jax.lax.top_k(logits, k=5)[1]
                     correct5 = jnp.any(top5 == targets[..., None], axis=-1)
                     correct5 = jnp.logical_and(correct5, mask)
                     acc5_sum = jnp.sum(correct5.astype(jnp.float32))
-                    encoder_mlm_acc5 = jnp.where(count > 0.0, acc5_sum / count, 0.0)
+                    encoder_mlm_acc5 = jnp.where(acc_count > 0.0, acc5_sum / acc_count, 0.0)
 
             if args.num_global_views > 0:
                 global_key = jax.random.fold_in(predictor_key, 0)
