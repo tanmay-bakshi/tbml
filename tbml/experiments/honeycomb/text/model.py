@@ -995,8 +995,11 @@ class TextTransformer(eqx.Module):
         reps = self.token_embed(tokens)
         if key is None:
             block_keys: list[Array | None] = [None] * len(self.blocks)
+            head_key = None
         else:
-            block_keys = list(jax.random.split(key, len(self.blocks)))
+            keys = list(jax.random.split(key, len(self.blocks) + 1))
+            block_keys = keys[:-1]
+            head_key = keys[-1]
 
         for block, block_key in zip(self.blocks, block_keys):
             reps = block(reps, attention_mask=attention_mask, train=train, key=block_key)
