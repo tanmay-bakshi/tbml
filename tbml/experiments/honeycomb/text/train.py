@@ -76,6 +76,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--global-mask-max", type=float, default=None)
     parser.add_argument("--local-mask-min", type=float, default=None)
     parser.add_argument("--local-mask-max", type=float, default=None)
+    parser.add_argument("--masking-mode", type=str, default="spans", choices=["spans", "tokens"])
 
     parser.add_argument("--sigreg-weight", type=float, default=0.25)
     parser.add_argument("--sigreg-slices", type=int, default=256)
@@ -423,9 +424,10 @@ def _mask_spans(
     eos_id: int,
     mask_id: int,
     use_mask_token: bool,
+    masking_mode: str,
     poisson_lambda: float = 3.0,
 ) -> tuple[Array, Array, Array]:
-    """Apply span masking to tokens using BART-style text infilling.
+    """Apply masking to tokens using span or token sampling.
 
     Masked tokens are excluded from attention but the sequence length is unchanged.
 
@@ -437,6 +439,7 @@ def _mask_spans(
     :param eos_id: EOS token id.
     :param mask_id: Mask token id.
     :param use_mask_token: Whether to replace masked positions with mask tokens.
+    :param masking_mode: Masking mode ("spans" or "tokens").
     :param poisson_lambda: Poisson lambda for span lengths.
     :returns: Tuple of (token ids, mask positions, attention mask).
     """
@@ -446,7 +449,9 @@ def _mask_spans(
         raise ValueError("max_ratio must be in [0, 1]")
     if min_ratio > max_ratio:
         raise ValueError("min_ratio must be <= max_ratio")
-    if poisson_lambda <= 0.0:
+    if masking_mode not in ("spans", "tokens"):
+        raise ValueError("masking_mode must be 'spans' or 'tokens'")
+    if masking_mode == "spans" and poisson_lambda <= 0.0:
         raise ValueError("poisson_lambda must be > 0")
 
     key_ratio, key_spans = jax.random.split(key)
@@ -462,7 +467,7 @@ def _mask_spans(
     idx_row = idx[None, :]
     all_lengths = jnp.arange(1, seq_len + 1, dtype=jnp.int32)[:, None]
 
-    def _one_sample(
+    def _one_sample_spans(
         sample_tokens: Array,
         ratio: Array,
         sample_key: Array,
@@ -515,19 +520,50 @@ def _mask_spans(
         final_mask, _final_count = jax.lax.fori_loop(
             0, seq_len, _body, (init_mask, init_count)
         )
+        return final_mask, eligible
+
+    def _one_sample_tokens(
+        sample_tokens: Array,
+        ratio: Array,
+        sample_key: Array,
+    ) -> tuple[Array, Array]:
+        """Mask individual tokens for a single sequence.
+
+        :param sample_tokens: Token ids of shape (T,).
+        :param ratio: Masking ratio scalar.
+        :param sample_key: PRNG key.
+        :returns: Tuple of (mask positions, eligibility mask).
+        """
+        eligible = jnp.logical_and(sample_tokens != pad_id, sample_tokens != eos_id)
+        valid_len = jnp.sum(eligible).astype(jnp.int32)
+        target = jnp.floor(ratio * valid_len).astype(jnp.int32)
+        target = jnp.minimum(target, jnp.maximum(valid_len - 1, 0))
+        scores = jax.random.uniform(sample_key, shape=(seq_len,), minval=0.0, maxval=1.0)
+        scores = jnp.where(eligible, scores, -jnp.inf)
+        order = jnp.argsort(-scores)
+        ranks = jnp.argsort(order)
+        mask = ranks < target
+        mask = jnp.logical_and(mask, eligible)
+        return mask, eligible
+
+    def _apply_mask(
+        sample_tokens: Array,
+        mask: Array,
+        eligible: Array,
+    ) -> tuple[Array, Array, Array]:
         if use_mask_token is True:
             attention_mask = eligible
         else:
-            attention_mask = jnp.logical_and(eligible, jnp.logical_not(final_mask))
+            attention_mask = jnp.logical_and(eligible, jnp.logical_not(mask))
 
         def _with_fallback(_: None) -> tuple[Array, Array]:
             fallback_idx = jnp.argmax(eligible)
             attn = attention_mask.at[fallback_idx].set(True)
-            mask = final_mask.at[fallback_idx].set(False)
-            return attn, mask
+            new_mask = mask.at[fallback_idx].set(False)
+            return attn, new_mask
 
         def _no_fallback(_: None) -> tuple[Array, Array]:
-            return attention_mask, final_mask
+            return attention_mask, mask
 
         attention_mask, final_mask = jax.lax.cond(
             jnp.any(attention_mask),
@@ -540,6 +576,23 @@ def _mask_spans(
         else:
             masked_tokens = sample_tokens
         return masked_tokens, final_mask, attention_mask
+
+    if masking_mode == "spans":
+        def _one_sample(
+            sample_tokens: Array,
+            ratio: Array,
+            sample_key: Array,
+        ) -> tuple[Array, Array, Array]:
+            mask, eligible = _one_sample_spans(sample_tokens, ratio, sample_key)
+            return _apply_mask(sample_tokens, mask, eligible)
+    else:
+        def _one_sample(
+            sample_tokens: Array,
+            ratio: Array,
+            sample_key: Array,
+        ) -> tuple[Array, Array, Array]:
+            mask, eligible = _one_sample_tokens(sample_tokens, ratio, sample_key)
+            return _apply_mask(sample_tokens, mask, eligible)
 
     masked, positions, attn_mask = jax.vmap(_one_sample)(tokens, ratios, keys)
     return masked, positions, attn_mask
@@ -556,6 +609,7 @@ def _mask_views(
     eos_id: int,
     mask_id: int,
     use_mask_token: bool,
+    masking_mode: str,
 ) -> tuple[Array, Array, Array]:
     """Generate multiple masked views of the token batch.
 
@@ -568,6 +622,7 @@ def _mask_views(
     :param eos_id: EOS token id.
     :param mask_id: Mask token id.
     :param use_mask_token: Whether to replace masked positions with mask tokens.
+    :param masking_mode: Masking mode ("spans" or "tokens").
     :returns: Tuple of (masked views, mask positions, attention masks).
     """
     if num_views == 0:
@@ -593,6 +648,7 @@ def _mask_views(
             eos_id=eos_id,
             mask_id=mask_id,
             use_mask_token=use_mask_token,
+            masking_mode=masking_mode,
         )
 
     views, masks, attn_masks = jax.vmap(_one_view)(keys)
@@ -617,6 +673,7 @@ def _build_views(
     eos_id: int,
     mask_id: int,
     use_mask_token: bool,
+    masking_mode: str,
 ) -> tuple[Array, Array, Array, Array, Array, Array, Array]:
     """Build masked views for global and local crops.
 
@@ -632,6 +689,7 @@ def _build_views(
     :param eos_id: EOS token id.
     :param mask_id: Mask token id.
     :param use_mask_token: Whether to replace masked positions with mask tokens.
+    :param masking_mode: Masking mode ("spans" or "tokens").
     :returns: Tuple of (model key, global views, global masks, global attn, local views, local masks, local attn).
     """
     model_key, global_key, local_key = jax.random.split(key, 3)
@@ -645,6 +703,7 @@ def _build_views(
         eos_id=eos_id,
         mask_id=mask_id,
         use_mask_token=use_mask_token,
+        masking_mode=masking_mode,
     )
     local_views, local_masks, local_attn = _mask_views(
         tokens,
@@ -656,6 +715,7 @@ def _build_views(
         eos_id=eos_id,
         mask_id=mask_id,
         use_mask_token=use_mask_token,
+        masking_mode=masking_mode,
     )
     return (
         model_key,
@@ -758,6 +818,7 @@ def _encode_views(
     eos_id: int,
     mask_id: int,
     use_mask_token: bool,
+    masking_mode: str,
 ) -> tuple[Array, Array, Array, Array, Array, Array]:
     """Encode masked views into pooled embeddings and token representations.
 
@@ -775,6 +836,7 @@ def _encode_views(
     :param eos_id: EOS token id.
     :param mask_id: Mask token id.
     :param use_mask_token: Whether to replace masked positions with mask tokens.
+    :param masking_mode: Masking mode ("spans" or "tokens").
     :returns: Tuple of (pooled_post, pooled_pre, token_post, token_pre, mask_positions, view_attn).
     """
     if num_global_views + num_local_views <= 0:
@@ -803,6 +865,7 @@ def _encode_views(
         eos_id=eos_id,
         mask_id=mask_id,
         use_mask_token=use_mask_token,
+        masking_mode=masking_mode,
     )
     views, _mask_positions, view_attn = _combine_views(
         global_views,
@@ -1357,6 +1420,7 @@ def main() -> None:
             eos_id=eos_id,
             mask_id=mask_id,
             use_mask_token=args.mask_token_input,
+            masking_mode=args.masking_mode,
         )
         local_views, _local_masks, _local_attn = _mask_views(
             jnp.asarray(batch_tokens),
@@ -1368,6 +1432,7 @@ def main() -> None:
             eos_id=eos_id,
             mask_id=mask_id,
             use_mask_token=args.mask_token_input,
+            masking_mode=args.masking_mode,
         )
 
         for idx in range(batch_tokens.shape[0]):
@@ -1461,6 +1526,7 @@ def main() -> None:
             "local_mask_min": args.local_mask_min,
             "local_mask_max": args.local_mask_max,
             "mask_token_input": args.mask_token_input,
+            "masking_mode": args.masking_mode,
         },
         "loss": {
             "sigreg_weight": args.sigreg_weight,
@@ -1653,6 +1719,7 @@ def main() -> None:
                 eos_id=eos_id,
                 mask_id=mask_id,
                 use_mask_token=args.mask_token_input,
+                masking_mode=args.masking_mode,
             )
 
             total_views = args.num_global_views + args.num_local_views
