@@ -28,10 +28,12 @@ implemented in the current code.
   - Spans are chosen from non-pad, non-EOS positions.
   - At least one unmasked token is guaranteed per view.
 - The masked spans are **not removed** and tokens are **not replaced** with a mask token in the
-  base model. Instead, masking is enforced via the attention mask:
+  base model by default. Instead, masking is enforced via the attention mask:
   - Masked positions are excluded as keys/values in attention.
   - Outputs at masked positions are zeroed by the attention implementation.
   - Positional indices are preserved, so the model can still infer relative distance.
+  - If `--mask-token-input` is enabled, masked positions are instead replaced with the mask token
+    id for the encoder input, and the encoder attention mask treats them as visible tokens.
 - The sample view uses the full (unmasked) sequence; it is not used in the LeJEPA loss directly,
   but is used as a target for the predictor loss.
 
@@ -42,14 +44,16 @@ composed of an **encoder**, a **predictor**, and a **decoder**.
 
 - **Token embedding**
   - Embedding table of shape `(vocab_size, d_model)`.
-  - Embedding normalization is enabled in `train.py` (`embed_norm=True`): embeddings are passed
-    through RMSNorm immediately after lookup.
+  - Embedding normalization is configurable in the model config; current training sets
+    `embed_norm=False` (no post-lookup RMSNorm).
   - The embedding module exposes an `unembed()` method that can project embeddings back to
-    vocabulary logits using the (optionally normalized) embedding weights.
+    vocabulary logits using the raw embedding weights.
 - **Transformer blocks**
   - Pre-norm RMSNorm.
   - Self-attention with PoPE or RoPE positional encoding (configured via `attn_type`).
-  - Attention is **causal** and also respects the provided attention mask (pads and masked spans).
+  - Attention is **causal** for both encoder and predictor when `--causal-attention true`, and
+    **non‑causal** when set to false. Attention also respects the provided attention masks
+    (pads and masked spans).
   - MLP: SwiGLU with expansion ratio `mlp_ratio`.
   - DropPath is applied with a linear schedule over depth.
 - **Final normalization**
@@ -58,12 +62,13 @@ composed of an **encoder**, a **predictor**, and a **decoder**.
   - The pooled sequence embedding is the representation of the **last valid position** according
     to the attention mask (i.e., the last non-masked, non-pad token).
 - **Predictor**
-  - A separate non‑causal transformer stack that operates on token‑level representations
-    after the encoder’s final norm.
+  - A separate transformer stack that operates on token‑level representations after the
+    encoder’s final norm. Causality follows the `--causal-attention` setting.
   - Number of predictor layers is configurable independently (`predictor_n_layers`); other
     hyperparameters (width, heads, MLP ratio, dropout, positional encoding) mirror the encoder.
   - Each masked token position is replaced by a learned position‑specific embedding before
-    entering the predictor.
+    entering the predictor, unless `--mask-token-input` is enabled (in which case the encoder
+    outputs for all positions are passed through directly).
   - The predictor outputs token representations **prior** to its own final RMSNorm; the
     final norm is applied only when forming the predictor reconstruction targets.
 - **Decoder**
@@ -72,6 +77,8 @@ composed of an **encoder**, a **predictor**, and a **decoder**.
     (no positional encoding) over predictor outputs for the masked span.
   - The decoder consumes token embeddings that are tied to the encoder’s embedding table, and
     its output logits are produced via the same shared embedding weights (`TokenEmbedding.unembed`).
+  - Predictor and decoder are optional: if `predictor_n_layers` or `decoder_n_layers` is set to
+    0, that component is not instantiated and any loss depending on it must be disabled.
 
 The model returns both per-token representations and the pooled representation on every call.
 
@@ -145,11 +152,19 @@ Each view contributes **one randomly selected masked span** as an independent de
 total_loss = seq_frac * seq_lejepa_loss
            + span_frac * span_lejepa_loss
            + decoder_frac * decoder_loss
+           + mlm_frac * encoder_mlm_loss
 ```
 
 The fractions are derived from the CLI flags `--seq-loss-weight`, `--span-loss-weight`,
-and `--decoder-loss-weight` by normalizing them to sum to 1.0. When `span-loss-weight`
-is 0, the span losses are skipped entirely.
+`--decoder-loss-weight`, and `--encoder-mlm-loss-weight` by normalizing them to sum to 1.0.
+When any weight is 0, its loss is skipped entirely.
+
+9) **Encoder MLM loss (`encoder_mlm_loss`)**
+
+- For every masked position in every global/local view, the encoder’s **post‑final‑norm**
+  token representation is unembedded through the tied token embedding weights.
+- Cross‑entropy is computed against the original token id, and top‑1/top‑5 accuracy are
+  reported for masked positions only.
 
 ### Optimization and training loop
 
