@@ -876,7 +876,6 @@ def _predictor_span_loss_tokenwise(
     def _loss_for_view(sample_rep: Array, view_rep: Array, mask: Array) -> Array:
         span_ids = _span_ids(mask)
         sample_post = base_norm(sample_rep).astype(jnp.float32)
-        sample_post = jax.lax.stop_gradient(sample_post)
         view_post = predictor_norm(view_rep).astype(jnp.float32)
         mse = jnp.mean(jnp.square(sample_post - view_post), axis=-1)
         mask_f = mask.astype(jnp.float32)
