@@ -79,6 +79,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-loss-weight", type=float, default=0.5)
     parser.add_argument("--span-loss-weight", type=float, default=0.0)
     parser.add_argument("--decoder-loss-weight", type=float, default=0.5)
+    parser.add_argument("--encoder-mlm-weight", type=float, default=0.0)
     parser.add_argument("--span-tokenwise", action="store_true")
     parser.add_argument("--mask-token-input", action="store_true")
 
@@ -1396,6 +1397,7 @@ def main() -> None:
             "seq_loss_weight": args.seq_loss_weight,
             "span_loss_weight": args.span_loss_weight,
             "decoder_loss_weight": args.decoder_loss_weight,
+            "encoder_mlm_weight": args.encoder_mlm_weight,
             "span_tokenwise": args.span_tokenwise,
         },
         "optimizer": {
@@ -1492,7 +1494,20 @@ def main() -> None:
         global_step: Array,
         micro_step0: Array,
         micro_steps: Array,
-    ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array]:
+    ) -> tuple[
+        eqx.Module,
+        Array,
+        Array,
+        Array,
+        Array,
+        Array,
+        Array,
+        Array,
+        Array,
+        Array,
+        Array,
+        Array,
+    ]:
         """Compute accumulated gradients and metrics across micro-steps.
 
         :param model_in: Replicated model.
@@ -1502,21 +1517,38 @@ def main() -> None:
         :param micro_step0: Starting micro-step index for RNG folding.
         :param micro_steps: Number of valid micro-steps in the batch.
         :returns: Tuple of (grads, total loss, seq rec loss, seq sigreg loss, span rec loss,
-            span sigreg loss, seq lejepa loss, span lejepa loss, decoder loss).
+            span sigreg loss, seq lejepa loss, span lejepa loss, decoder loss,
+            encoder mlm loss, encoder mlm acc1, encoder mlm acc5).
         """
 
         def _loss_fn(
             model_inner: TextTransformer,
             tokens: Array,
             tokens_key: Array,
-        ) -> tuple[Array, tuple[Array, Array, Array, Array, Array, Array, Array, Array]]:
+        ) -> tuple[
+            Array,
+            tuple[
+                Array,
+                Array,
+                Array,
+                Array,
+                Array,
+                Array,
+                Array,
+                Array,
+                Array,
+                Array,
+                Array,
+            ],
+        ]:
             """Compute the total loss and its components.
 
             :param model_inner: Model replica used for the loss computation.
             :param tokens: Token batch of shape (B, T).
             :param tokens_key: PRNG key for masking.
             :returns: Tuple of (total loss, (seq rec loss, seq sigreg loss, span rec loss,
-                span sigreg loss, seq lejepa loss, span lejepa loss, decoder loss, total loss)).
+                span sigreg loss, seq lejepa loss, span lejepa loss, decoder loss,
+                encoder mlm loss, encoder mlm acc1, encoder mlm acc5, total loss)).
             """
             view_key, predictor_key, sigreg_key, decoder_key = jax.random.split(tokens_key, 4)
             (
@@ -1580,6 +1612,38 @@ def main() -> None:
             view_tokens_list: list[Array] = []
             view_masks_list: list[Array] = []
             view_attn_list: list[Array] = []
+
+            encoder_mlm_loss = jnp.asarray(0.0, dtype=jnp.float32)
+            encoder_mlm_acc1 = jnp.asarray(0.0, dtype=jnp.float32)
+            encoder_mlm_acc5 = jnp.asarray(0.0, dtype=jnp.float32)
+            if args.encoder_mlm_weight > 0.0:
+                total_views = args.num_global_views + args.num_local_views
+                if total_views > 0:
+                    mlm_reps = token_post[:, :total_views, :, :]
+                    mlm_masks = mask_positions[:, :total_views, :]
+                    tokens_no_eos = jnp.where(tokens == eos_id, pad_id, tokens)
+                    reps = mlm_reps.reshape((bsz * total_views, seq_len, dim))
+                    mask = mlm_masks.reshape((bsz * total_views, seq_len))
+                    targets = jnp.repeat(tokens_no_eos, repeats=total_views, axis=0)
+
+                    logits = model_inner.token_embed.unembed(reps)
+                    log_probs = jax.nn.log_softmax(logits, axis=-1)
+                    target_logp = jnp.take_along_axis(log_probs, targets[..., None], axis=-1).squeeze(-1)
+                    mask_f = mask.astype(jnp.float32)
+                    count = jnp.sum(mask_f)
+                    loss_sum = -jnp.sum(target_logp * mask_f)
+                    encoder_mlm_loss = jnp.where(count > 0.0, loss_sum / count, 0.0)
+
+                    preds = jnp.argmax(logits, axis=-1)
+                    correct1 = jnp.logical_and(preds == targets, mask)
+                    acc1_sum = jnp.sum(correct1.astype(jnp.float32))
+                    encoder_mlm_acc1 = jnp.where(count > 0.0, acc1_sum / count, 0.0)
+
+                    top5 = jax.lax.top_k(logits, k=5)[1]
+                    correct5 = jnp.any(top5 == targets[..., None], axis=-1)
+                    correct5 = jnp.logical_and(correct5, mask)
+                    acc5_sum = jnp.sum(correct5.astype(jnp.float32))
+                    encoder_mlm_acc5 = jnp.where(count > 0.0, acc5_sum / count, 0.0)
 
             if args.num_global_views > 0:
                 global_key = jax.random.fold_in(predictor_key, 0)
@@ -1696,12 +1760,19 @@ def main() -> None:
             seq_weight = jnp.asarray(args.seq_loss_weight, dtype=jnp.float32)
             span_weight = jnp.asarray(args.span_loss_weight, dtype=jnp.float32)
             decoder_weight = jnp.asarray(args.decoder_loss_weight, dtype=jnp.float32)
-            weight_sum = seq_weight + span_weight + decoder_weight
+            mlm_weight = jnp.asarray(args.encoder_mlm_weight, dtype=jnp.float32)
+            weight_sum = seq_weight + span_weight + decoder_weight + mlm_weight
             weight_sum = jnp.maximum(weight_sum, 1e-6)
             seq_frac = seq_weight / weight_sum
             span_frac = span_weight / weight_sum
             decoder_frac = decoder_weight / weight_sum
-            total_loss = seq_frac * seq_lejepa_loss + span_frac * span_lejepa_loss + decoder_frac * decoder_loss
+            mlm_frac = mlm_weight / weight_sum
+            total_loss = (
+                seq_frac * seq_lejepa_loss
+                + span_frac * span_lejepa_loss
+                + decoder_frac * decoder_loss
+                + mlm_frac * encoder_mlm_loss
+            )
             return (
                 total_loss,
                 (
@@ -1712,6 +1783,9 @@ def main() -> None:
                     seq_lejepa_loss,
                     span_lejepa_loss,
                     decoder_loss,
+                    encoder_mlm_loss,
+                    encoder_mlm_acc1,
+                    encoder_mlm_acc5,
                     total_loss,
                 ),
             )
@@ -1730,17 +1804,24 @@ def main() -> None:
         seq_lejepa_init = jnp.asarray(0.0, dtype=jnp.float32)
         span_lejepa_init = jnp.asarray(0.0, dtype=jnp.float32)
         decoder_loss_init = jnp.asarray(0.0, dtype=jnp.float32)
+        encoder_mlm_init = jnp.asarray(0.0, dtype=jnp.float32)
+        encoder_mlm_acc1_init = jnp.asarray(0.0, dtype=jnp.float32)
+        encoder_mlm_acc5_init = jnp.asarray(0.0, dtype=jnp.float32)
 
         step_indices = jnp.arange(batch_tokens.shape[0], dtype=jnp.int32)
 
         def _accum_body(
-            carry: tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array],
+            carry: tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array, Array, Array, Array],
             inputs: tuple[Array, Array],
-        ) -> tuple[tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array], None]:
+        ) -> tuple[
+            tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array, Array, Array, Array],
+            None,
+        ]:
             """Accumulate gradients and metrics for one micro-step.
 
             :param carry: Tuple of (grads, total loss, seq rec loss, seq sigreg loss, span rec loss,
-                span sigreg loss, seq lejepa loss, span lejepa loss, decoder loss).
+                span sigreg loss, seq lejepa loss, span lejepa loss, decoder loss,
+                encoder mlm loss, encoder mlm acc1, encoder mlm acc5).
             :param inputs: Tuple of (micro step index, token batch).
             :returns: Updated carry and unused output.
             """
@@ -1754,12 +1835,17 @@ def main() -> None:
                 seq_lejepa_acc,
                 span_lejepa_acc,
                 decoder_loss_acc,
+                encoder_mlm_acc,
+                encoder_mlm_acc1_acc,
+                encoder_mlm_acc5_acc,
             ) = carry
             step_idx, tokens = inputs
             step_idx_global = micro_step0 + step_idx
             tokens_key = jax.random.fold_in(key, step_idx_global)
 
-            def _do_compute(_: None) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array]:
+            def _do_compute(
+                _: None,
+            ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array, Array, Array, Array]:
                 (
                     loss,
                     (
@@ -1770,6 +1856,9 @@ def main() -> None:
                         seq_lejepa_loss,
                         span_lejepa_loss,
                         decoder_loss,
+                        encoder_mlm_loss,
+                        encoder_mlm_acc1,
+                        encoder_mlm_acc5,
                         _total_loss,
                     ),
                 ), grads = value_and_grad(
@@ -1787,6 +1876,9 @@ def main() -> None:
                 seq_lejepa_accum = seq_lejepa_acc + seq_lejepa_loss
                 span_lejepa_accum = span_lejepa_acc + span_lejepa_loss
                 decoder_loss_accum = decoder_loss_acc + decoder_loss
+                encoder_mlm_accum = encoder_mlm_acc + encoder_mlm_loss
+                encoder_mlm_acc1_accum = encoder_mlm_acc1_acc + encoder_mlm_acc1
+                encoder_mlm_acc5_accum = encoder_mlm_acc5_acc + encoder_mlm_acc5
                 return (
                     grads_accum,
                     loss_accum,
@@ -1797,9 +1889,14 @@ def main() -> None:
                     seq_lejepa_accum,
                     span_lejepa_accum,
                     decoder_loss_accum,
+                    encoder_mlm_accum,
+                    encoder_mlm_acc1_accum,
+                    encoder_mlm_acc5_accum,
                 )
 
-            def _skip_compute(_: None) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array]:
+            def _skip_compute(
+                _: None,
+            ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array, Array, Array, Array]:
                 return (
                     grads_acc,
                     loss_acc,
@@ -1810,6 +1907,9 @@ def main() -> None:
                     seq_lejepa_acc,
                     span_lejepa_acc,
                     decoder_loss_acc,
+                    encoder_mlm_acc,
+                    encoder_mlm_acc1_acc,
+                    encoder_mlm_acc5_acc,
                 )
 
             active = step_idx < micro_steps
@@ -1826,6 +1926,9 @@ def main() -> None:
             seq_lejepa_loss,
             span_lejepa_loss,
             decoder_loss,
+            encoder_mlm_loss,
+            encoder_mlm_acc1,
+            encoder_mlm_acc5,
         ), _ = jax.lax.scan(
             _accum_body,
             (
@@ -1838,6 +1941,9 @@ def main() -> None:
                 seq_lejepa_init,
                 span_lejepa_init,
                 decoder_loss_init,
+                encoder_mlm_init,
+                encoder_mlm_acc1_init,
+                encoder_mlm_acc5_init,
             ),
             (step_indices, batch_tokens),
         )
@@ -1856,6 +1962,9 @@ def main() -> None:
         seq_lejepa_loss = seq_lejepa_loss / scale
         span_lejepa_loss = span_lejepa_loss / scale
         decoder_loss = decoder_loss / scale
+        encoder_mlm_loss = encoder_mlm_loss / scale
+        encoder_mlm_acc1 = encoder_mlm_acc1 / scale
+        encoder_mlm_acc5 = encoder_mlm_acc5 / scale
 
         grads = jax.lax.pmean(grads, axis_name="data")
         loss = jax.lax.pmean(loss, axis_name="data")
@@ -1866,6 +1975,9 @@ def main() -> None:
         seq_lejepa_loss = jax.lax.pmean(seq_lejepa_loss, axis_name="data")
         span_lejepa_loss = jax.lax.pmean(span_lejepa_loss, axis_name="data")
         decoder_loss = jax.lax.pmean(decoder_loss, axis_name="data")
+        encoder_mlm_loss = jax.lax.pmean(encoder_mlm_loss, axis_name="data")
+        encoder_mlm_acc1 = jax.lax.pmean(encoder_mlm_acc1, axis_name="data")
+        encoder_mlm_acc5 = jax.lax.pmean(encoder_mlm_acc5, axis_name="data")
         return (
             grads,
             loss,
@@ -1876,6 +1988,9 @@ def main() -> None:
             seq_lejepa_loss,
             span_lejepa_loss,
             decoder_loss,
+            encoder_mlm_loss,
+            encoder_mlm_acc1,
+            encoder_mlm_acc5,
         )
 
     def apply_step(
@@ -1928,6 +2043,9 @@ def main() -> None:
     last_seq_lejepa_val = 0.0
     last_span_lejepa_val = 0.0
     last_decoder_val = 0.0
+    last_encoder_mlm_val = 0.0
+    last_encoder_mlm_acc1_val = 0.0
+    last_encoder_mlm_acc5_val = 0.0
     if total_samples <= 0:
         raise ValueError("no valid samples found in the dataset")
     epoch_steps = total_samples // global_batch
@@ -2005,6 +2123,9 @@ def main() -> None:
                     seq_lejepa,
                     span_lejepa,
                     decoder_loss,
+                    encoder_mlm_loss,
+                    encoder_mlm_acc1,
+                    encoder_mlm_acc5,
                 ) = grad_step_pmap(
                     train_repl,
                     batch_tokens,
@@ -2039,6 +2160,9 @@ def main() -> None:
                     seq_lejepa_val = float(np.mean(jax.device_get(seq_lejepa)))
                     span_lejepa_val = float(np.mean(jax.device_get(span_lejepa)))
                     decoder_val = float(np.mean(jax.device_get(decoder_loss)))
+                    encoder_mlm_val = float(np.mean(jax.device_get(encoder_mlm_loss)))
+                    encoder_mlm_acc1_val = float(np.mean(jax.device_get(encoder_mlm_acc1)))
+                    encoder_mlm_acc5_val = float(np.mean(jax.device_get(encoder_mlm_acc5)))
                     last_loss_val = loss_val
                     last_seq_rec_val = seq_rec_val
                     last_seq_sigreg_val = seq_sigreg_val
@@ -2047,6 +2171,9 @@ def main() -> None:
                     last_seq_lejepa_val = seq_lejepa_val
                     last_span_lejepa_val = span_lejepa_val
                     last_decoder_val = decoder_val
+                    last_encoder_mlm_val = encoder_mlm_val
+                    last_encoder_mlm_acc1_val = encoder_mlm_acc1_val
+                    last_encoder_mlm_acc5_val = encoder_mlm_acc5_val
 
                     writer.add_scalar("train/total_loss", loss_val, global_step)
                     writer.add_scalar("train/seq_rec_loss", seq_rec_val, global_step)
@@ -2056,6 +2183,9 @@ def main() -> None:
                     writer.add_scalar("train/seq_lejepa_loss", seq_lejepa_val, global_step)
                     writer.add_scalar("train/span_lejepa_loss", span_lejepa_val, global_step)
                     writer.add_scalar("train/decoder_loss", decoder_val, global_step)
+                    writer.add_scalar("train/encoder_mlm_loss", encoder_mlm_val, global_step)
+                    writer.add_scalar("train/encoder_mlm_acc1", encoder_mlm_acc1_val, global_step)
+                    writer.add_scalar("train/encoder_mlm_acc5", encoder_mlm_acc5_val, global_step)
 
                 if log_this_step:
                     pbar.set_postfix(
@@ -2067,6 +2197,9 @@ def main() -> None:
                         seq_ljp=f"{last_seq_lejepa_val:.4f}",
                         span_ljp=f"{last_span_lejepa_val:.4f}",
                         dec=f"{last_decoder_val:.4f}",
+                        mlm=f"{last_encoder_mlm_val:.4f}",
+                        mlm1=f"{last_encoder_mlm_acc1_val:.4f}",
+                        mlm5=f"{last_encoder_mlm_acc5_val:.4f}",
                     )
                 pbar.update(1)
                 global_step += 1
