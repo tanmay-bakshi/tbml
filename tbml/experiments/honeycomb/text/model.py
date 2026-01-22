@@ -36,6 +36,7 @@ class TextTransformerConfig(BaseModel):
     :ivar embed_norm_scale: Scale applied after embedding RMSNorm.
     :ivar predictor_n_layers: Number of predictor blocks.
     :ivar decoder_n_layers: Number of decoder blocks.
+    :ivar causal_attention: Whether encoder/predictor attention is causal.
     """
 
     vocab_size: int = Field(default=50257)
@@ -54,6 +55,7 @@ class TextTransformerConfig(BaseModel):
     embed_norm_scale: float = Field(default=1.0)
     predictor_n_layers: int = Field(default=2)
     decoder_n_layers: int = Field(default=2)
+    causal_attention: bool = Field(default=True)
 
 
 class TokenEmbedding(eqx.Module):
@@ -308,6 +310,7 @@ class PredictorBlock(eqx.Module):
         qkv_kernel_init: Initializer,
         o_kernel_init: Initializer,
         mlp_kernel_init: Initializer,
+        is_causal: bool,
         key: Array,
     ) -> None:
         """Initialize the predictor transformer block.
@@ -325,6 +328,7 @@ class PredictorBlock(eqx.Module):
         :param qkv_kernel_init: Initializer for Q/K/V projections.
         :param o_kernel_init: Initializer for output projection.
         :param mlp_kernel_init: Initializer for MLP projections.
+        :param is_causal: Whether to apply causal attention masking.
         :param key: PRNG key for parameter initialization.
         """
         norm1_key, norm2_key, attn_key, mlp_key = jax.random.split(key, 4)
@@ -337,7 +341,7 @@ class PredictorBlock(eqx.Module):
                 n_kv_heads=n_heads,
                 attn_dropout=attn_dropout,
                 resid_dropout=resid_dropout,
-                is_causal=True,
+                is_causal=is_causal,
                 base=pope_base,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -352,7 +356,7 @@ class PredictorBlock(eqx.Module):
                 n_kv_heads=n_heads,
                 attn_dropout=attn_dropout,
                 resid_dropout=resid_dropout,
-                is_causal=True,
+                is_causal=is_causal,
                 base=pope_base,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -479,6 +483,7 @@ class Predictor(eqx.Module):
                     qkv_kernel_init=qkv_kernel_init,
                     o_kernel_init=o_kernel_init,
                     mlp_kernel_init=mlp_kernel_init,
+                    is_causal=config.causal_attention,
                     key=block_keys[idx],
                 )
             )
@@ -874,7 +879,7 @@ class TextTransformer(eqx.Module):
                     drop_path_prob=drop_rates[idx],
                     pope_base=config.pope_base,
                     attn_type=config.attn_type,
-                    is_causal=True,
+                    is_causal=config.causal_attention,
                     dtype=dtype,
                     param_dtype=param_dtype,
                     qkv_kernel_init=init,

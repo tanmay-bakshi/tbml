@@ -63,6 +63,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--pope-base", type=float, default=10000.0)
     parser.add_argument("--init-std", type=float, default=0.02)
     parser.add_argument("--attn-type", type=str, default="pope", choices=["pope", "rope"])
+    parser.add_argument("--causal-attention", type=str, default="true", choices=["true", "false"])
 
     parser.add_argument("--num-global-views", type=int, default=2)
     parser.add_argument("--num-local-views", type=int, default=6)
@@ -108,6 +109,20 @@ def _parse_betas(value: str) -> tuple[float, float]:
     if len(parts) != 2:
         raise ValueError("expected two comma-separated values for betas")
     return float(parts[0]), float(parts[1])
+
+
+def _parse_bool(value: str) -> bool:
+    """Parse a boolean string.
+
+    :param value: Input string ("true" or "false").
+    :returns: Parsed boolean.
+    """
+    lowered = value.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    raise ValueError("expected 'true' or 'false'")
 
 
 def _dtype_from_name(name: str) -> jnp.dtype:
@@ -1145,6 +1160,7 @@ def _save_checkpoint(
 def main() -> None:
     """Run the text training loop."""
     args = _parse_args()
+    causal_attention = _parse_bool(args.causal_attention)
 
     if args.max_train_steps < 0:
         raise ValueError("max-train-steps must be >= 0")
@@ -1341,6 +1357,7 @@ def main() -> None:
         attn_type=args.attn_type,
         embed_norm=False,
         embed_norm_scale=args.init_std,
+        causal_attention=causal_attention,
     )
     exclusion_patterns = list(TextTransformer.MUON_PARAM_EXCLUSION_PATTERNS)
 
