@@ -90,7 +90,8 @@ size. The encoder produces token representations of shape `(B, V, T, K)`.
 - Every view’s token representations (sample‑level encoder outputs, predictor outputs for masked
   globals, and predictor outputs for locals) are matched **token‑by‑token** to this global
   center.
-- Masked **and** unmasked tokens are included; EOS and padding positions are excluded.
+- Masked positions are always included; a random subset of unmasked positions is also included
+  (controlled by `--tjepa-unmasked-keep-prob`). EOS and padding positions are excluded.
 
 2) **TJepa SIGReg (`tjepa_sigreg_loss`)**
 

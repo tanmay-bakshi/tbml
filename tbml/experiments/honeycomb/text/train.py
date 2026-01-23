@@ -80,6 +80,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sigreg-slices", type=int, default=256)
     parser.add_argument("--sigreg-seed", type=int, default=0)
     parser.add_argument("--tjepa-loss-weight", type=float, default=1.0)
+    parser.add_argument("--tjepa-unmasked-keep-prob", type=float, default=0.1)
     parser.add_argument("--encoder-mlm-loss-weight", type=float, default=0.0)
     parser.add_argument("--encoder-mlm-keep-prob", type=float, default=0.0)
     parser.add_argument("--mask-token-input", action="store_true")
@@ -955,6 +956,8 @@ def main() -> None:
         raise ValueError("local-mask-min must be <= local-mask-max")
     if args.sigreg_weight < 0.0 or args.sigreg_weight > 1.0:
         raise ValueError("sigreg-weight must be in [0, 1]")
+    if args.tjepa_unmasked_keep_prob < 0.0 or args.tjepa_unmasked_keep_prob > 1.0:
+        raise ValueError("tjepa-unmasked-keep-prob must be in [0, 1]")
     if args.tjepa_loss_weight < 0.0:
         raise ValueError("tjepa-loss-weight must be >= 0")
     if args.encoder_mlm_loss_weight < 0.0:
@@ -1149,6 +1152,7 @@ def main() -> None:
             "sigreg_slices": args.sigreg_slices,
             "sigreg_seed": args.sigreg_seed,
             "tjepa_loss_weight": args.tjepa_loss_weight,
+            "tjepa_unmasked_keep_prob": args.tjepa_unmasked_keep_prob,
             "encoder_mlm_weight": args.encoder_mlm_loss_weight,
             "encoder_mlm_keep_prob": args.encoder_mlm_keep_prob,
         },
@@ -1278,7 +1282,7 @@ def main() -> None:
             :returns: Tuple of (total loss, (tjepa rec loss, tjepa sigreg loss, tjepa loss,
                 encoder mlm loss, encoder mlm acc1, encoder mlm acc5)).
             """
-            view_key, predictor_key, mlm_key = jax.random.split(tokens_key, 3)
+            view_key, predictor_key, mlm_key, rec_key = jax.random.split(tokens_key, 4)
             token_post, mask_positions, view_attn = _encode_views(
                 model_inner,
                 tokens,
@@ -1392,7 +1396,13 @@ def main() -> None:
                 view_reps = jnp.concatenate([sample_global, pred_globals, pred_locals], axis=1)
                 diffs = view_reps.astype(jnp.float32) - global_center[:, None, :, :]
                 mse = jnp.mean(jnp.square(diffs), axis=-1)
-                rec_mask = jnp.logical_or(view_attn, mask_positions)
+                unmasked = jnp.logical_and(view_attn, jnp.logical_not(mask_positions))
+                if args.tjepa_unmasked_keep_prob > 0.0:
+                    keep_noise = jax.random.uniform(rec_key, shape=unmasked.shape)
+                    keep_unmasked = jnp.logical_and(unmasked, keep_noise < args.tjepa_unmasked_keep_prob)
+                else:
+                    keep_unmasked = jnp.zeros_like(unmasked)
+                rec_mask = jnp.logical_or(mask_positions, keep_unmasked)
                 rec_mask_f = rec_mask.astype(jnp.float32)
                 loss_sum = jnp.sum(mse * rec_mask_f)
                 count = jnp.sum(rec_mask_f)
