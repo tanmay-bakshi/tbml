@@ -223,7 +223,7 @@ def main() -> None:
     mask_positions = np.zeros((1, seq_len), dtype=np.bool_)
     mask_positions[0, len(prefix_ids) :] = True
 
-    token_pre, token_post, _pooled = model.forward_with_intermediates(
+    _token_pre, token_post, _pooled = model.forward_with_intermediates(
         jnp.asarray(masked_tokens),
         jnp.asarray(masked_attn),
         train=False,
@@ -238,7 +238,6 @@ def main() -> None:
         key=None,
     )
     pred_span = _masked_mean(pred_reps, jnp.asarray(mask_positions))
-    pred_span = model.predictor.final_norm(pred_span)
     pred_span = jax.device_get(pred_span)[0]
 
     num_candidates = len(suffix_ids_list)
@@ -249,7 +248,7 @@ def main() -> None:
         full_tokens[idx, :] = np.asarray(tokens, dtype=np.int32)
         full_attn[idx, :] = True
 
-    cand_pre, _cand_post, _cand_pooled = model.forward_with_intermediates(
+    _cand_pre, cand_post, _cand_pooled = model.forward_with_intermediates(
         jnp.asarray(full_tokens),
         jnp.asarray(full_attn),
         train=False,
@@ -257,9 +256,7 @@ def main() -> None:
     )
     suffix_mask = np.zeros((num_candidates, seq_len), dtype=np.bool_)
     suffix_mask[:, len(prefix_ids) :] = True
-    cand_span = _masked_mean(cand_pre, jnp.asarray(suffix_mask))
-    cand_span = model.final_norm(cand_span)
-    cand_span = model.output_ffn(cand_span, train=False, key=None)
+    cand_span = _masked_mean(cand_post, jnp.asarray(suffix_mask))
     cand_span = jax.device_get(cand_span)
 
     diffs = cand_span - pred_span[None, :]

@@ -25,7 +25,6 @@ from tbml.experiments.honeycomb.text.dataset import (
     iter_text_batches,
 )
 from tbml.experiments.honeycomb.text.model import TextTransformer, TextTransformerConfig
-from tbml.nn import RMSNorm, SwiGLUFeedForward
 from tbml.optimizers import (
     MuonWithAdamWFallback,
     MuonWithAdamWFallbackState,
@@ -39,7 +38,7 @@ def _parse_args() -> argparse.Namespace:
 
     :returns: Parsed arguments namespace.
     """
-    parser = argparse.ArgumentParser(description="Train a text encoder with LeJEPA.")
+    parser = argparse.ArgumentParser(description="Train a text encoder with TJepa.")
     parser.add_argument("--runs-folder", type=str, required=True)
     parser.add_argument("--data-folder", type=str, required=True)
     parser.add_argument("--shuffle-buffer", type=int, default=1024)
@@ -60,7 +59,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--n-heads", type=int, default=12)
     parser.add_argument("--n-layers", type=int, default=12)
     parser.add_argument("--predictor-n-layers", type=int, default=None)
-    parser.add_argument("--decoder-n-layers", type=int, default=None)
     parser.add_argument("--mlp-ratio", type=float, default=4.0)
     parser.add_argument("--attn-dropout", type=float, default=0.0)
     parser.add_argument("--resid-dropout", type=float, default=0.0)
@@ -70,7 +68,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--attn-type", type=str, default="pope", choices=["pope", "rope"])
     parser.add_argument("--causal-attention", type=str, default="true", choices=["true", "false"])
 
-    parser.add_argument("--num-global-views", type=int, default=2)
+    parser.add_argument("--num-global-views", type=int, default=1)
     parser.add_argument("--num-local-views", type=int, default=6)
     parser.add_argument("--global-mask-min", type=float, default=None)
     parser.add_argument("--global-mask-max", type=float, default=None)
@@ -81,13 +79,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sigreg-weight", type=float, default=0.25)
     parser.add_argument("--sigreg-slices", type=int, default=256)
     parser.add_argument("--sigreg-seed", type=int, default=0)
-    parser.add_argument("--pred-loss", type=str, default="mse", choices=["mse", "cosine"])
-    parser.add_argument("--seq-loss-weight", type=float, default=0.5)
-    parser.add_argument("--span-loss-weight", type=float, default=0.0)
-    parser.add_argument("--decoder-loss-weight", type=float, default=0.5)
+    parser.add_argument("--tjepa-loss-weight", type=float, default=1.0)
     parser.add_argument("--encoder-mlm-loss-weight", type=float, default=0.0)
     parser.add_argument("--encoder-mlm-keep-prob", type=float, default=0.0)
-    parser.add_argument("--span-tokenwise", action="store_true")
     parser.add_argument("--mask-token-input", action="store_true")
 
     parser.add_argument("--muon-lr", type=float, default=1e-3)
@@ -752,56 +746,6 @@ def _combine_views(
     return views, mask_positions, view_attn
 
 
-def _pool_last(
-    reps: Array,
-    attention_mask: Array,
-) -> Array:
-    """Pool the last valid token representation.
-
-    :param reps: Token representations of shape (B, T, D).
-    :param attention_mask: Attention mask of shape (B, T).
-    :returns: Pooled representations of shape (B, D).
-    """
-    if reps.ndim != 3:
-        raise ValueError("reps must have shape (B, T, D)")
-    if attention_mask.ndim != 2:
-        raise ValueError("attention_mask must have shape (B, T)")
-    if reps.shape[:2] != attention_mask.shape:
-        raise ValueError("reps and attention_mask must align on (B, T)")
-
-    mask = attention_mask.astype(bool)
-    positions = jnp.arange(reps.shape[1], dtype=jnp.int32)
-    positions = jnp.broadcast_to(positions[None, :], mask.shape)
-    masked_positions = jnp.where(mask, positions, jnp.full_like(positions, -1))
-    last_idx = jnp.max(masked_positions, axis=1)
-    last_idx = jnp.maximum(last_idx, 0)
-    idx = last_idx[:, None, None]
-    idx = jnp.broadcast_to(idx, (idx.shape[0], 1, reps.shape[-1]))
-    return jnp.take_along_axis(reps, idx, axis=1).squeeze(axis=1)
-
-
-def _apply_encoder_head(
-    reps: Array,
-    *,
-    base_norm: RMSNorm,
-    output_ffn: SwiGLUFeedForward,
-    train: bool,
-    key: Array | None,
-) -> Array:
-    """Apply the encoder output head (norm -> FFN -> norm).
-
-    :param reps: Input representations.
-    :param base_norm: Transformer final RMSNorm.
-    :param output_ffn: Output feed-forward layer.
-    :param train: Whether to enable dropout in the output FFN.
-    :param key: PRNG key for FFN dropout.
-    :returns: Transformed representations.
-    """
-    reps = base_norm(reps)
-    reps = output_ffn(reps, train=train, key=key)
-    return reps
-
-
 def _encode_views(
     model: TextTransformer,
     tokens: Array,
@@ -819,8 +763,8 @@ def _encode_views(
     mask_id: int,
     use_mask_token: bool,
     masking_mode: str,
-) -> tuple[Array, Array, Array, Array, Array, Array]:
-    """Encode masked views into pooled embeddings and token representations.
+) -> tuple[Array, Array, Array]:
+    """Encode masked views into token representations.
 
     :param model: Text transformer encoder.
     :param tokens: Token ids of shape (B, T).
@@ -837,7 +781,7 @@ def _encode_views(
     :param mask_id: Mask token id.
     :param use_mask_token: Whether to replace masked positions with mask tokens.
     :param masking_mode: Masking mode ("spans" or "tokens").
-    :returns: Tuple of (pooled_post, pooled_pre, token_post, token_pre, mask_positions, view_attn).
+    :returns: Tuple of (token_post, mask_positions, view_attn).
     """
     if num_global_views + num_local_views <= 0:
         raise ValueError("at least one view must be requested")
@@ -875,383 +819,44 @@ def _encode_views(
         local_masks,
         local_attn,
     )
-
-    sample_view = tokens[:, None, :]
-    sample_mask = jnp.zeros_like(sample_view, dtype=jnp.bool_)
-    sample_attn = tokens != pad_id
-    sample_attn = sample_attn[:, None, :]
-
-    views = jnp.concatenate([views, sample_view], axis=1)
-    mask_positions = jnp.concatenate([_mask_positions, sample_mask], axis=1)
-    view_attn = jnp.concatenate([view_attn, sample_attn], axis=1)
+    mask_positions = _mask_positions
 
     bsz, num_views, seq_len = views.shape
     flat_views = views.reshape((bsz * num_views, seq_len))
     flat_mask = view_attn.reshape((bsz * num_views, seq_len))
-    if use_mask_token is True:
-        pool_mask = jnp.logical_and(view_attn, jnp.logical_not(mask_positions))
-    else:
-        pool_mask = view_attn
-    flat_pool_mask = pool_mask.reshape((bsz * num_views, seq_len))
-    reps_pre, reps_post, _pooled_post = model.forward_with_intermediates(
+    _reps_pre, reps_post, _pooled_post = model.forward_with_intermediates(
         flat_views,
         flat_mask,
         train=train,
         key=model_key,
     )
-    pooled_pre = _pool_last(reps_pre, flat_pool_mask)
-    pooled_post = _pool_last(reps_post, flat_pool_mask)
-    token_pre = reps_pre.reshape((bsz, num_views, seq_len, reps_pre.shape[-1]))
     token_post = reps_post.reshape((bsz, num_views, seq_len, reps_post.shape[-1]))
-    pooled_post = pooled_post.reshape((bsz, num_views, pooled_post.shape[-1]))
-    pooled_pre = pooled_pre.reshape((bsz, num_views, pooled_pre.shape[-1]))
-    return pooled_post, pooled_pre, token_post, token_pre, mask_positions, view_attn
+    return token_post, mask_positions, view_attn
 
 
-def _span_ids(mask: Array) -> Array:
-    """Assign a span id to each masked position.
-
-    :param mask: Boolean mask of shape (T,).
-    :returns: Integer span ids of shape (T,), 0 for unmasked positions.
-    """
-    if mask.ndim != 1:
-        raise ValueError("mask must be 1D")
-    mask_int = mask.astype(jnp.int32)
-    prev = jnp.concatenate([jnp.zeros((1,), dtype=jnp.int32), mask_int[:-1]])
-    start = jnp.logical_and(mask_int == 1, prev == 0)
-    span_ids = jnp.cumsum(start.astype(jnp.int32)) * mask_int
-    return span_ids
-
-
-def _predictor_span_loss(
-    sample_reps: Array,
-    view_reps: Array,
-    mask_positions: Array,
-    *,
-    base_norm: RMSNorm,
-    output_ffn: SwiGLUFeedForward,
-    predictor_norm: RMSNorm,
+def _masked_mean(
+    reps: Array,
+    mask: Array,
 ) -> Array:
-    """Compute predictor span reconstruction loss for a batch of views.
+    """Compute mean representations over masked positions.
 
-    :param sample_reps: Sample token reps of shape (B, T, D) pre-base-norm.
-    :param view_reps: Predictor reps of shape (B, V, T, D) pre-predictor-norm.
-    :param mask_positions: Mask positions of shape (B, V, T).
-    :param base_norm: Base model RMSNorm module.
-    :param output_ffn: Encoder output feed-forward layer.
-    :param predictor_norm: Predictor RMSNorm module.
-    :returns: Scalar loss.
+    :param reps: Token representations of shape (B, V, T, D).
+    :param mask: Boolean mask of shape (B, V, T).
+    :returns: Mean pooled representations of shape (B, V, D).
     """
-    if sample_reps.ndim != 3:
-        raise ValueError("sample_reps must have shape (B, T, D)")
-    if view_reps.ndim != 4:
-        raise ValueError("view_reps must have shape (B, V, T, D)")
-    if mask_positions.ndim != 3:
-        raise ValueError("mask_positions must have shape (B, V, T)")
-    if view_reps.shape[:3] != mask_positions.shape:
-        raise ValueError("view_reps and mask_positions must align on (B, V, T)")
-    if sample_reps.shape[0] != view_reps.shape[0]:
-        raise ValueError("batch sizes must match")
-    if sample_reps.shape[1] != view_reps.shape[2]:
-        raise ValueError("sequence lengths must match")
+    if reps.ndim != 4:
+        raise ValueError("reps must have shape (B, V, T, D)")
+    if mask.ndim != 3:
+        raise ValueError("mask must have shape (B, V, T)")
+    if reps.shape[:3] != mask.shape:
+        raise ValueError("reps and mask must align on (B, V, T)")
 
-    num_segments = sample_reps.shape[1] + 1
-
-    def _loss_for_view(
-        sample_rep: Array,
-        view_rep: Array,
-        mask: Array,
-    ) -> Array:
-        span_ids = _span_ids(mask)
-        sum_sample = jax.ops.segment_sum(sample_rep, span_ids, num_segments)
-        sum_view = jax.ops.segment_sum(view_rep, span_ids, num_segments)
-        counts = jax.ops.segment_sum(mask.astype(jnp.float32), span_ids, num_segments)
-        denom = jnp.maximum(counts[:, None], 1.0)
-        mean_sample = sum_sample / denom
-        mean_view = sum_view / denom
-        mean_sample = _apply_encoder_head(
-            mean_sample,
-            base_norm=base_norm,
-            output_ffn=output_ffn,
-            train=False,
-            key=None,
-        ).astype(jnp.float32)
-        mean_view = predictor_norm(mean_view).astype(jnp.float32)
-        mse = jnp.mean(jnp.square(mean_sample - mean_view), axis=-1)
-        valid = counts > 0
-        valid_count = jnp.sum(valid)
-        return jnp.where(valid_count > 0, jnp.sum(mse * valid) / valid_count, 0.0)
-
-    def _loss_for_sample(
-        sample_rep: Array,
-        view_rep: Array,
-        mask: Array,
-    ) -> Array:
-        view_losses = jax.vmap(_loss_for_view, in_axes=(None, 0, 0))(sample_rep, view_rep, mask)
-        return jnp.mean(view_losses)
-
-    losses = jax.vmap(_loss_for_sample, in_axes=(0, 0, 0))(sample_reps, view_reps, mask_positions)
-    return jnp.mean(losses)
-
-
-def _predictor_span_loss_tokenwise(
-    sample_reps: Array,
-    view_reps: Array,
-    mask_positions: Array,
-    *,
-    base_norm: RMSNorm,
-    output_ffn: SwiGLUFeedForward,
-    predictor_norm: RMSNorm,
-) -> Array:
-    """Compute predictor span loss using per-token reconstruction.
-
-    :param sample_reps: Sample token reps of shape (B, T, D) pre-base-norm.
-    :param view_reps: Predictor reps of shape (B, V, T, D) pre-predictor-norm.
-    :param mask_positions: Mask positions of shape (B, V, T).
-    :param base_norm: Base model RMSNorm module.
-    :param output_ffn: Encoder output feed-forward layer.
-    :param predictor_norm: Predictor RMSNorm module.
-    :returns: Scalar loss.
-    """
-    if sample_reps.ndim != 3:
-        raise ValueError("sample_reps must have shape (B, T, D)")
-    if view_reps.ndim != 4:
-        raise ValueError("view_reps must have shape (B, V, T, D)")
-    if mask_positions.ndim != 3:
-        raise ValueError("mask_positions must have shape (B, V, T)")
-    if view_reps.shape[:3] != mask_positions.shape:
-        raise ValueError("view_reps and mask_positions must align on (B, V, T)")
-    if sample_reps.shape[0] != view_reps.shape[0]:
-        raise ValueError("batch sizes must match")
-    if sample_reps.shape[1] != view_reps.shape[2]:
-        raise ValueError("sequence lengths must match")
-
-    num_segments = sample_reps.shape[1] + 1
-
-    def _loss_for_view(sample_rep: Array, view_rep: Array, mask: Array) -> Array:
-        span_ids = _span_ids(mask)
-        sample_post = _apply_encoder_head(
-            sample_rep,
-            base_norm=base_norm,
-            output_ffn=output_ffn,
-            train=False,
-            key=None,
-        ).astype(jnp.float32)
-        sample_post = jax.lax.stop_gradient(sample_post)
-        view_post = predictor_norm(view_rep).astype(jnp.float32)
-        mse = jnp.mean(jnp.square(sample_post - view_post), axis=-1)
-        mask_f = mask.astype(jnp.float32)
-        span_loss = jax.ops.segment_sum(mse * mask_f, span_ids, num_segments)
-        counts = jax.ops.segment_sum(mask_f, span_ids, num_segments)
-        denom = jnp.maximum(counts, 1.0)
-        mean_span = span_loss / denom
-        valid = counts > 0
-        valid_count = jnp.sum(valid)
-        return jnp.where(valid_count > 0, jnp.sum(mean_span * valid) / valid_count, 0.0)
-
-    def _loss_for_sample(sample_rep: Array, view_rep: Array, mask: Array) -> Array:
-        view_losses = jax.vmap(_loss_for_view, in_axes=(None, 0, 0))(sample_rep, view_rep, mask)
-        return jnp.mean(view_losses)
-
-    losses = jax.vmap(_loss_for_sample, in_axes=(0, 0, 0))(sample_reps, view_reps, mask_positions)
-    return jnp.mean(losses)
-
-
-def _decoder_loss(
-    model: TextTransformer,
-    sample_tokens: Array,
-    view_pred_reps: Array,
-    view_masks: Array,
-    *,
-    bos_id: int,
-    eos_id: int,
-    pad_id: int,
-    key: Array,
-) -> Array:
-    """Compute decoder autoregressive loss over sampled masked spans.
-
-    :param model: TextTransformer containing the decoder and embeddings.
-    :param sample_tokens: Token ids of shape (B, T) with EOS removed.
-    :param view_pred_reps: Predictor outputs of shape (B, V, T, D) pre-predictor-norm.
-    :param view_masks: Mask positions of shape (B, V, T) for the decoder views.
-    :param bos_id: BOS token id.
-    :param eos_id: EOS token id.
-    :param pad_id: Padding token id.
-    :param key: PRNG key for decoder dropout.
-    :returns: Scalar decoder loss.
-    """
-    if sample_tokens.ndim != 2:
-        raise ValueError("sample_tokens must have shape (B, T)")
-    if view_pred_reps.ndim != 4:
-        raise ValueError("view_pred_reps must have shape (B, V, T, D)")
-    if view_masks.ndim != 3:
-        raise ValueError("view_masks must have shape (B, V, T)")
-    if view_pred_reps.shape[:3] != view_masks.shape:
-        raise ValueError("view_pred_reps and view_masks must align on (B, V, T)")
-    if sample_tokens.shape[0] != view_pred_reps.shape[0]:
-        raise ValueError("batch sizes must match")
-    if sample_tokens.shape[1] != view_pred_reps.shape[2]:
-        raise ValueError("sequence lengths must match")
-    if model.predictor is None:
-        raise ValueError("predictor is required for decoder loss")
-    if model.decoder is None:
-        raise ValueError("decoder is required for decoder loss")
-    view_pred_reps = model.predictor.final_norm(view_pred_reps)
-    bsz, num_views, seq_len, dim = view_pred_reps.shape
-    flat_masks = view_masks.reshape((bsz * num_views, seq_len))
-    flat_pred = view_pred_reps.reshape((bsz * num_views, seq_len, dim))
-    sample_tokens = sample_tokens.astype(jnp.int32)
-    sample_tokens_flat = jnp.repeat(sample_tokens, repeats=num_views, axis=0)
-
-    positions = jnp.arange(seq_len, dtype=jnp.int32)
-    flat_keys = jax.random.split(key, flat_masks.shape[0])
-
-    def _pick_span(mask: Array, span_key: Array) -> tuple[Array, Array, Array]:
-        span_ids = _span_ids(mask)
-        pos_for_min = jnp.where(span_ids > 0, positions, jnp.full_like(positions, seq_len))
-        pos_for_max = jnp.where(span_ids > 0, positions, jnp.full_like(positions, -1))
-        start = jax.ops.segment_min(pos_for_min, span_ids, seq_len + 1)
-        end = jax.ops.segment_max(pos_for_max, span_ids, seq_len + 1)
-        length = jnp.where(end >= start, end - start + 1, 0)
-        length = length.at[0].set(0)
-        valid = length > 0
-        valid = valid.at[0].set(False)
-        count = jnp.sum(valid)
-
-        def _choose() -> tuple[Array, Array, Array]:
-            probs = valid.astype(jnp.float32)
-            probs = probs / jnp.sum(probs)
-            idx = jax.random.choice(span_key, valid.shape[0], p=probs)
-            return start[idx], length[idx], jnp.asarray(True)
-
-        def _fallback() -> tuple[Array, Array, Array]:
-            return jnp.asarray(0, dtype=jnp.int32), jnp.asarray(0, dtype=jnp.int32), jnp.asarray(False)
-
-        return jax.lax.cond(count > 0, _choose, _fallback)
-
-    span_starts, span_lengths, span_valid = jax.vmap(_pick_span)(flat_masks, flat_keys)
-    offsets = jnp.arange(seq_len, dtype=jnp.int32)
-    offsets_with_bos = jnp.arange(seq_len + 1, dtype=jnp.int32)
-    chunk_key = jax.random.split(key, 1)[0]
-    tokens_view = sample_tokens_flat
-    pred_view = flat_pred
-    idxs = span_starts[:, None] + offsets[None, :]
-    idxs = jnp.clip(idxs, 0, seq_len - 1)
-    span_tokens = jnp.take_along_axis(tokens_view, idxs, axis=1)
-    span_mem = jnp.take_along_axis(pred_view, idxs[:, :, None], axis=1)
-
-    span_mask = offsets[None, :] < span_lengths[:, None]
-    span_tokens = jnp.where(span_mask, span_tokens, pad_id)
-    span_mem = jnp.where(span_mask[:, :, None], span_mem, jnp.zeros_like(span_mem))
-
-    bos_col = jnp.full((span_tokens.shape[0], 1), bos_id, dtype=span_tokens.dtype)
-    dec_in = jnp.concatenate([bos_col, span_tokens], axis=1)
-    dec_mask = offsets_with_bos[None, :] < (span_lengths + 1)[:, None]
-    dec_mask = jnp.logical_and(dec_mask, span_valid[:, None])
-
-    dec_targets = jnp.full((span_tokens.shape[0], seq_len + 1), pad_id, dtype=span_tokens.dtype)
-    dec_targets = dec_targets.at[:, :seq_len].set(span_tokens)
-    eos_pos = jnp.clip(span_lengths, 0, seq_len)
-    row_idx = jnp.arange(span_tokens.shape[0], dtype=jnp.int32)
-    dec_targets = dec_targets.at[row_idx, eos_pos].set(eos_id)
-
-    target_mask = offsets_with_bos[None, :] < (span_lengths + 1)[:, None]
-    target_mask = jnp.logical_and(target_mask, span_valid[:, None])
-
-    mem_mask = jnp.logical_and(span_mask, span_valid[:, None])
-    any_mem = jnp.any(mem_mask, axis=1)
-    fallback = jnp.zeros_like(mem_mask)
-    fallback = fallback.at[:, 0].set(True)
-    mem_mask = jnp.where(any_mem[:, None], mem_mask, fallback)
-
-    dec_embed = model.token_embed(dec_in)
-    dec_out = model.decoder(
-        dec_embed,
-        dec_mask,
-        span_mem,
-        mem_mask,
-        train=True,
-        key=chunk_key,
-    )
-    logits = model.token_embed.unembed(dec_out).astype(jnp.float32)
-    log_probs = jax.nn.log_softmax(logits, axis=-1)
-    target_idx = dec_targets.astype(jnp.int32)
-    token_logp = jnp.take_along_axis(log_probs, target_idx[..., None], axis=-1).squeeze(-1)
-    loss = -token_logp * target_mask.astype(jnp.float32)
-    loss_sum = jnp.sum(loss)
-    count_sum = jnp.sum(target_mask.astype(jnp.float32))
-
-    def _with_count() -> Array:
-        return loss_sum / count_sum
-
-    def _no_count() -> Array:
-        return jnp.asarray(0.0, dtype=jnp.float32)
-
-    return jax.lax.cond(count_sum > 0.0, _with_count, _no_count)
-
-
-def _select_span_targets_per_view(
-    sample_reps: Array,
-    mask_positions: Array,
-    *,
-    base_norm: RMSNorm,
-    output_ffn: SwiGLUFeedForward,
-    key: Array,
-) -> Array:
-    """Select one masked-span target vector per sample and per view for SIGReg.
-
-    :param sample_reps: Sample token reps of shape (B, T, D) pre-base-norm.
-    :param mask_positions: Mask positions of shape (B, V, T) for global/local views.
-    :param base_norm: Base model RMSNorm module.
-    :param output_ffn: Encoder output feed-forward layer.
-    :param key: PRNG key for sampling.
-    :returns: Array of shape (B, V, D) with one selected target per sample per view.
-    """
-    if sample_reps.ndim != 3:
-        raise ValueError("sample_reps must have shape (B, T, D)")
-    if mask_positions.ndim != 3:
-        raise ValueError("mask_positions must have shape (B, V, T)")
-    if sample_reps.shape[0] != mask_positions.shape[0]:
-        raise ValueError("batch sizes must match")
-    if sample_reps.shape[1] != mask_positions.shape[2]:
-        raise ValueError("sequence lengths must match")
-
-    num_segments = sample_reps.shape[1] + 1
-
-    def _per_view(sample_rep: Array, mask: Array, view_key: Array) -> Array:
-        span_ids = _span_ids(mask)
-        sum_sample = jax.ops.segment_sum(sample_rep, span_ids, num_segments)
-        counts = jax.ops.segment_sum(mask.astype(jnp.float32), span_ids, num_segments)
-        denom = jnp.maximum(counts[:, None], 1.0)
-        mean_sample = sum_sample / denom
-        mean_sample = _apply_encoder_head(
-            mean_sample,
-            base_norm=base_norm,
-            output_ffn=output_ffn,
-            train=False,
-            key=None,
-        )
-        valid = counts > 0
-        valid = valid.at[0].set(False)
-        valid_count = jnp.sum(valid)
-
-        def _pick() -> Array:
-            probs = valid.astype(jnp.float32)
-            probs = probs / jnp.sum(probs)
-            idx = jax.random.choice(view_key, valid.shape[0], p=probs)
-            return mean_sample[idx]
-
-        def _fallback() -> Array:
-            return jnp.zeros((mean_sample.shape[-1],), dtype=mean_sample.dtype)
-
-        return jax.lax.cond(valid_count > 0, _pick, _fallback)
-
-    def _per_sample(sample_rep: Array, view_masks: Array, sample_key: Array) -> Array:
-        view_keys = jax.random.split(sample_key, view_masks.shape[0])
-        return jax.vmap(_per_view, in_axes=(None, 0, 0))(sample_rep, view_masks, view_keys)
-
-    keys = jax.random.split(key, sample_reps.shape[0])
-    return jax.vmap(_per_sample)(sample_reps, mask_positions, keys)
+    mask_f = mask.astype(jnp.float32)
+    reps_f = reps.astype(jnp.float32)
+    summed = jnp.sum(reps_f * mask_f[..., None], axis=2)
+    counts = jnp.sum(mask_f, axis=2)
+    denom = jnp.maximum(counts, 1.0)
+    return summed / denom[..., None]
 
 
 def _save_checkpoint(
@@ -1296,8 +901,8 @@ def main() -> None:
         raise ValueError("num-global-views must be >= 0")
     if args.num_local_views < 0:
         raise ValueError("num-local-views must be >= 0")
-    default_global_min = 0.25
-    default_global_max = 0.30
+    default_global_min = 0.0
+    default_global_max = 0.0
     default_local_min = 0.40
     default_local_max = 0.45
 
@@ -1324,28 +929,23 @@ def main() -> None:
         raise ValueError("local-mask-min must be <= local-mask-max")
     if args.sigreg_weight < 0.0 or args.sigreg_weight > 1.0:
         raise ValueError("sigreg-weight must be in [0, 1]")
-    if args.pred_loss not in ("mse", "cosine"):
-        raise ValueError("pred-loss must be 'mse' or 'cosine'")
-    if args.seq_loss_weight < 0.0:
-        raise ValueError("seq-loss-weight must be >= 0")
-    if args.span_loss_weight < 0.0:
-        raise ValueError("span-loss-weight must be >= 0")
-    if args.decoder_loss_weight < 0.0:
-        raise ValueError("decoder-loss-weight must be >= 0")
+    if args.tjepa_loss_weight < 0.0:
+        raise ValueError("tjepa-loss-weight must be >= 0")
     if args.encoder_mlm_loss_weight < 0.0:
         raise ValueError("encoder-mlm-loss-weight must be >= 0")
     if args.encoder_mlm_keep_prob < 0.0 or args.encoder_mlm_keep_prob > 1.0:
         raise ValueError("encoder-mlm-keep-prob must be in [0, 1]")
-    if (
-        args.seq_loss_weight
-        + args.span_loss_weight
-        + args.decoder_loss_weight
-        + args.encoder_mlm_loss_weight
-        <= 0.0
-    ):
+    if args.tjepa_loss_weight + args.encoder_mlm_loss_weight <= 0.0:
         raise ValueError("at least one loss weight must be > 0")
     if args.num_global_views + args.num_local_views <= 0:
         raise ValueError("at least one view must be requested")
+    if args.tjepa_loss_weight > 0.0:
+        if args.num_global_views != 1:
+            raise ValueError("tjepa requires exactly one global view")
+        if args.num_local_views <= 0:
+            raise ValueError("tjepa requires at least one local view")
+        if args.global_mask_max != 0.0:
+            raise ValueError("tjepa requires global-mask-max to be 0")
 
     dtype = _dtype_from_name(args.dtype)
     if dtype in (jnp.bfloat16, jnp.float16):
@@ -1466,11 +1066,8 @@ def main() -> None:
         predictor_layers = args.n_layers
     if predictor_layers < 0:
         raise ValueError("predictor-n-layers must be >= 0")
-    decoder_layers = args.decoder_n_layers
-    if decoder_layers is None:
-        decoder_layers = args.n_layers
-    if decoder_layers < 0:
-        raise ValueError("decoder-n-layers must be >= 0")
+    if args.tjepa_loss_weight > 0.0 and predictor_layers == 0:
+        raise ValueError("tjepa requires predictor-n-layers > 0")
 
     model_config = TextTransformerConfig(
         vocab_size=vocab_size,
@@ -1479,7 +1076,6 @@ def main() -> None:
         n_heads=args.n_heads,
         n_layers=args.n_layers,
         predictor_n_layers=int(predictor_layers),
-        decoder_n_layers=int(decoder_layers),
         mlp_ratio=args.mlp_ratio,
         attn_dropout=args.attn_dropout,
         resid_dropout=args.resid_dropout,
@@ -1497,7 +1093,6 @@ def main() -> None:
         r"^.*norm\d*\..*$",
         r"^final_norm\..*$",
         r"^predictor\.final_norm\..*$",
-        r"^decoder\.final_norm\..*$",
     ]
 
     run_config: dict[str, object] = {
@@ -1532,13 +1127,9 @@ def main() -> None:
             "sigreg_weight": args.sigreg_weight,
             "sigreg_slices": args.sigreg_slices,
             "sigreg_seed": args.sigreg_seed,
-            "pred_loss": args.pred_loss,
-            "seq_loss_weight": args.seq_loss_weight,
-            "span_loss_weight": args.span_loss_weight,
-            "decoder_loss_weight": args.decoder_loss_weight,
+            "tjepa_loss_weight": args.tjepa_loss_weight,
             "encoder_mlm_weight": args.encoder_mlm_loss_weight,
             "encoder_mlm_keep_prob": args.encoder_mlm_keep_prob,
-            "span_tokenwise": args.span_tokenwise,
         },
         "optimizer": {
             "muon_lr": args.muon_lr,
@@ -1640,20 +1231,7 @@ def main() -> None:
         global_step: Array,
         micro_step0: Array,
         micro_steps: Array,
-    ) -> tuple[
-        eqx.Module,
-        Array,
-        Array,
-        Array,
-        Array,
-        Array,
-        Array,
-        Array,
-        Array,
-        Array,
-        Array,
-        Array,
-    ]:
+    ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array]:
         """Compute accumulated gradients and metrics across micro-steps.
 
         :param model_in: Replicated model.
@@ -1662,8 +1240,7 @@ def main() -> None:
         :param global_step: Global step index for loss scheduling.
         :param micro_step0: Starting micro-step index for RNG folding.
         :param micro_steps: Number of valid micro-steps in the batch.
-        :returns: Tuple of (grads, total loss, seq rec loss, seq sigreg loss, span rec loss,
-            span sigreg loss, seq lejepa loss, span lejepa loss, decoder loss,
+        :returns: Tuple of (grads, total loss, tjepa rec loss, tjepa sigreg loss, tjepa loss,
             encoder mlm loss, encoder mlm acc1, encoder mlm acc5).
         """
 
@@ -1671,40 +1248,17 @@ def main() -> None:
             model_inner: TextTransformer,
             tokens: Array,
             tokens_key: Array,
-        ) -> tuple[
-            Array,
-            tuple[
-                Array,
-                Array,
-                Array,
-                Array,
-                Array,
-                Array,
-                Array,
-                Array,
-                Array,
-                Array,
-                Array,
-            ],
-        ]:
+        ) -> tuple[Array, tuple[Array, Array, Array, Array, Array, Array]]:
             """Compute the total loss and its components.
 
             :param model_inner: Model replica used for the loss computation.
             :param tokens: Token batch of shape (B, T).
             :param tokens_key: PRNG key for masking.
-            :returns: Tuple of (total loss, (seq rec loss, seq sigreg loss, span rec loss,
-                span sigreg loss, seq lejepa loss, span lejepa loss, decoder loss,
-                encoder mlm loss, encoder mlm acc1, encoder mlm acc5, total loss)).
+            :returns: Tuple of (total loss, (tjepa rec loss, tjepa sigreg loss, tjepa loss,
+                encoder mlm loss, encoder mlm acc1, encoder mlm acc5)).
             """
-            view_key, predictor_key, sigreg_key, decoder_key, mlm_key = jax.random.split(tokens_key, 5)
-            (
-                pooled_post,
-                pooled_pre,
-                token_post,
-                token_pre,
-                mask_positions,
-                view_attn,
-            ) = _encode_views(
+            view_key, predictor_key, mlm_key = jax.random.split(tokens_key, 3)
+            token_post, mask_positions, view_attn = _encode_views(
                 model_inner,
                 tokens,
                 train=True,
@@ -1722,52 +1276,12 @@ def main() -> None:
                 masking_mode=args.masking_mode,
             )
 
-            total_views = args.num_global_views + args.num_local_views
-            seq_rec_loss = jnp.asarray(0.0, dtype=jnp.float32)
-            seq_sigreg_loss = jnp.asarray(0.0, dtype=jnp.float32)
-            seq_lejepa_loss = jnp.asarray(0.0, dtype=jnp.float32)
-            if args.seq_loss_weight > 0.0:
-                pooled_post_views = pooled_post[:, :total_views, :]
-                pooled_pre_global = pooled_pre[:, : args.num_global_views, :]
-                center_pre = jnp.mean(pooled_pre_global, axis=1)
-                model_key = jax.random.split(view_key, 3)[0]
-                head_key = jax.random.split(model_key, len(model_inner.blocks) + 1)[-1]
-                center = model_inner.final_norm(center_pre)
-                center = model_inner.output_ffn(center, train=True, key=head_key)
-                pooled_post_views = pooled_post_views.astype(jnp.float32)
-                center = center.astype(jnp.float32)
-
-                if args.pred_loss == "mse":
-                    diffs = pooled_post_views - center[:, None, :]
-                    seq_rec_loss = jnp.mean(jnp.square(diffs))
-                else:
-                    eps = jnp.asarray(1e-8, dtype=pooled_post_views.dtype)
-                    emb_norm = pooled_post_views / (jnp.linalg.norm(pooled_post_views, axis=-1, keepdims=True) + eps)
-                    ctr_norm = center / (jnp.linalg.norm(center, axis=-1, keepdims=True) + eps)
-                    cos_sim = jnp.sum(emb_norm * ctr_norm[:, None, :], axis=-1)
-                    seq_rec_loss = jnp.mean(1.0 - cos_sim)
-
-                if args.sigreg_weight > 0.0:
-                    seq_sigreg_loss = sigreg_loss_views(
-                        pooled_post_views,
-                        global_step=global_step,
-                        num_slices=args.sigreg_slices,
-                        seed=args.sigreg_seed,
-                        axis_name="data",
-                    )
-                seq_lejepa_loss = (1.0 - args.sigreg_weight) * seq_rec_loss + args.sigreg_weight * seq_sigreg_loss
-
             bsz, num_views, seq_len, dim = token_post.shape
-            batch_idx = jnp.arange(bsz, dtype=jnp.int32)
-            view_tokens_list: list[Array] = []
-            view_masks_list: list[Array] = []
-            view_attn_list: list[Array] = []
-
+            total_views = args.num_global_views + args.num_local_views
             encoder_mlm_loss = jnp.asarray(0.0, dtype=jnp.float32)
             encoder_mlm_acc1 = jnp.asarray(0.0, dtype=jnp.float32)
             encoder_mlm_acc5 = jnp.asarray(0.0, dtype=jnp.float32)
             if args.encoder_mlm_loss_weight > 0.0:
-                total_views = args.num_global_views + args.num_local_views
                 if total_views > 0:
                     mlm_reps = token_post[:, :total_views, :, :]
                     mlm_masks = mask_positions[:, :total_views, :]
@@ -1806,58 +1320,24 @@ def main() -> None:
                     acc5_sum = jnp.sum(correct5.astype(jnp.float32))
                     encoder_mlm_acc5 = jnp.where(acc_count > 0.0, acc5_sum / acc_count, 0.0)
 
-            if args.num_global_views > 0:
-                global_key = jax.random.fold_in(predictor_key, 0)
-                global_idx = jax.random.randint(
-                    global_key,
-                    shape=(bsz,),
-                    minval=0,
-                    maxval=args.num_global_views,
-                )
-                view_tokens_list.append(token_post[batch_idx, global_idx, :, :])
-                view_masks_list.append(mask_positions[batch_idx, global_idx, :])
-                view_attn_list.append(view_attn[batch_idx, global_idx, :])
-            if args.num_local_views > 0:
-                local_key = jax.random.fold_in(predictor_key, 1)
-                local_idx = jax.random.randint(
-                    local_key,
-                    shape=(bsz,),
-                    minval=0,
-                    maxval=args.num_local_views,
-                )
-                local_idx = local_idx + args.num_global_views
-                view_tokens_list.append(token_post[batch_idx, local_idx, :, :])
-                view_masks_list.append(mask_positions[batch_idx, local_idx, :])
-                view_attn_list.append(view_attn[batch_idx, local_idx, :])
-
-            if len(view_tokens_list) == 0:
-                raise ValueError("predictor requires at least one view")
-
-            view_tokens_sel = jnp.stack(view_tokens_list, axis=1)
-            view_masks_sel = jnp.stack(view_masks_list, axis=1)
-            view_attn_sel = jnp.stack(view_attn_list, axis=1)
-
-            span_sigreg_loss = jnp.asarray(0.0, dtype=jnp.float32)
-            span_rec_loss = jnp.asarray(0.0, dtype=jnp.float32)
-            span_lejepa_loss = jnp.asarray(0.0, dtype=jnp.float32)
-            decoder_loss = jnp.asarray(0.0, dtype=jnp.float32)
-
-            need_predictor = args.span_loss_weight > 0.0 or args.decoder_loss_weight > 0.0
-            if need_predictor:
+            tjepa_rec_loss = jnp.asarray(0.0, dtype=jnp.float32)
+            tjepa_sigreg_loss = jnp.asarray(0.0, dtype=jnp.float32)
+            tjepa_loss = jnp.asarray(0.0, dtype=jnp.float32)
+            if args.tjepa_loss_weight > 0.0:
                 if model_inner.predictor is None:
-                    raise ValueError("predictor must be enabled when span or decoder losses are active")
-                if args.decoder_loss_weight > 0.0 and model_inner.decoder is None:
-                    raise ValueError("decoder must be enabled when decoder loss is active")
-                if args.mask_token_input is True:
-                    predictor_attn = view_attn_sel
-                    predictor_mask = jnp.zeros_like(view_masks_sel)
-                else:
-                    predictor_attn = jnp.logical_or(view_attn_sel, view_masks_sel)
-                    predictor_mask = view_masks_sel
-                num_sel = view_tokens_sel.shape[1]
-                flat_tokens = view_tokens_sel.reshape((bsz * num_sel, seq_len, dim))
-                flat_attn = predictor_attn.reshape((bsz * num_sel, seq_len))
-                flat_mask = predictor_mask.reshape((bsz * num_sel, seq_len))
+                    raise ValueError("predictor must be enabled when tjepa loss is active")
+
+                num_global = args.num_global_views
+                num_local = args.num_local_views
+                global_reps = token_post[:, :num_global, :, :]
+                local_reps = token_post[:, num_global:, :, :]
+                local_masks = mask_positions[:, num_global:, :]
+                local_attn = view_attn[:, num_global:, :]
+
+                predictor_attn = jnp.logical_or(local_attn, local_masks)
+                flat_tokens = local_reps.reshape((bsz * num_local, seq_len, dim))
+                flat_attn = predictor_attn.reshape((bsz * num_local, seq_len))
+                flat_mask = local_masks.reshape((bsz * num_local, seq_len))
 
                 pred_reps = model_inner.predictor(
                     flat_tokens,
@@ -1866,95 +1346,48 @@ def main() -> None:
                     train=True,
                     key=predictor_key,
                 )
-                pred_reps = pred_reps.reshape((bsz, num_sel, seq_len, dim))
+                pred_reps = pred_reps.reshape((bsz, num_local, seq_len, dim))
 
-                view_pred_reps = pred_reps
-                view_masks = view_masks_sel
+                global_rep = global_reps[:, 0, :, :].astype(jnp.float32)
+                diffs = pred_reps.astype(jnp.float32) - global_rep[:, None, :, :]
+                mse = jnp.mean(jnp.square(diffs), axis=-1)
+                rec_mask = jnp.logical_or(local_attn, local_masks)
+                rec_mask_f = rec_mask.astype(jnp.float32)
+                loss_sum = jnp.sum(mse * rec_mask_f)
+                count = jnp.sum(rec_mask_f)
+                tjepa_rec_loss = jnp.where(count > 0.0, loss_sum / count, 0.0)
 
-                if args.span_loss_weight > 0.0:
-                    sample_index = total_views
-                    sample_reps = token_pre[:, sample_index, :, :]
-                    if args.sigreg_weight > 0.0:
-                        span_targets = _select_span_targets_per_view(
-                            sample_reps,
-                            mask_positions[:, :total_views, :],
-                            base_norm=model_inner.final_norm,
-                            output_ffn=model_inner.output_ffn,
-                            key=sigreg_key,
-                        )
-                        span_sigreg_loss = sigreg_loss_views(
-                            span_targets,
-                            global_step=global_step,
-                            num_slices=args.sigreg_slices,
-                            seed=args.sigreg_seed,
-                            axis_name="data",
-                        )
-
-                    if args.span_tokenwise is False:
-                        span_rec_loss = _predictor_span_loss(
-                            sample_reps,
-                            view_pred_reps,
-                            view_masks,
-                            base_norm=model_inner.final_norm,
-                            output_ffn=model_inner.output_ffn,
-                            predictor_norm=model_inner.predictor.final_norm,
-                        )
-                    else:
-                        span_rec_loss = _predictor_span_loss_tokenwise(
-                            sample_reps,
-                            view_pred_reps,
-                            view_masks,
-                            base_norm=model_inner.final_norm,
-                            output_ffn=model_inner.output_ffn,
-                            predictor_norm=model_inner.predictor.final_norm,
-                        )
-                    span_lejepa_loss = (
-                        (1.0 - args.sigreg_weight) * span_rec_loss + args.sigreg_weight * span_sigreg_loss
+                if args.sigreg_weight > 0.0:
+                    view_reps = _masked_mean(token_post, view_attn)
+                    tjepa_sigreg_loss = sigreg_loss_views(
+                        view_reps,
+                        global_step=global_step,
+                        num_slices=args.sigreg_slices,
+                        seed=args.sigreg_seed,
+                        axis_name="data",
                     )
 
-                if args.decoder_loss_weight > 0.0:
-                    tokens_no_eos = jnp.where(tokens == eos_id, pad_id, tokens)
-                    decoder_loss = _decoder_loss(
-                        model_inner,
-                        tokens_no_eos,
-                        view_pred_reps,
-                        view_masks,
-                        bos_id=bos_id,
-                        eos_id=eos_id,
-                        pad_id=pad_id,
-                        key=decoder_key,
-                    )
+                if args.sigreg_weight > 0.0:
+                    tjepa_loss = (1.0 - args.sigreg_weight) * tjepa_rec_loss + args.sigreg_weight * tjepa_sigreg_loss
+                else:
+                    tjepa_loss = tjepa_rec_loss
 
-            seq_weight = jnp.asarray(args.seq_loss_weight, dtype=jnp.float32)
-            span_weight = jnp.asarray(args.span_loss_weight, dtype=jnp.float32)
-            decoder_weight = jnp.asarray(args.decoder_loss_weight, dtype=jnp.float32)
+            tjepa_weight = jnp.asarray(args.tjepa_loss_weight, dtype=jnp.float32)
             mlm_weight = jnp.asarray(args.encoder_mlm_loss_weight, dtype=jnp.float32)
-            weight_sum = seq_weight + span_weight + decoder_weight + mlm_weight
+            weight_sum = tjepa_weight + mlm_weight
             weight_sum = jnp.maximum(weight_sum, 1e-6)
-            seq_frac = seq_weight / weight_sum
-            span_frac = span_weight / weight_sum
-            decoder_frac = decoder_weight / weight_sum
+            tjepa_frac = tjepa_weight / weight_sum
             mlm_frac = mlm_weight / weight_sum
-            total_loss = (
-                seq_frac * seq_lejepa_loss
-                + span_frac * span_lejepa_loss
-                + decoder_frac * decoder_loss
-                + mlm_frac * encoder_mlm_loss
-            )
+            total_loss = tjepa_frac * tjepa_loss + mlm_frac * encoder_mlm_loss
             return (
                 total_loss,
                 (
-                    seq_rec_loss,
-                    seq_sigreg_loss,
-                    span_rec_loss,
-                    span_sigreg_loss,
-                    seq_lejepa_loss,
-                    span_lejepa_loss,
-                    decoder_loss,
+                    tjepa_rec_loss,
+                    tjepa_sigreg_loss,
+                    tjepa_loss,
                     encoder_mlm_loss,
                     encoder_mlm_acc1,
                     encoder_mlm_acc5,
-                    total_loss,
                 ),
             )
 
@@ -1965,13 +1398,9 @@ def main() -> None:
             params_only,
         )
         loss_init = jnp.asarray(0.0, dtype=jnp.float32)
-        seq_rec_init = jnp.asarray(0.0, dtype=jnp.float32)
-        seq_sigreg_init = jnp.asarray(0.0, dtype=jnp.float32)
-        span_rec_init = jnp.asarray(0.0, dtype=jnp.float32)
-        span_sigreg_init = jnp.asarray(0.0, dtype=jnp.float32)
-        seq_lejepa_init = jnp.asarray(0.0, dtype=jnp.float32)
-        span_lejepa_init = jnp.asarray(0.0, dtype=jnp.float32)
-        decoder_loss_init = jnp.asarray(0.0, dtype=jnp.float32)
+        tjepa_rec_init = jnp.asarray(0.0, dtype=jnp.float32)
+        tjepa_sigreg_init = jnp.asarray(0.0, dtype=jnp.float32)
+        tjepa_init = jnp.asarray(0.0, dtype=jnp.float32)
         encoder_mlm_init = jnp.asarray(0.0, dtype=jnp.float32)
         encoder_mlm_acc1_init = jnp.asarray(0.0, dtype=jnp.float32)
         encoder_mlm_acc5_init = jnp.asarray(0.0, dtype=jnp.float32)
@@ -1979,30 +1408,22 @@ def main() -> None:
         step_indices = jnp.arange(batch_tokens.shape[0], dtype=jnp.int32)
 
         def _accum_body(
-            carry: tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array, Array, Array, Array],
+            carry: tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array],
             inputs: tuple[Array, Array],
-        ) -> tuple[
-            tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array, Array, Array, Array],
-            None,
-        ]:
+        ) -> tuple[tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array], None]:
             """Accumulate gradients and metrics for one micro-step.
 
-            :param carry: Tuple of (grads, total loss, seq rec loss, seq sigreg loss, span rec loss,
-                span sigreg loss, seq lejepa loss, span lejepa loss, decoder loss,
-                encoder mlm loss, encoder mlm acc1, encoder mlm acc5).
+            :param carry: Tuple of (grads, total loss, tjepa rec loss, tjepa sigreg loss,
+                tjepa loss, encoder mlm loss, encoder mlm acc1, encoder mlm acc5).
             :param inputs: Tuple of (micro step index, token batch).
             :returns: Updated carry and unused output.
             """
             (
                 grads_acc,
                 loss_acc,
-                seq_rec_acc,
-                seq_sigreg_acc,
-                span_rec_acc,
-                span_sigreg_acc,
-                seq_lejepa_acc,
-                span_lejepa_acc,
-                decoder_loss_acc,
+                tjepa_rec_acc,
+                tjepa_sigreg_acc,
+                tjepa_acc,
                 encoder_mlm_acc,
                 encoder_mlm_acc1_acc,
                 encoder_mlm_acc5_acc,
@@ -2013,21 +1434,16 @@ def main() -> None:
 
             def _do_compute(
                 _: None,
-            ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array, Array, Array, Array]:
+            ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array]:
                 (
                     loss,
                     (
-                        seq_rec_loss,
-                        seq_sigreg_loss,
-                        span_rec_loss,
-                        span_sigreg_loss,
-                        seq_lejepa_loss,
-                        span_lejepa_loss,
-                        decoder_loss,
+                        tjepa_rec_loss,
+                        tjepa_sigreg_loss,
+                        tjepa_loss,
                         encoder_mlm_loss,
                         encoder_mlm_acc1,
                         encoder_mlm_acc5,
-                        _total_loss,
                     ),
                 ), grads = value_and_grad(
                     model_in,
@@ -2037,26 +1453,18 @@ def main() -> None:
                 grads = _cast_tree_dtype(grads, jnp.float32)
                 grads_accum = _add_trees(grads_acc, grads)
                 loss_accum = loss_acc + loss
-                seq_rec_accum = seq_rec_acc + seq_rec_loss
-                seq_sigreg_accum = seq_sigreg_acc + seq_sigreg_loss
-                span_rec_accum = span_rec_acc + span_rec_loss
-                span_sigreg_accum = span_sigreg_acc + span_sigreg_loss
-                seq_lejepa_accum = seq_lejepa_acc + seq_lejepa_loss
-                span_lejepa_accum = span_lejepa_acc + span_lejepa_loss
-                decoder_loss_accum = decoder_loss_acc + decoder_loss
+                tjepa_rec_accum = tjepa_rec_acc + tjepa_rec_loss
+                tjepa_sigreg_accum = tjepa_sigreg_acc + tjepa_sigreg_loss
+                tjepa_accum = tjepa_acc + tjepa_loss
                 encoder_mlm_accum = encoder_mlm_acc + encoder_mlm_loss
                 encoder_mlm_acc1_accum = encoder_mlm_acc1_acc + encoder_mlm_acc1
                 encoder_mlm_acc5_accum = encoder_mlm_acc5_acc + encoder_mlm_acc5
                 return (
                     grads_accum,
                     loss_accum,
-                    seq_rec_accum,
-                    seq_sigreg_accum,
-                    span_rec_accum,
-                    span_sigreg_accum,
-                    seq_lejepa_accum,
-                    span_lejepa_accum,
-                    decoder_loss_accum,
+                    tjepa_rec_accum,
+                    tjepa_sigreg_accum,
+                    tjepa_accum,
                     encoder_mlm_accum,
                     encoder_mlm_acc1_accum,
                     encoder_mlm_acc5_accum,
@@ -2064,17 +1472,13 @@ def main() -> None:
 
             def _skip_compute(
                 _: None,
-            ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array, Array, Array, Array]:
+            ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array]:
                 return (
                     grads_acc,
                     loss_acc,
-                    seq_rec_acc,
-                    seq_sigreg_acc,
-                    span_rec_acc,
-                    span_sigreg_acc,
-                    seq_lejepa_acc,
-                    span_lejepa_acc,
-                    decoder_loss_acc,
+                    tjepa_rec_acc,
+                    tjepa_sigreg_acc,
+                    tjepa_acc,
                     encoder_mlm_acc,
                     encoder_mlm_acc1_acc,
                     encoder_mlm_acc5_acc,
@@ -2087,13 +1491,9 @@ def main() -> None:
         (
             grads,
             loss,
-            seq_rec_loss,
-            seq_sigreg_loss,
-            span_rec_loss,
-            span_sigreg_loss,
-            seq_lejepa_loss,
-            span_lejepa_loss,
-            decoder_loss,
+            tjepa_rec_loss,
+            tjepa_sigreg_loss,
+            tjepa_loss,
             encoder_mlm_loss,
             encoder_mlm_acc1,
             encoder_mlm_acc5,
@@ -2102,13 +1502,9 @@ def main() -> None:
             (
                 grad_init,
                 loss_init,
-                seq_rec_init,
-                seq_sigreg_init,
-                span_rec_init,
-                span_sigreg_init,
-                seq_lejepa_init,
-                span_lejepa_init,
-                decoder_loss_init,
+                tjepa_rec_init,
+                tjepa_sigreg_init,
+                tjepa_init,
                 encoder_mlm_init,
                 encoder_mlm_acc1_init,
                 encoder_mlm_acc5_init,
@@ -2123,39 +1519,27 @@ def main() -> None:
             grads,
         )
         loss = loss / scale
-        seq_rec_loss = seq_rec_loss / scale
-        seq_sigreg_loss = seq_sigreg_loss / scale
-        span_rec_loss = span_rec_loss / scale
-        span_sigreg_loss = span_sigreg_loss / scale
-        seq_lejepa_loss = seq_lejepa_loss / scale
-        span_lejepa_loss = span_lejepa_loss / scale
-        decoder_loss = decoder_loss / scale
+        tjepa_rec_loss = tjepa_rec_loss / scale
+        tjepa_sigreg_loss = tjepa_sigreg_loss / scale
+        tjepa_loss = tjepa_loss / scale
         encoder_mlm_loss = encoder_mlm_loss / scale
         encoder_mlm_acc1 = encoder_mlm_acc1 / scale
         encoder_mlm_acc5 = encoder_mlm_acc5 / scale
 
         grads = jax.lax.pmean(grads, axis_name="data")
         loss = jax.lax.pmean(loss, axis_name="data")
-        seq_rec_loss = jax.lax.pmean(seq_rec_loss, axis_name="data")
-        seq_sigreg_loss = jax.lax.pmean(seq_sigreg_loss, axis_name="data")
-        span_rec_loss = jax.lax.pmean(span_rec_loss, axis_name="data")
-        span_sigreg_loss = jax.lax.pmean(span_sigreg_loss, axis_name="data")
-        seq_lejepa_loss = jax.lax.pmean(seq_lejepa_loss, axis_name="data")
-        span_lejepa_loss = jax.lax.pmean(span_lejepa_loss, axis_name="data")
-        decoder_loss = jax.lax.pmean(decoder_loss, axis_name="data")
+        tjepa_rec_loss = jax.lax.pmean(tjepa_rec_loss, axis_name="data")
+        tjepa_sigreg_loss = jax.lax.pmean(tjepa_sigreg_loss, axis_name="data")
+        tjepa_loss = jax.lax.pmean(tjepa_loss, axis_name="data")
         encoder_mlm_loss = jax.lax.pmean(encoder_mlm_loss, axis_name="data")
         encoder_mlm_acc1 = jax.lax.pmean(encoder_mlm_acc1, axis_name="data")
         encoder_mlm_acc5 = jax.lax.pmean(encoder_mlm_acc5, axis_name="data")
         return (
             grads,
             loss,
-            seq_rec_loss,
-            seq_sigreg_loss,
-            span_rec_loss,
-            span_sigreg_loss,
-            seq_lejepa_loss,
-            span_lejepa_loss,
-            decoder_loss,
+            tjepa_rec_loss,
+            tjepa_sigreg_loss,
+            tjepa_loss,
             encoder_mlm_loss,
             encoder_mlm_acc1,
             encoder_mlm_acc5,
@@ -2204,13 +1588,9 @@ def main() -> None:
     perf_log_time = 0.0
     perf_warmup = args.profile_warmup_steps
     last_loss_val = 0.0
-    last_seq_rec_val = 0.0
-    last_seq_sigreg_val = 0.0
-    last_span_rec_val = 0.0
-    last_span_sigreg_val = 0.0
-    last_seq_lejepa_val = 0.0
-    last_span_lejepa_val = 0.0
-    last_decoder_val = 0.0
+    last_tjepa_rec_val = 0.0
+    last_tjepa_sigreg_val = 0.0
+    last_tjepa_val = 0.0
     last_encoder_mlm_val = 0.0
     last_encoder_mlm_acc1_val = 0.0
     last_encoder_mlm_acc5_val = 0.0
@@ -2284,13 +1664,9 @@ def main() -> None:
                 (
                     grads,
                     loss,
-                    seq_rec,
-                    seq_sigreg,
-                    span_rec,
-                    span_sigreg,
-                    seq_lejepa,
-                    span_lejepa,
-                    decoder_loss,
+                    tjepa_rec,
+                    tjepa_sigreg,
+                    tjepa_loss,
                     encoder_mlm_loss,
                     encoder_mlm_acc1,
                     encoder_mlm_acc5,
@@ -2321,36 +1697,24 @@ def main() -> None:
                 log_this_step = (global_step % args.log_every) == 0
                 if log_this_step:
                     loss_val = float(np.mean(jax.device_get(loss)))
-                    seq_rec_val = float(np.mean(jax.device_get(seq_rec)))
-                    seq_sigreg_val = float(np.mean(jax.device_get(seq_sigreg)))
-                    span_rec_val = float(np.mean(jax.device_get(span_rec)))
-                    span_sigreg_val = float(np.mean(jax.device_get(span_sigreg)))
-                    seq_lejepa_val = float(np.mean(jax.device_get(seq_lejepa)))
-                    span_lejepa_val = float(np.mean(jax.device_get(span_lejepa)))
-                    decoder_val = float(np.mean(jax.device_get(decoder_loss)))
+                    tjepa_rec_val = float(np.mean(jax.device_get(tjepa_rec)))
+                    tjepa_sigreg_val = float(np.mean(jax.device_get(tjepa_sigreg)))
+                    tjepa_val = float(np.mean(jax.device_get(tjepa_loss)))
                     encoder_mlm_val = float(np.mean(jax.device_get(encoder_mlm_loss)))
                     encoder_mlm_acc1_val = float(np.mean(jax.device_get(encoder_mlm_acc1)))
                     encoder_mlm_acc5_val = float(np.mean(jax.device_get(encoder_mlm_acc5)))
                     last_loss_val = loss_val
-                    last_seq_rec_val = seq_rec_val
-                    last_seq_sigreg_val = seq_sigreg_val
-                    last_span_rec_val = span_rec_val
-                    last_span_sigreg_val = span_sigreg_val
-                    last_seq_lejepa_val = seq_lejepa_val
-                    last_span_lejepa_val = span_lejepa_val
-                    last_decoder_val = decoder_val
+                    last_tjepa_rec_val = tjepa_rec_val
+                    last_tjepa_sigreg_val = tjepa_sigreg_val
+                    last_tjepa_val = tjepa_val
                     last_encoder_mlm_val = encoder_mlm_val
                     last_encoder_mlm_acc1_val = encoder_mlm_acc1_val
                     last_encoder_mlm_acc5_val = encoder_mlm_acc5_val
 
                     writer.add_scalar("train/total_loss", loss_val, global_step)
-                    writer.add_scalar("train/seq_rec_loss", seq_rec_val, global_step)
-                    writer.add_scalar("train/seq_sigreg_loss", seq_sigreg_val, global_step)
-                    writer.add_scalar("train/span_rec_loss", span_rec_val, global_step)
-                    writer.add_scalar("train/span_sigreg_loss", span_sigreg_val, global_step)
-                    writer.add_scalar("train/seq_lejepa_loss", seq_lejepa_val, global_step)
-                    writer.add_scalar("train/span_lejepa_loss", span_lejepa_val, global_step)
-                    writer.add_scalar("train/decoder_loss", decoder_val, global_step)
+                    writer.add_scalar("train/tjepa_rec_loss", tjepa_rec_val, global_step)
+                    writer.add_scalar("train/tjepa_sigreg_loss", tjepa_sigreg_val, global_step)
+                    writer.add_scalar("train/tjepa_loss", tjepa_val, global_step)
                     writer.add_scalar("train/encoder_mlm_loss", encoder_mlm_val, global_step)
                     writer.add_scalar("train/encoder_mlm_acc1", encoder_mlm_acc1_val, global_step)
                     writer.add_scalar("train/encoder_mlm_acc5", encoder_mlm_acc5_val, global_step)
@@ -2358,13 +1722,9 @@ def main() -> None:
                 if log_this_step:
                     pbar.set_postfix(
                         total=f"{last_loss_val:.4f}",
-                        seq_rec=f"{last_seq_rec_val:.4f}",
-                        span_rec=f"{last_span_rec_val:.4f}",
-                        seq_sig=f"{last_seq_sigreg_val:.4f}",
-                        span_sig=f"{last_span_sigreg_val:.4f}",
-                        seq_ljp=f"{last_seq_lejepa_val:.4f}",
-                        span_ljp=f"{last_span_lejepa_val:.4f}",
-                        dec=f"{last_decoder_val:.4f}",
+                        tj_rec=f"{last_tjepa_rec_val:.4f}",
+                        tj_sig=f"{last_tjepa_sigreg_val:.4f}",
+                        tj=f"{last_tjepa_val:.4f}",
                         mlm=f"{last_encoder_mlm_val:.4f}",
                         mlm1=f"{last_encoder_mlm_acc1_val:.4f}",
                         mlm5=f"{last_encoder_mlm_acc5_val:.4f}",
