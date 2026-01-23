@@ -66,7 +66,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--pope-base", type=float, default=10000.0)
     parser.add_argument("--init-std", type=float, default=0.02)
     parser.add_argument("--attn-type", type=str, default="pope", choices=["pope", "rope"])
-    parser.add_argument("--causal-attention", type=str, default="true", choices=["true", "false"])
+    parser.add_argument("--encoder-causal-attention", type=str, default="true", choices=["true", "false"])
+    parser.add_argument("--predictor-causal-attention", type=str, default="true", choices=["true", "false"])
 
     parser.add_argument("--num-global-views", type=int, default=1)
     parser.add_argument("--num-local-views", type=int, default=6)
@@ -915,7 +916,8 @@ def _save_checkpoint(
 def main() -> None:
     """Run the text training loop."""
     args = _parse_args()
-    causal_attention = _parse_bool(args.causal_attention)
+    encoder_causal_attention = _parse_bool(args.encoder_causal_attention)
+    predictor_causal_attention = _parse_bool(args.predictor_causal_attention)
 
     if args.max_train_steps < 0:
         raise ValueError("max-train-steps must be >= 0")
@@ -1111,7 +1113,8 @@ def main() -> None:
         attn_type=args.attn_type,
         embed_norm=False,
         embed_norm_scale=args.init_std,
-        causal_attention=causal_attention,
+        encoder_causal_attention=encoder_causal_attention,
+        predictor_causal_attention=predictor_causal_attention,
     )
     exclusion_patterns = list(TextTransformer.MUON_PARAM_EXCLUSION_PATTERNS)
     weight_decay_exclusions = [

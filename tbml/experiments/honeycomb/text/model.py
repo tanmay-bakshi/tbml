@@ -4,7 +4,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, root_validator
 
 from tbml.nn import DropPath, PoPESelfAttention, RMSNorm, RoPESelfAttention, SwiGLUFeedForward
 from tbml.nn.init import Initializer, truncated_normal_init
@@ -28,7 +28,8 @@ class TextTransformerConfig(BaseModel):
     :ivar embed_norm: Whether to apply RMSNorm to token embeddings.
     :ivar embed_norm_scale: Scale applied after embedding RMSNorm.
     :ivar predictor_n_layers: Number of predictor blocks.
-    :ivar causal_attention: Whether encoder/predictor attention is causal.
+    :ivar encoder_causal_attention: Whether encoder attention is causal.
+    :ivar predictor_causal_attention: Whether predictor attention is causal.
     """
 
     vocab_size: int = Field(default=50257)
@@ -46,7 +47,24 @@ class TextTransformerConfig(BaseModel):
     embed_norm: bool = Field(default=False)
     embed_norm_scale: float = Field(default=1.0)
     predictor_n_layers: int = Field(default=2)
-    causal_attention: bool = Field(default=True)
+    encoder_causal_attention: bool = Field(default=True)
+    predictor_causal_attention: bool = Field(default=True)
+    causal_attention: bool | None = Field(default=None)
+
+    @root_validator(pre=True)
+    def _coerce_causal_attention(cls, values: dict[str, object]) -> dict[str, object]:
+        """Map legacy causal_attention to encoder/predictor causal flags.
+
+        :param values: Raw input values for the configuration.
+        :returns: Normalized values with causal flags set.
+        """
+        if "causal_attention" in values:
+            causal = values.get("causal_attention")
+            if "encoder_causal_attention" not in values:
+                values["encoder_causal_attention"] = causal
+            if "predictor_causal_attention" not in values:
+                values["predictor_causal_attention"] = causal
+        return values
 
 
 class TokenEmbedding(eqx.Module):
@@ -479,7 +497,7 @@ class Predictor(eqx.Module):
                     qkv_kernel_init=qkv_kernel_init,
                     o_kernel_init=o_kernel_init,
                     mlp_kernel_init=mlp_kernel_init,
-                    is_causal=config.causal_attention,
+                    is_causal=config.encoder_causal_attention,
                     key=block_keys[idx],
                 )
             )
@@ -645,7 +663,7 @@ class TextTransformer(eqx.Module):
                     drop_path_prob=drop_rates[idx],
                     pope_base=config.pope_base,
                     attn_type=config.attn_type,
-                    is_causal=config.causal_attention,
+                    is_causal=config.predictor_causal_attention,
                     dtype=dtype,
                     param_dtype=param_dtype,
                     qkv_kernel_init=init,
