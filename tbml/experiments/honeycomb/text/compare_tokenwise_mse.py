@@ -33,6 +33,11 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run candidate texts through the SWA weights while keeping the reference on the base weights.",
     )
+    parser.add_argument(
+        "--reference-use-swa",
+        action="store_true",
+        help="Run the reference text through the SWA weights instead of the base weights.",
+    )
     return parser.parse_args()
 
 
@@ -377,23 +382,25 @@ def main() -> None:
 
     model = _load_model(ckpt_dir, dtype=dtype, model_config=model_config)
     swa_model: TextTransformer | None = None
-    if args.candidates_use_swa is True:
+    if args.candidates_use_swa is True or args.reference_use_swa is True:
         swa_model = _load_swa_model(
             ckpt_dir,
             dtype=dtype,
             model_config=model_config,
         )
-    if model.predictor is None:
+    ref_model = swa_model if args.reference_use_swa else model
+    cand_model = swa_model if args.candidates_use_swa else model
+    if ref_model.predictor is None:
         raise ValueError("predictor is required for this comparison")
 
-    _ref_pre, ref_post, _ref_pool = model.forward_with_intermediates(
+    _ref_pre, ref_post, _ref_pool = ref_model.forward_with_intermediates(
         jnp.asarray(ref_tokens_arr),
         jnp.asarray(ref_attn_mask),
         train=False,
         key=None,
     )
     pred_attn = np.logical_or(ref_attn_mask, mask_positions)
-    pred_reps = model.predictor(
+    pred_reps = ref_model.predictor(
         ref_post,
         jnp.asarray(pred_attn),
         jnp.asarray(mask_positions),
@@ -401,7 +408,6 @@ def main() -> None:
         key=None,
     )
 
-    cand_model = swa_model if swa_model is not None else model
     _cand_pre, cand_post, _cand_pool = cand_model.forward_with_intermediates(
         jnp.asarray(cand_tokens_arr),
         jnp.asarray(cand_attn),
