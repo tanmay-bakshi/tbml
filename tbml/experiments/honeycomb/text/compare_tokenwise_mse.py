@@ -28,11 +28,6 @@ def _parse_args() -> argparse.Namespace:
         nargs="+",
         help="Input texts: first is the masked reference, remaining are candidates.",
     )
-    parser.add_argument(
-        "--reference-encoder-only",
-        action="store_true",
-        help="Use encoder outputs for the reference text instead of passing it through the predictor.",
-    )
     return parser.parse_args()
 
 
@@ -305,7 +300,7 @@ def main() -> None:
         ref_attn_mask = np.logical_and(ref_attn, np.logical_not(mask_positions))
 
     model = _load_model(ckpt_dir, dtype=dtype, model_config=model_config)
-    if args.reference_encoder_only is False and model.predictor is None:
+    if model.predictor is None:
         raise ValueError("predictor is required for this comparison")
 
     _ref_pre, ref_post, _ref_pool = model.forward_with_intermediates(
@@ -314,17 +309,14 @@ def main() -> None:
         train=False,
         key=None,
     )
-    if args.reference_encoder_only is True:
-        pred_reps = ref_post
-    else:
-        pred_attn = np.logical_or(ref_attn_mask, mask_positions)
-        pred_reps = model.predictor(
-            ref_post,
-            jnp.asarray(pred_attn),
-            jnp.asarray(mask_positions),
-            train=False,
-            key=None,
-        )
+    pred_attn = np.logical_or(ref_attn_mask, mask_positions)
+    pred_reps = model.predictor(
+        ref_post,
+        jnp.asarray(pred_attn),
+        jnp.asarray(mask_positions),
+        train=False,
+        key=None,
+    )
 
     _cand_pre, cand_post, _cand_pool = model.forward_with_intermediates(
         jnp.asarray(cand_tokens_arr),
@@ -334,13 +326,21 @@ def main() -> None:
     )
 
     rec_mask = np.logical_or(ref_attn_mask, mask_positions)
-    mse_values = _masked_mean_square_error(pred_reps[0], cand_post, jnp.asarray(rec_mask[0]))
-    mse_values = np.asarray(jax.device_get(mse_values))
+    pred_mse = _masked_mean_square_error(pred_reps[0], cand_post, jnp.asarray(rec_mask[0]))
+    pred_mse = np.asarray(jax.device_get(pred_mse))
+    enc_mse = _masked_mean_square_error(ref_post[0], cand_post, jnp.asarray(rec_mask[0]))
+    enc_mse = np.asarray(jax.device_get(enc_mse))
 
-    results = list(zip(args.texts[1:], mse_values, strict=True))
-    results.sort(key=lambda item: float(item[1]))
-    print("Tokenwise MSE (ascending):")
-    for idx, (text, score) in enumerate(results, start=1):
+    pred_results = list(zip(args.texts[1:], pred_mse, strict=True))
+    pred_results.sort(key=lambda item: float(item[1]))
+    enc_results = list(zip(args.texts[1:], enc_mse, strict=True))
+    enc_results.sort(key=lambda item: float(item[1]))
+
+    print("Predictor vs candidate encoder MSE (ascending):")
+    for idx, (text, score) in enumerate(pred_results, start=1):
+        print(f"  {idx:>2}. {score:.6f} :: {repr(text)}")
+    print("Reference encoder vs candidate encoder MSE (ascending):")
+    for idx, (text, score) in enumerate(enc_results, start=1):
         print(f"  {idx:>2}. {score:.6f} :: {repr(text)}")
 
 
