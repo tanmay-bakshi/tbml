@@ -1093,6 +1093,7 @@ def main() -> None:
         r"^.*norm\d*\..*$",
         r"^final_norm\..*$",
         r"^predictor\.final_norm\..*$",
+        r"^predictor\.mask_tokens$",
     ]
 
     run_config: dict[str, object] = {
