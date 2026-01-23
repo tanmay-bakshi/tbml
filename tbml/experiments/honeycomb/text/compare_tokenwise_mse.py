@@ -28,6 +28,11 @@ def _parse_args() -> argparse.Namespace:
         nargs="+",
         help="Input texts: first is the masked reference, remaining are candidates.",
     )
+    parser.add_argument(
+        "--reference-encoder-only",
+        action="store_true",
+        help="Use encoder outputs for the reference text instead of passing it through the predictor.",
+    )
     return parser.parse_args()
 
 
@@ -300,7 +305,7 @@ def main() -> None:
         ref_attn_mask = np.logical_and(ref_attn, np.logical_not(mask_positions))
 
     model = _load_model(ckpt_dir, dtype=dtype, model_config=model_config)
-    if model.predictor is None:
+    if args.reference_encoder_only is False and model.predictor is None:
         raise ValueError("predictor is required for this comparison")
 
     _ref_pre, ref_post, _ref_pool = model.forward_with_intermediates(
@@ -309,14 +314,17 @@ def main() -> None:
         train=False,
         key=None,
     )
-    pred_attn = np.logical_or(ref_attn_mask, mask_positions)
-    pred_reps = model.predictor(
-        ref_post,
-        jnp.asarray(pred_attn),
-        jnp.asarray(mask_positions),
-        train=False,
-        key=None,
-    )
+    if args.reference_encoder_only is True:
+        pred_reps = ref_post
+    else:
+        pred_attn = np.logical_or(ref_attn_mask, mask_positions)
+        pred_reps = model.predictor(
+            ref_post,
+            jnp.asarray(pred_attn),
+            jnp.asarray(mask_positions),
+            train=False,
+            key=None,
+        )
 
     _cand_pre, cand_post, _cand_pool = model.forward_with_intermediates(
         jnp.asarray(cand_tokens_arr),
