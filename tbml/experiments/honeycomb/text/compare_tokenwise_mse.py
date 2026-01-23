@@ -135,6 +135,52 @@ def _load_model_from_path(
     raise RuntimeError("failed to load model checkpoint")
 
 
+def _load_swa_model(
+    checkpoint_dir: str,
+    *,
+    dtype: jnp.dtype,
+    model_config: dict[str, Any],
+) -> TextTransformer:
+    """Load the SWA parameters and combine them with static model state.
+
+    :param checkpoint_dir: Checkpoint directory path.
+    :param dtype: Compute and parameter dtype.
+    :param model_config: Model configuration dictionary.
+    :returns: TextTransformer with SWA parameters.
+    """
+    config = TextTransformerConfig(**model_config)
+    model_path = os.path.join(checkpoint_dir, "swa.eqx")
+    if os.path.isfile(model_path) is False:
+        raise FileNotFoundError(f"swa.eqx not found in checkpoint directory: {checkpoint_dir}")
+
+    candidates = [dtype, jnp.float32, jnp.bfloat16, jnp.float16]
+    seen: set[jnp.dtype] = set()
+    last_error: Exception | None = None
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        model_key = jax.random.PRNGKey(0)
+        model = TextTransformer(
+            config,
+            dtype=candidate,
+            param_dtype=candidate,
+            key=model_key,
+        )
+        params, static = eqx.partition(model, eqx.is_array)
+        try:
+            swa_params = eqx.tree_deserialise_leaves(model_path, params)
+            return eqx.combine(swa_params, static)
+        except RuntimeError as exc:
+            last_error = exc
+            if "changed dtype" not in str(exc):
+                raise
+            continue
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("failed to load swa parameters")
+
+
 def _load_model(
     checkpoint_dir: str,
     *,
@@ -332,11 +378,10 @@ def main() -> None:
     model = _load_model(ckpt_dir, dtype=dtype, model_config=model_config)
     swa_model: TextTransformer | None = None
     if args.candidates_use_swa is True:
-        swa_model = _load_model_from_path(
+        swa_model = _load_swa_model(
             ckpt_dir,
             dtype=dtype,
             model_config=model_config,
-            filename="swa.eqx",
         )
     if model.predictor is None:
         raise ValueError("predictor is required for this comparison")
