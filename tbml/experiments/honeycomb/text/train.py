@@ -890,6 +890,7 @@ def _save_checkpoint(
     run_dir: str,
     step: int,
     model: TextTransformer,
+    swa_params: eqx.Module,
     opt_state: eqx.Module,
     metadata: dict[str, object],
 ) -> None:
@@ -898,12 +899,14 @@ def _save_checkpoint(
     :param run_dir: Run directory path.
     :param step: Global step index.
     :param model: Model to serialize.
+    :param swa_params: SWA parameters to serialize.
     :param opt_state: Optimizer state to serialize.
     :param metadata: Metadata to persist.
     """
     ckpt_dir = os.path.join(run_dir, f"checkpoint_step_{step:08d}")
     os.makedirs(ckpt_dir, exist_ok=False)
     eqx.tree_serialise_leaves(os.path.join(ckpt_dir, "model.eqx"), model)
+    eqx.tree_serialise_leaves(os.path.join(ckpt_dir, "swa.eqx"), swa_params)
     eqx.tree_serialise_leaves(os.path.join(ckpt_dir, "optimizer.eqx"), opt_state)
     with open(os.path.join(ckpt_dir, "metadata.json"), "w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2)
@@ -1859,11 +1862,14 @@ def main() -> None:
                 if global_step % args.checkpoint_every == 0:
                     jax.block_until_ready(loss)
                     _block_until_ready(train_repl)
+                    _block_until_ready(swa_params_repl)
                     _block_until_ready(opt_state_repl)
                     opt_state_host = cast(MuonWithAdamWFallbackState, _unreplicate(opt_state_repl))
                     opt_state_host = cast(MuonWithAdamWFallbackState, _to_host(opt_state_host))
                     model_host = cast(TextTransformer, _unreplicate(train_repl))
                     model_host = cast(TextTransformer, _to_host(model_host))
+                    swa_host = cast(eqx.Module, _unreplicate(swa_params_repl))
+                    swa_host = cast(eqx.Module, _to_host(swa_host))
                     metadata = {
                         "global_step": global_step,
                         "config": run_config,
@@ -1872,6 +1878,7 @@ def main() -> None:
                         run_dir,
                         global_step,
                         model_host,
+                        swa_host,
                         opt_state_host,
                         metadata,
                     )
