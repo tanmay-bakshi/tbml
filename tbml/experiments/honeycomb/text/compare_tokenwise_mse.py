@@ -28,6 +28,11 @@ def _parse_args() -> argparse.Namespace:
         nargs="+",
         help="Input texts: first is the masked reference, remaining are candidates.",
     )
+    parser.add_argument(
+        "--candidates-use-swa",
+        action="store_true",
+        help="Run candidate texts through the SWA weights while keeping the reference on the base weights.",
+    )
     return parser.parse_args()
 
 
@@ -85,21 +90,25 @@ def _load_run_config(checkpoint_dir: str) -> dict[str, Any]:
     return config
 
 
-def _load_model(
+def _load_model_from_path(
     checkpoint_dir: str,
     *,
     dtype: jnp.dtype,
     model_config: dict[str, Any],
+    filename: str,
 ) -> TextTransformer:
     """Load a TextTransformer model from a checkpoint.
 
     :param checkpoint_dir: Checkpoint directory path.
     :param dtype: Compute and parameter dtype.
     :param model_config: Model configuration dictionary.
+    :param filename: Checkpoint filename to load.
     :returns: Deserialized TextTransformer model.
     """
     config = TextTransformerConfig(**model_config)
-    model_path = os.path.join(checkpoint_dir, "model.eqx")
+    model_path = os.path.join(checkpoint_dir, filename)
+    if os.path.isfile(model_path) is False:
+        raise FileNotFoundError(f"{filename} not found in checkpoint directory: {checkpoint_dir}")
     candidates = [dtype, jnp.float32, jnp.bfloat16, jnp.float16]
     seen: set[jnp.dtype] = set()
     last_error: Exception | None = None
@@ -124,6 +133,27 @@ def _load_model(
     if last_error is not None:
         raise last_error
     raise RuntimeError("failed to load model checkpoint")
+
+
+def _load_model(
+    checkpoint_dir: str,
+    *,
+    dtype: jnp.dtype,
+    model_config: dict[str, Any],
+) -> TextTransformer:
+    """Load the base TextTransformer model from a checkpoint.
+
+    :param checkpoint_dir: Checkpoint directory path.
+    :param dtype: Compute and parameter dtype.
+    :param model_config: Model configuration dictionary.
+    :returns: Deserialized TextTransformer model.
+    """
+    return _load_model_from_path(
+        checkpoint_dir,
+        dtype=dtype,
+        model_config=model_config,
+        filename="model.eqx",
+    )
 
 
 def _tokenize_texts(
@@ -300,6 +330,14 @@ def main() -> None:
         ref_attn_mask = np.logical_and(ref_attn, np.logical_not(mask_positions))
 
     model = _load_model(ckpt_dir, dtype=dtype, model_config=model_config)
+    swa_model: TextTransformer | None = None
+    if args.candidates_use_swa is True:
+        swa_model = _load_model_from_path(
+            ckpt_dir,
+            dtype=dtype,
+            model_config=model_config,
+            filename="swa.eqx",
+        )
     if model.predictor is None:
         raise ValueError("predictor is required for this comparison")
 
@@ -318,7 +356,8 @@ def main() -> None:
         key=None,
     )
 
-    _cand_pre, cand_post, _cand_pool = model.forward_with_intermediates(
+    cand_model = swa_model if swa_model is not None else model
+    _cand_pre, cand_post, _cand_pool = cand_model.forward_with_intermediates(
         jnp.asarray(cand_tokens_arr),
         jnp.asarray(cand_attn),
         train=False,
