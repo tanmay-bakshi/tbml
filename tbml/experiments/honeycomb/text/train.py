@@ -1425,20 +1425,21 @@ def main() -> None:
                     else:
                         pred_locals = pred_reps
 
-                view_reps = jnp.concatenate([sample_global, pred_globals, pred_locals], axis=1)
-                diffs = view_reps.astype(jnp.float32) - global_center[:, None, :, :]
-                mse = jnp.mean(jnp.square(diffs), axis=-1)
-                unmasked = jnp.logical_and(view_attn, jnp.logical_not(mask_positions))
-                if args.tjepa_unmasked_keep_prob > 0.0:
-                    keep_noise = jax.random.uniform(rec_key, shape=unmasked.shape)
-                    keep_unmasked = jnp.logical_and(unmasked, keep_noise < args.tjepa_unmasked_keep_prob)
-                else:
-                    keep_unmasked = jnp.zeros_like(unmasked)
-                rec_mask = jnp.logical_or(mask_positions, keep_unmasked)
-                rec_mask_f = rec_mask.astype(jnp.float32)
-                loss_sum = jnp.sum(mse * rec_mask_f)
-                count = jnp.sum(rec_mask_f)
-                tjepa_rec_loss = jnp.where(count > 0.0, loss_sum / count, 0.0)
+                if total_pred_views > 0:
+                    view_reps = jnp.concatenate([pred_globals, pred_locals], axis=1)
+                    diffs = view_reps.astype(jnp.float32) - global_center[:, None, :, :]
+                    mse = jnp.mean(jnp.square(diffs), axis=-1)
+                    unmasked = jnp.logical_and(pred_in_attn, jnp.logical_not(pred_in_masks))
+                    if args.tjepa_unmasked_keep_prob > 0.0:
+                        keep_noise = jax.random.uniform(rec_key, shape=unmasked.shape)
+                        keep_unmasked = jnp.logical_and(unmasked, keep_noise < args.tjepa_unmasked_keep_prob)
+                    else:
+                        keep_unmasked = jnp.zeros_like(unmasked)
+                    rec_mask = jnp.logical_or(pred_in_masks, keep_unmasked)
+                    rec_mask_f = rec_mask.astype(jnp.float32)
+                    loss_sum = jnp.sum(mse * rec_mask_f)
+                    count = jnp.sum(rec_mask_f)
+                    tjepa_rec_loss = jnp.where(count > 0.0, loss_sum / count, 0.0)
 
                 if args.sigreg_weight > 0.0:
                     view_reps = _masked_mean(token_post, view_attn)
