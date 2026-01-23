@@ -687,18 +687,44 @@ def _build_views(
     :returns: Tuple of (model key, global views, global masks, global attn, local views, local masks, local attn).
     """
     model_key, global_key, local_key = jax.random.split(key, 3)
-    global_views, global_masks, global_attn = _mask_views(
-        tokens,
-        global_key,
-        num_views=num_global_views,
-        min_ratio=global_mask_min,
-        max_ratio=global_mask_max,
-        pad_id=pad_id,
-        eos_id=eos_id,
-        mask_id=mask_id,
-        use_mask_token=use_mask_token,
-        masking_mode=masking_mode,
-    )
+    if num_global_views == 0:
+        global_views = jnp.zeros((tokens.shape[0], 0, tokens.shape[1]), dtype=tokens.dtype)
+        global_masks = jnp.zeros((tokens.shape[0], 0, tokens.shape[1]), dtype=jnp.bool_)
+        global_attn = jnp.zeros((tokens.shape[0], 0, tokens.shape[1]), dtype=jnp.bool_)
+    else:
+        sample_key, masked_key = jax.random.split(global_key, 2)
+        sample_views, sample_masks, sample_attn = _mask_views(
+            tokens,
+            sample_key,
+            num_views=1,
+            min_ratio=0.0,
+            max_ratio=0.0,
+            pad_id=pad_id,
+            eos_id=eos_id,
+            mask_id=mask_id,
+            use_mask_token=use_mask_token,
+            masking_mode=masking_mode,
+        )
+        if num_global_views > 1:
+            other_views, other_masks, other_attn = _mask_views(
+                tokens,
+                masked_key,
+                num_views=num_global_views - 1,
+                min_ratio=global_mask_min,
+                max_ratio=global_mask_max,
+                pad_id=pad_id,
+                eos_id=eos_id,
+                mask_id=mask_id,
+                use_mask_token=use_mask_token,
+                masking_mode=masking_mode,
+            )
+            global_views = jnp.concatenate([sample_views, other_views], axis=1)
+            global_masks = jnp.concatenate([sample_masks, other_masks], axis=1)
+            global_attn = jnp.concatenate([sample_attn, other_attn], axis=1)
+        else:
+            global_views = sample_views
+            global_masks = sample_masks
+            global_attn = sample_attn
     local_views, local_masks, local_attn = _mask_views(
         tokens,
         local_key,
@@ -939,13 +965,16 @@ def main() -> None:
         raise ValueError("at least one loss weight must be > 0")
     if args.num_global_views + args.num_local_views <= 0:
         raise ValueError("at least one view must be requested")
+    if args.num_global_views > 0:
+        if args.global_mask_max == 0.0:
+            if args.num_global_views != 1:
+                raise ValueError("global views must be 1 when global masking is disabled")
+        else:
+            if args.num_global_views < 2:
+                raise ValueError("global masking requires at least two global views")
     if args.tjepa_loss_weight > 0.0:
-        if args.num_global_views != 1:
-            raise ValueError("tjepa requires exactly one global view")
-        if args.num_local_views <= 0:
-            raise ValueError("tjepa requires at least one local view")
-        if args.global_mask_max != 0.0:
-            raise ValueError("tjepa requires global-mask-max to be 0")
+        if args.num_global_views <= 0:
+            raise ValueError("tjepa requires at least one global view")
 
     dtype = _dtype_from_name(args.dtype)
     if dtype in (jnp.bfloat16, jnp.float16):
@@ -1009,25 +1038,15 @@ def main() -> None:
         batch_tokens = next(iter(preview_iter))
         batch_tokens = np.where(batch_tokens == eos_id, pad_id, batch_tokens)
         key = jax.random.PRNGKey(args.seed)
-        key, global_key, local_key = jax.random.split(key, 3)
-        global_views, _global_masks, _global_attn = _mask_views(
+        _, global_views, _global_masks, _global_attn, local_views, _local_masks, _local_attn = _build_views(
             jnp.asarray(batch_tokens),
-            global_key,
-            num_views=args.num_global_views,
-            min_ratio=args.global_mask_min,
-            max_ratio=args.global_mask_max,
-            pad_id=pad_id,
-            eos_id=eos_id,
-            mask_id=mask_id,
-            use_mask_token=args.mask_token_input,
-            masking_mode=args.masking_mode,
-        )
-        local_views, _local_masks, _local_attn = _mask_views(
-            jnp.asarray(batch_tokens),
-            local_key,
-            num_views=args.num_local_views,
-            min_ratio=args.local_mask_min,
-            max_ratio=args.local_mask_max,
+            key,
+            num_global_views=args.num_global_views,
+            num_local_views=args.num_local_views,
+            global_mask_min=args.global_mask_min,
+            global_mask_max=args.global_mask_max,
+            local_mask_min=args.local_mask_min,
+            local_mask_max=args.local_mask_max,
             pad_id=pad_id,
             eos_id=eos_id,
             mask_id=mask_id,
@@ -1066,8 +1085,9 @@ def main() -> None:
         predictor_layers = args.n_layers
     if predictor_layers < 0:
         raise ValueError("predictor-n-layers must be >= 0")
-    if args.tjepa_loss_weight > 0.0 and predictor_layers == 0:
-        raise ValueError("tjepa requires predictor-n-layers > 0")
+    if args.tjepa_loss_weight > 0.0 and (args.num_local_views > 0 or args.num_global_views > 1):
+        if predictor_layers == 0:
+            raise ValueError("tjepa requires predictor-n-layers > 0 when masked globals or locals are enabled")
 
     model_config = TextTransformerConfig(
         vocab_size=vocab_size,
@@ -1325,34 +1345,54 @@ def main() -> None:
             tjepa_sigreg_loss = jnp.asarray(0.0, dtype=jnp.float32)
             tjepa_loss = jnp.asarray(0.0, dtype=jnp.float32)
             if args.tjepa_loss_weight > 0.0:
-                if model_inner.predictor is None:
-                    raise ValueError("predictor must be enabled when tjepa loss is active")
-
                 num_global = args.num_global_views
                 num_local = args.num_local_views
                 global_reps = token_post[:, :num_global, :, :]
-                local_reps = token_post[:, num_global:, :, :]
-                local_masks = mask_positions[:, num_global:, :]
-                local_attn = view_attn[:, num_global:, :]
+                sample_global = global_reps[:, :1, :, :]
+                masked_global_reps = global_reps[:, 1:, :, :]
 
-                predictor_attn = jnp.logical_or(local_attn, local_masks)
-                flat_tokens = local_reps.reshape((bsz * num_local, seq_len, dim))
-                flat_attn = predictor_attn.reshape((bsz * num_local, seq_len))
-                flat_mask = local_masks.reshape((bsz * num_local, seq_len))
+                pred_globals = jnp.zeros((bsz, 0, seq_len, dim), dtype=token_post.dtype)
+                pred_locals = jnp.zeros((bsz, 0, seq_len, dim), dtype=token_post.dtype)
+                total_pred_views = (num_global - 1) + num_local
+                if total_pred_views > 0:
+                    if model_inner.predictor is None:
+                        raise ValueError("predictor must be enabled when masked globals or locals are active")
+                    global_masks = mask_positions[:, 1:num_global, :]
+                    global_attn = view_attn[:, 1:num_global, :]
+                    local_reps = token_post[:, num_global:, :, :]
+                    local_masks = mask_positions[:, num_global:, :]
+                    local_attn = view_attn[:, num_global:, :]
 
-                pred_reps = model_inner.predictor(
-                    flat_tokens,
-                    flat_attn,
-                    flat_mask,
-                    train=True,
-                    key=predictor_key,
-                )
-                pred_reps = pred_reps.reshape((bsz, num_local, seq_len, dim))
+                    pred_in_reps = jnp.concatenate([masked_global_reps, local_reps], axis=1)
+                    pred_in_masks = jnp.concatenate([global_masks, local_masks], axis=1)
+                    pred_in_attn = jnp.concatenate([global_attn, local_attn], axis=1)
+                    predictor_attn = jnp.logical_or(pred_in_attn, pred_in_masks)
 
-                global_rep = global_reps[:, 0, :, :].astype(jnp.float32)
-                diffs = pred_reps.astype(jnp.float32) - global_rep[:, None, :, :]
+                    flat_tokens = pred_in_reps.reshape((bsz * total_pred_views, seq_len, dim))
+                    flat_attn = predictor_attn.reshape((bsz * total_pred_views, seq_len))
+                    flat_mask = pred_in_masks.reshape((bsz * total_pred_views, seq_len))
+
+                    pred_reps = model_inner.predictor(
+                        flat_tokens,
+                        flat_attn,
+                        flat_mask,
+                        train=True,
+                        key=predictor_key,
+                    )
+                    pred_reps = pred_reps.reshape((bsz, total_pred_views, seq_len, dim))
+                    if num_global > 1:
+                        pred_globals = pred_reps[:, : num_global - 1, :, :]
+                        pred_locals = pred_reps[:, num_global - 1 :, :, :]
+                    else:
+                        pred_locals = pred_reps
+
+                global_center_reps = jnp.concatenate([sample_global, pred_globals], axis=1)
+                global_center = jnp.mean(global_center_reps.astype(jnp.float32), axis=1)
+
+                view_reps = jnp.concatenate([sample_global, pred_globals, pred_locals], axis=1)
+                diffs = view_reps.astype(jnp.float32) - global_center[:, None, :, :]
                 mse = jnp.mean(jnp.square(diffs), axis=-1)
-                rec_mask = jnp.logical_or(local_attn, local_masks)
+                rec_mask = jnp.logical_or(view_attn, mask_positions)
                 rec_mask_f = rec_mask.astype(jnp.float32)
                 loss_sum = jnp.sum(mse * rec_mask_f)
                 count = jnp.sum(rec_mask_f)
