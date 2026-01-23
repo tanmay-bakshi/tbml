@@ -790,7 +790,7 @@ def _encode_views(
     mask_id: int,
     use_mask_token: bool,
     masking_mode: str,
-) -> tuple[Array, Array, Array]:
+) -> tuple[Array, Array, Array, Array]:
     """Encode masked views into token representations.
 
     :param model: Text transformer encoder.
@@ -808,7 +808,7 @@ def _encode_views(
     :param mask_id: Mask token id.
     :param use_mask_token: Whether to replace masked positions with mask tokens.
     :param masking_mode: Masking mode ("spans" or "tokens").
-    :returns: Tuple of (token_post, mask_positions, view_attn).
+    :returns: Tuple of (views, token_post, mask_positions, view_attn).
     """
     if num_global_views + num_local_views <= 0:
         raise ValueError("at least one view must be requested")
@@ -858,7 +858,7 @@ def _encode_views(
         key=model_key,
     )
     token_post = reps_post.reshape((bsz, num_views, seq_len, reps_post.shape[-1]))
-    return token_post, mask_positions, view_attn
+    return views, token_post, mask_positions, view_attn
 
 
 def _masked_mean(
@@ -1249,8 +1249,20 @@ def main() -> None:
 
     opt_state: MuonWithAdamWFallbackState = optimizer.init(params)
 
+    def _stop_gradient_tree(values: eqx.Module) -> eqx.Module:
+        """Stop gradients for all array leaves in a pytree.
+
+        :param values: Pytree of arrays and None entries.
+        :returns: Pytree with gradients stopped for array leaves.
+        """
+        return jax.tree_util.tree_map(
+            lambda leaf: jax.lax.stop_gradient(leaf) if isinstance(leaf, jax.Array) else leaf,
+            values,
+        )
+
     def grad_step(
         model_in: TextTransformer,
+        swa_params: eqx.Module,
         batch_tokens: Array,
         key: Array,
         global_step: Array,
@@ -1260,6 +1272,7 @@ def main() -> None:
         """Compute accumulated gradients and metrics across micro-steps.
 
         :param model_in: Replicated model.
+        :param swa_params: SWA parameters used for global centers.
         :param batch_tokens: Token batches of shape (M, B, T).
         :param key: PRNG key for view masking.
         :param global_step: Global step index for loss scheduling.
@@ -1268,6 +1281,8 @@ def main() -> None:
         :returns: Tuple of (grads, total loss, tjepa rec loss, tjepa sigreg loss, tjepa loss,
             encoder mlm loss, encoder mlm acc1, encoder mlm acc5).
         """
+
+        swa_model = eqx.combine(_stop_gradient_tree(swa_params), model_static)
 
         def _loss_fn(
             model_inner: TextTransformer,
@@ -1283,7 +1298,7 @@ def main() -> None:
                 encoder mlm loss, encoder mlm acc1, encoder mlm acc5)).
             """
             view_key, predictor_key, mlm_key, rec_key = jax.random.split(tokens_key, 4)
-            token_post, mask_positions, view_attn = _encode_views(
+            views, token_post, mask_positions, view_attn = _encode_views(
                 model_inner,
                 tokens,
                 train=True,
@@ -1355,6 +1370,20 @@ def main() -> None:
                 sample_global = global_reps[:, :1, :, :]
                 masked_global_reps = global_reps[:, 1:, :, :]
 
+                global_views = views[:, :num_global, :]
+                global_attn = view_attn[:, :num_global, :]
+                flat_globals = global_views.reshape((bsz * num_global, seq_len))
+                flat_global_attn = global_attn.reshape((bsz * num_global, seq_len))
+                _swa_pre, swa_post, _swa_pool = swa_model.forward_with_intermediates(
+                    flat_globals,
+                    flat_global_attn,
+                    train=False,
+                    key=None,
+                )
+                swa_post = swa_post.reshape((bsz, num_global, seq_len, dim))
+                global_center = jnp.mean(swa_post.astype(jnp.float32), axis=1)
+                global_center = jax.lax.stop_gradient(global_center)
+
                 pred_globals = jnp.zeros((bsz, 0, seq_len, dim), dtype=token_post.dtype)
                 pred_locals = jnp.zeros((bsz, 0, seq_len, dim), dtype=token_post.dtype)
                 total_pred_views = (num_global - 1) + num_local
@@ -1389,9 +1418,6 @@ def main() -> None:
                         pred_locals = pred_reps[:, num_global - 1 :, :, :]
                     else:
                         pred_locals = pred_reps
-
-                global_center_reps = jnp.concatenate([sample_global, pred_globals], axis=1)
-                global_center = jnp.mean(global_center_reps.astype(jnp.float32), axis=1)
 
                 view_reps = jnp.concatenate([sample_global, pred_globals, pred_locals], axis=1)
                 diffs = view_reps.astype(jnp.float32) - global_center[:, None, :, :]
@@ -1613,6 +1639,30 @@ def main() -> None:
         new_model = eqx.apply_updates(model_in, updates)
         return new_model, new_state
 
+    def update_swa(
+        swa_params: eqx.Module,
+        model_in: TextTransformer,
+        swa_count: Array,
+    ) -> tuple[eqx.Module, Array]:
+        """Update SWA parameters with the latest model weights.
+
+        :param swa_params: Current SWA parameters.
+        :param model_in: Current model (student).
+        :param swa_count: Number of models averaged so far.
+        :returns: Tuple of (updated SWA params, updated count).
+        """
+        params_inner = eqx.filter(model_in, eqx.is_array)
+        count_f = swa_count.astype(jnp.float32)
+        inv = 1.0 / (count_f + 1.0)
+
+        def _update(swa_value: Array | None, param: Array | None) -> Array | None:
+            if param is None or swa_value is None:
+                return None
+            return (swa_value * count_f + param) * inv
+
+        new_swa = jax.tree_util.tree_map(_update, swa_params, params_inner)
+        return new_swa, swa_count + 1
+
     grad_step_pmap = eqx.filter_pmap(
         grad_step,
         axis_name="data",
@@ -1624,12 +1674,21 @@ def main() -> None:
         devices=device_list,
         donate="all",
     )  # type: ignore[call-overload]
+    update_swa_pmap = eqx.filter_pmap(
+        update_swa,
+        axis_name="data",
+        devices=device_list,
+    )  # type: ignore[call-overload]
 
     params_repl = _replicate_tree(params, num_devices)
     params_repl = jax.device_put(params_repl, device=data_sharding)
     train_repl = eqx.combine(params_repl, model_static)
     opt_state_repl = _replicate_tree(opt_state, num_devices)
     opt_state_repl = jax.device_put(opt_state_repl, device=data_sharding)
+    swa_params_repl = _replicate_tree(params, num_devices)
+    swa_params_repl = jax.device_put(swa_params_repl, device=data_sharding)
+    swa_count_repl = jnp.full((num_devices,), 1, dtype=jnp.int32)
+    swa_count_repl = jax.device_put(swa_count_repl, device=data_sharding)
 
     global_batch = args.per_device_batch_size * num_devices
     global_step = 0
@@ -1723,6 +1782,7 @@ def main() -> None:
                     encoder_mlm_acc5,
                 ) = grad_step_pmap(
                     train_repl,
+                    swa_params_repl,
                     batch_tokens,
                     device_keys,
                     step_id,
@@ -1737,6 +1797,11 @@ def main() -> None:
                     train_repl,
                     opt_state_repl,
                     grads,
+                )
+                swa_params_repl, swa_count_repl = update_swa_pmap(
+                    swa_params_repl,
+                    train_repl,
+                    swa_count_repl,
                 )
                 compute_time += time.perf_counter() - compute_start
                 grads = None

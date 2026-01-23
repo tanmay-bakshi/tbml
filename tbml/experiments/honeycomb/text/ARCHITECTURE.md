@@ -85,8 +85,8 @@ size. The encoder produces token representations of shape `(B, V, T, K)`.
 - The encoder processes all global and local views together.
 - The sample-level global view is encoder‑only. Any *additional* global views and all local
   views are passed through the predictor.
-- A **token‑wise global center** is computed by averaging the sample‑level global encoder
-  outputs together with the predictor outputs of the additional global views.
+- A **token‑wise global center** is computed by averaging the **SWA encoder outputs** of all
+  global views. This center is treated as a detached target (no gradient flow into SWA).
 - Every view’s token representations (sample‑level encoder outputs, predictor outputs for masked
   globals, and predictor outputs for locals) are matched **token‑by‑token** to this global
   center.
