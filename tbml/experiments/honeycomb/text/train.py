@@ -1349,7 +1349,7 @@ def main() -> None:
                 pred_reps = pred_reps.reshape((bsz, num_local, seq_len, dim))
 
                 global_rep = global_reps[:, 0, :, :].astype(jnp.float32)
-                diffs = pred_reps.astype(jnp.float32) - jax.lax.stop_gradient(global_rep[:, None, :, :])
+                diffs = pred_reps.astype(jnp.float32) - global_rep[:, None, :, :]
                 mse = jnp.mean(jnp.square(diffs), axis=-1)
                 rec_mask = jnp.logical_or(local_attn, local_masks)
                 rec_mask_f = rec_mask.astype(jnp.float32)
