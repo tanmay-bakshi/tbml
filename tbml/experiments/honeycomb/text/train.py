@@ -71,10 +71,11 @@ def _parse_args() -> argparse.Namespace:
 
     parser.add_argument("--num-global-views", type=int, default=1)
     parser.add_argument("--num-local-views", type=int, default=6)
-    parser.add_argument("--global-dropout-min", type=float, default=None)
-    parser.add_argument("--global-dropout-max", type=float, default=None)
-    parser.add_argument("--local-dropout-min", type=float, default=None)
-    parser.add_argument("--local-dropout-max", type=float, default=None)
+    parser.add_argument("--global-mask-min", type=float, default=None)
+    parser.add_argument("--global-mask-max", type=float, default=None)
+    parser.add_argument("--local-mask-min", type=float, default=None)
+    parser.add_argument("--local-mask-max", type=float, default=None)
+    parser.add_argument("--masking-mode", type=str, default="spans", choices=["spans", "tokens"])
 
     parser.add_argument("--sigreg-weight", type=float, default=0.25)
     parser.add_argument("--sigreg-slices", type=int, default=256)
@@ -83,6 +84,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--tjepa-unmasked-keep-prob", type=float, default=0.1)
     parser.add_argument("--encoder-mlm-loss-weight", type=float, default=0.0)
     parser.add_argument("--encoder-mlm-keep-prob", type=float, default=0.0)
+    parser.add_argument("--mask-token-input", action="store_true")
 
     parser.add_argument("--muon-lr", type=float, default=1e-3)
     parser.add_argument("--muon-momentum", type=float, default=0.95)
@@ -408,53 +410,249 @@ def _iter_batches(
         yield tokens
 
 
-def _sample_view_dropout_rates(
+def _mask_spans(
+    tokens: Array,
     key: Array,
     *,
-    num_global_views: int,
-    num_local_views: int,
-    global_dropout_min: float,
-    global_dropout_max: float,
-    local_dropout_min: float,
-    local_dropout_max: float,
-) -> tuple[Array, Array]:
-    """Sample per-view dropout rates.
+    min_ratio: float,
+    max_ratio: float,
+    pad_id: int,
+    eos_id: int,
+    mask_id: int,
+    use_mask_token: bool,
+    masking_mode: str,
+    poisson_lambda: float = 3.0,
+) -> tuple[Array, Array, Array]:
+    """Apply masking to tokens using span or token sampling.
 
+    Masked tokens are excluded from attention but the sequence length is unchanged.
+
+    :param tokens: Token ids of shape (B, T).
     :param key: PRNG key.
-    :param num_global_views: Number of global views.
-    :param num_local_views: Number of local views.
-    :param global_dropout_min: Minimum global dropout rate.
-    :param global_dropout_max: Maximum global dropout rate.
-    :param local_dropout_min: Minimum local dropout rate.
-    :param local_dropout_max: Maximum local dropout rate.
-    :returns: Tuple of (global rates, local rates).
+    :param min_ratio: Minimum masking ratio.
+    :param max_ratio: Maximum masking ratio.
+    :param pad_id: Padding token id.
+    :param eos_id: EOS token id.
+    :param mask_id: Mask token id.
+    :param use_mask_token: Whether to replace masked positions with mask tokens.
+    :param masking_mode: Masking mode ("spans" or "tokens").
+    :param poisson_lambda: Poisson lambda for span lengths.
+    :returns: Tuple of (token ids, mask positions, attention mask).
     """
-    if num_global_views == 0:
-        global_rates = jnp.zeros((0,), dtype=jnp.float32)
-        local_key = key
-    else:
-        global_key, local_key = jax.random.split(key, 2)
-        sample_rate = jnp.zeros((1,), dtype=jnp.float32)
-        if num_global_views > 1:
-            other_rates = jax.random.uniform(
-                global_key,
-                shape=(num_global_views - 1,),
-                minval=global_dropout_min,
-                maxval=global_dropout_max,
+    if min_ratio < 0.0 or min_ratio > 1.0:
+        raise ValueError("min_ratio must be in [0, 1]")
+    if max_ratio < 0.0 or max_ratio > 1.0:
+        raise ValueError("max_ratio must be in [0, 1]")
+    if min_ratio > max_ratio:
+        raise ValueError("min_ratio must be <= max_ratio")
+    if masking_mode not in ("spans", "tokens"):
+        raise ValueError("masking_mode must be 'spans' or 'tokens'")
+    if masking_mode == "spans" and poisson_lambda <= 0.0:
+        raise ValueError("poisson_lambda must be > 0")
+
+    key_ratio, key_spans = jax.random.split(key)
+    ratios = jax.random.uniform(
+        key_ratio,
+        shape=(tokens.shape[0],),
+        minval=min_ratio,
+        maxval=max_ratio,
+    )
+    keys = jax.random.split(key_spans, tokens.shape[0])
+    seq_len = tokens.shape[1]
+    idx = jnp.arange(seq_len, dtype=jnp.int32)
+    idx_row = idx[None, :]
+    all_lengths = jnp.arange(1, seq_len + 1, dtype=jnp.int32)[:, None]
+
+    def _one_sample_spans(
+        sample_tokens: Array,
+        ratio: Array,
+        sample_key: Array,
+    ) -> tuple[Array, Array, Array]:
+        """Mask spans for a single sequence.
+
+        :param sample_tokens: Token ids of shape (T,).
+        :param ratio: Masking ratio scalar.
+        :param sample_key: PRNG key.
+        :returns: Tuple of (masked tokens, mask positions, attention mask).
+        """
+        key_len, key_start = jax.random.split(sample_key)
+        eligible = jnp.logical_and(sample_tokens != pad_id, sample_tokens != eos_id)
+        valid_len = jnp.sum(eligible).astype(jnp.int32)
+        target = jnp.floor(ratio * valid_len).astype(jnp.int32)
+        target = jnp.minimum(target, jnp.maximum(valid_len - 1, 0))
+        span_lengths = jax.random.poisson(key_len, poisson_lambda, shape=(seq_len,))
+        span_lengths = jnp.maximum(span_lengths, 1)
+        start_scores = jax.random.uniform(key_start, shape=(seq_len, seq_len), minval=0.0, maxval=1.0)
+
+        def _body(i: int, state: tuple[Array, Array]) -> tuple[Array, Array]:
+            mask, masked_count = state
+            remaining = target - masked_count
+            use = remaining > 0
+            span_len = jnp.minimum(span_lengths[i], remaining)
+            span_len = jnp.maximum(span_len, 1)
+            valid = jnp.logical_and(eligible, jnp.logical_not(mask))
+            valid_int = valid.astype(jnp.int32)
+            prefix = jnp.concatenate(
+                [jnp.zeros((1,), dtype=jnp.int32), jnp.cumsum(valid_int)]
             )
-            global_rates = jnp.concatenate([sample_rate, other_rates], axis=0)
-        else:
-            global_rates = sample_rate
-    if num_local_views == 0:
-        local_rates = jnp.zeros((0,), dtype=jnp.float32)
-    else:
-        local_rates = jax.random.uniform(
-            local_key,
-            shape=(num_local_views,),
-            minval=local_dropout_min,
-            maxval=local_dropout_max,
+            end = idx_row + all_lengths
+            valid_window = end <= seq_len
+            prefix_end = jnp.take(prefix, end, mode="clip")
+            prefix_start = prefix[idx_row]
+            window_sum = jnp.where(valid_window, prefix_end - prefix_start, 0)
+            length_index = jnp.maximum(span_len - 1, 0)
+            possible = jnp.take(window_sum, length_index, axis=0) == span_len
+            any_possible = jnp.any(possible)
+            scores = jnp.where(possible, start_scores[i], -jnp.inf)
+            start = jnp.argmax(scores)
+            span_positions = jnp.logical_and(idx >= start, idx < start + span_len)
+            apply = jnp.logical_and(use, any_possible)
+            new_mask = jnp.where(apply, jnp.logical_or(mask, span_positions), mask)
+            new_count = jnp.where(apply, masked_count + span_len, masked_count)
+            return new_mask, new_count
+
+        init_mask = jnp.zeros((seq_len,), dtype=jnp.bool_)
+        init_count = jnp.asarray(0, dtype=jnp.int32)
+        final_mask, _final_count = jax.lax.fori_loop(
+            0, seq_len, _body, (init_mask, init_count)
         )
-    return global_rates, local_rates
+        return final_mask, eligible
+
+    def _one_sample_tokens(
+        sample_tokens: Array,
+        ratio: Array,
+        sample_key: Array,
+    ) -> tuple[Array, Array]:
+        """Mask individual tokens for a single sequence.
+
+        :param sample_tokens: Token ids of shape (T,).
+        :param ratio: Masking ratio scalar.
+        :param sample_key: PRNG key.
+        :returns: Tuple of (mask positions, eligibility mask).
+        """
+        eligible = jnp.logical_and(sample_tokens != pad_id, sample_tokens != eos_id)
+        valid_len = jnp.sum(eligible).astype(jnp.int32)
+        target = jnp.floor(ratio * valid_len).astype(jnp.int32)
+        target = jnp.minimum(target, jnp.maximum(valid_len - 1, 0))
+        scores = jax.random.uniform(sample_key, shape=(seq_len,), minval=0.0, maxval=1.0)
+        scores = jnp.where(eligible, scores, -jnp.inf)
+        order = jnp.argsort(-scores)
+        ranks = jnp.argsort(order)
+        mask = ranks < target
+        mask = jnp.logical_and(mask, eligible)
+        return mask, eligible
+
+    def _apply_mask(
+        sample_tokens: Array,
+        mask: Array,
+        eligible: Array,
+    ) -> tuple[Array, Array, Array]:
+        if use_mask_token is True:
+            attention_mask = eligible
+        else:
+            attention_mask = jnp.logical_and(eligible, jnp.logical_not(mask))
+
+        def _with_fallback(_: None) -> tuple[Array, Array]:
+            fallback_idx = jnp.argmax(eligible)
+            attn = attention_mask.at[fallback_idx].set(True)
+            new_mask = mask.at[fallback_idx].set(False)
+            return attn, new_mask
+
+        def _no_fallback(_: None) -> tuple[Array, Array]:
+            return attention_mask, mask
+
+        attention_mask, final_mask = jax.lax.cond(
+            jnp.any(attention_mask),
+            _no_fallback,
+            _with_fallback,
+            operand=None,
+        )
+        if use_mask_token is True:
+            masked_tokens = jnp.where(final_mask, jnp.asarray(mask_id, dtype=sample_tokens.dtype), sample_tokens)
+        else:
+            masked_tokens = sample_tokens
+        return masked_tokens, final_mask, attention_mask
+
+    if masking_mode == "spans":
+        def _one_sample(
+            sample_tokens: Array,
+            ratio: Array,
+            sample_key: Array,
+        ) -> tuple[Array, Array, Array]:
+            mask, eligible = _one_sample_spans(sample_tokens, ratio, sample_key)
+            return _apply_mask(sample_tokens, mask, eligible)
+    else:
+        def _one_sample(
+            sample_tokens: Array,
+            ratio: Array,
+            sample_key: Array,
+        ) -> tuple[Array, Array, Array]:
+            mask, eligible = _one_sample_tokens(sample_tokens, ratio, sample_key)
+            return _apply_mask(sample_tokens, mask, eligible)
+
+    masked, positions, attn_mask = jax.vmap(_one_sample)(tokens, ratios, keys)
+    return masked, positions, attn_mask
+
+
+def _mask_views(
+    tokens: Array,
+    key: Array,
+    *,
+    num_views: int,
+    min_ratio: float,
+    max_ratio: float,
+    pad_id: int,
+    eos_id: int,
+    mask_id: int,
+    use_mask_token: bool,
+    masking_mode: str,
+) -> tuple[Array, Array, Array]:
+    """Generate multiple masked views of the token batch.
+
+    :param tokens: Token ids of shape (B, T).
+    :param key: PRNG key.
+    :param num_views: Number of views to generate.
+    :param min_ratio: Minimum masking ratio.
+    :param max_ratio: Maximum masking ratio.
+    :param pad_id: Padding token id.
+    :param eos_id: EOS token id.
+    :param mask_id: Mask token id.
+    :param use_mask_token: Whether to replace masked positions with mask tokens.
+    :param masking_mode: Masking mode ("spans" or "tokens").
+    :returns: Tuple of (masked views, mask positions, attention masks).
+    """
+    if num_views == 0:
+        empty_views = jnp.zeros((tokens.shape[0], 0, tokens.shape[1]), dtype=tokens.dtype)
+        empty_mask = jnp.zeros((tokens.shape[0], 0, tokens.shape[1]), dtype=jnp.bool_)
+        empty_attn = jnp.zeros((tokens.shape[0], 0, tokens.shape[1]), dtype=jnp.bool_)
+        return empty_views, empty_mask, empty_attn
+
+    keys = jax.random.split(key, num_views)
+
+    def _one_view(view_key: Array) -> tuple[Array, Array, Array]:
+        """Mask tokens using the provided view key.
+
+        :param view_key: PRNG key for masking.
+        :returns: Tuple of (masked token ids, mask positions, attention mask).
+        """
+        return _mask_spans(
+            tokens,
+            view_key,
+            min_ratio=min_ratio,
+            max_ratio=max_ratio,
+            pad_id=pad_id,
+            eos_id=eos_id,
+            mask_id=mask_id,
+            use_mask_token=use_mask_token,
+            masking_mode=masking_mode,
+        )
+
+    views, masks, attn_masks = jax.vmap(_one_view)(keys)
+    return (
+        jnp.transpose(views, (1, 0, 2)),
+        jnp.transpose(masks, (1, 0, 2)),
+        jnp.transpose(attn_masks, (1, 0, 2)),
+    )
 
 
 def _build_views(
@@ -463,67 +661,117 @@ def _build_views(
     *,
     num_global_views: int,
     num_local_views: int,
-    global_dropout_min: float,
-    global_dropout_max: float,
-    local_dropout_min: float,
-    local_dropout_max: float,
+    global_mask_min: float,
+    global_mask_max: float,
+    local_mask_min: float,
+    local_mask_max: float,
     pad_id: int,
     eos_id: int,
-) -> tuple[Array, Array, Array, Array, Array]:
-    """Build global and local views along with dropout rates.
+    mask_id: int,
+    use_mask_token: bool,
+    masking_mode: str,
+) -> tuple[Array, Array, Array, Array, Array, Array, Array]:
+    """Build masked views for global and local crops.
 
     :param tokens: Token ids of shape (B, T).
     :param key: PRNG key.
     :param num_global_views: Number of global views.
     :param num_local_views: Number of local views.
-    :param global_dropout_min: Minimum global dropout rate.
-    :param global_dropout_max: Maximum global dropout rate.
-    :param local_dropout_min: Minimum local dropout rate.
-    :param local_dropout_max: Maximum local dropout rate.
+    :param global_mask_min: Minimum global masking ratio.
+    :param global_mask_max: Maximum global masking ratio.
+    :param local_mask_min: Minimum local masking ratio.
+    :param local_mask_max: Maximum local masking ratio.
     :param pad_id: Padding token id.
     :param eos_id: EOS token id.
-    :returns: Tuple of (views, mask positions, attention masks, view keys, view dropout rates).
+    :param mask_id: Mask token id.
+    :param use_mask_token: Whether to replace masked positions with mask tokens.
+    :param masking_mode: Masking mode ("spans" or "tokens").
+    :returns: Tuple of (model key, global views, global masks, global attn, local views, local masks, local attn).
     """
-    tokens = jnp.where(tokens == eos_id, jnp.asarray(pad_id, dtype=tokens.dtype), tokens)
-    attention = tokens != pad_id
-
+    model_key, global_key, local_key = jax.random.split(key, 3)
     if num_global_views == 0:
         global_views = jnp.zeros((tokens.shape[0], 0, tokens.shape[1]), dtype=tokens.dtype)
+        global_masks = jnp.zeros((tokens.shape[0], 0, tokens.shape[1]), dtype=jnp.bool_)
         global_attn = jnp.zeros((tokens.shape[0], 0, tokens.shape[1]), dtype=jnp.bool_)
     else:
-        global_views = jnp.broadcast_to(tokens[:, None, :], (tokens.shape[0], num_global_views, tokens.shape[1]))
-        global_attn = jnp.broadcast_to(attention[:, None, :], global_views.shape)
-
-    if num_local_views == 0:
-        local_views = jnp.zeros((tokens.shape[0], 0, tokens.shape[1]), dtype=tokens.dtype)
-        local_attn = jnp.zeros((tokens.shape[0], 0, tokens.shape[1]), dtype=jnp.bool_)
-    else:
-        local_views = jnp.broadcast_to(tokens[:, None, :], (tokens.shape[0], num_local_views, tokens.shape[1]))
-        local_attn = jnp.broadcast_to(attention[:, None, :], local_views.shape)
-
-    views = jnp.concatenate([global_views, local_views], axis=1)
-    view_attn = jnp.concatenate([global_attn, local_attn], axis=1)
-    mask_positions = jnp.zeros_like(view_attn, dtype=jnp.bool_)
-
-    total_views = num_global_views + num_local_views
-    if total_views == 0:
-        view_keys = jnp.zeros((0, 2), dtype=jnp.uint32)
-        view_dropout = jnp.zeros((0,), dtype=jnp.float32)
-        return views, mask_positions, view_attn, view_keys, view_dropout
-
-    model_key, drop_key = jax.random.split(key, 2)
-    view_keys = jax.random.split(model_key, total_views)
-    global_rates, local_rates = _sample_view_dropout_rates(
-        drop_key,
-        num_global_views=num_global_views,
-        num_local_views=num_local_views,
-        global_dropout_min=global_dropout_min,
-        global_dropout_max=global_dropout_max,
-        local_dropout_min=local_dropout_min,
-        local_dropout_max=local_dropout_max,
+        sample_key, masked_key = jax.random.split(global_key, 2)
+        sample_views, sample_masks, sample_attn = _mask_views(
+            tokens,
+            sample_key,
+            num_views=1,
+            min_ratio=0.0,
+            max_ratio=0.0,
+            pad_id=pad_id,
+            eos_id=eos_id,
+            mask_id=mask_id,
+            use_mask_token=use_mask_token,
+            masking_mode=masking_mode,
+        )
+        if num_global_views > 1:
+            other_views, other_masks, other_attn = _mask_views(
+                tokens,
+                masked_key,
+                num_views=num_global_views - 1,
+                min_ratio=global_mask_min,
+                max_ratio=global_mask_max,
+                pad_id=pad_id,
+                eos_id=eos_id,
+                mask_id=mask_id,
+                use_mask_token=use_mask_token,
+                masking_mode=masking_mode,
+            )
+            global_views = jnp.concatenate([sample_views, other_views], axis=1)
+            global_masks = jnp.concatenate([sample_masks, other_masks], axis=1)
+            global_attn = jnp.concatenate([sample_attn, other_attn], axis=1)
+        else:
+            global_views = sample_views
+            global_masks = sample_masks
+            global_attn = sample_attn
+    local_views, local_masks, local_attn = _mask_views(
+        tokens,
+        local_key,
+        num_views=num_local_views,
+        min_ratio=local_mask_min,
+        max_ratio=local_mask_max,
+        pad_id=pad_id,
+        eos_id=eos_id,
+        mask_id=mask_id,
+        use_mask_token=use_mask_token,
+        masking_mode=masking_mode,
     )
-    view_dropout = jnp.concatenate([global_rates, local_rates], axis=0)
-    return views, mask_positions, view_attn, view_keys, view_dropout
+    return (
+        model_key,
+        global_views,
+        global_masks,
+        global_attn,
+        local_views,
+        local_masks,
+        local_attn,
+    )
+
+
+def _combine_views(
+    global_views: Array,
+    global_masks: Array,
+    global_attn: Array,
+    local_views: Array,
+    local_masks: Array,
+    local_attn: Array,
+) -> tuple[Array, Array, Array]:
+    """Combine global and local views into a single view batch.
+
+    :param global_views: Global view tokens.
+    :param global_masks: Global view mask positions.
+    :param global_attn: Global view attention masks.
+    :param local_views: Local view tokens.
+    :param local_masks: Local view mask positions.
+    :param local_attn: Local view attention masks.
+    :returns: Tuple of (views, mask positions, attention masks).
+    """
+    views = jnp.concatenate([global_views, local_views], axis=1)
+    mask_positions = jnp.concatenate([global_masks, local_masks], axis=1)
+    view_attn = jnp.concatenate([global_attn, local_attn], axis=1)
+    return views, mask_positions, view_attn
 
 
 def _encode_views(
@@ -534,15 +782,17 @@ def _encode_views(
     key: Array,
     num_global_views: int,
     num_local_views: int,
-    global_dropout_min: float,
-    global_dropout_max: float,
-    local_dropout_min: float,
-    local_dropout_max: float,
+    global_mask_min: float,
+    global_mask_max: float,
+    local_mask_min: float,
+    local_mask_max: float,
     pad_id: int,
     eos_id: int,
-    input_dropout: bool,
-) -> tuple[Array, Array, Array, Array, Array, Array]:
-    """Encode views into token representations.
+    mask_id: int,
+    use_mask_token: bool,
+    masking_mode: str,
+) -> tuple[Array, Array, Array, Array]:
+    """Encode masked views into token representations.
 
     :param model: Text transformer encoder.
     :param tokens: Token ids of shape (B, T).
@@ -550,64 +800,73 @@ def _encode_views(
     :param key: PRNG key.
     :param num_global_views: Number of global views.
     :param num_local_views: Number of local views.
-    :param global_dropout_min: Minimum global dropout rate.
-    :param global_dropout_max: Maximum global dropout rate.
-    :param local_dropout_min: Minimum local dropout rate.
-    :param local_dropout_max: Maximum local dropout rate.
+    :param global_mask_min: Minimum global masking ratio.
+    :param global_mask_max: Maximum global masking ratio.
+    :param local_mask_min: Minimum local masking ratio.
+    :param local_mask_max: Maximum local masking ratio.
     :param pad_id: Padding token id.
     :param eos_id: EOS token id.
-    :param input_dropout: Whether to apply view-level input dropout.
-    :returns: Tuple of (views, token_post, mask_positions, view_attn, view_keys, view_dropout).
+    :param mask_id: Mask token id.
+    :param use_mask_token: Whether to replace masked positions with mask tokens.
+    :param masking_mode: Masking mode ("spans" or "tokens").
+    :returns: Tuple of (views, token_post, mask_positions, view_attn).
     """
     if num_global_views + num_local_views <= 0:
         raise ValueError("at least one view must be requested")
 
-    views, mask_positions, view_attn, view_keys, view_dropout = _build_views(
+    tokens = jnp.where(tokens == eos_id, jnp.asarray(pad_id, dtype=tokens.dtype), tokens)
+
+    (
+        model_key,
+        global_views,
+        global_masks,
+        global_attn,
+        local_views,
+        local_masks,
+        local_attn,
+    ) = _build_views(
         tokens,
         key,
         num_global_views=num_global_views,
         num_local_views=num_local_views,
-        global_dropout_min=global_dropout_min,
-        global_dropout_max=global_dropout_max,
-        local_dropout_min=local_dropout_min,
-        local_dropout_max=local_dropout_max,
+        global_mask_min=global_mask_min,
+        global_mask_max=global_mask_max,
+        local_mask_min=local_mask_min,
+        local_mask_max=local_mask_max,
         pad_id=pad_id,
         eos_id=eos_id,
+        mask_id=mask_id,
+        use_mask_token=use_mask_token,
+        masking_mode=masking_mode,
     )
+    views, _mask_positions, view_attn = _combine_views(
+        global_views,
+        global_masks,
+        global_attn,
+        local_views,
+        local_masks,
+        local_attn,
+    )
+    mask_positions = _mask_positions
 
     bsz, num_views, seq_len = views.shape
-    views_v = jnp.transpose(views, (1, 0, 2))
-    attn_v = jnp.transpose(view_attn, (1, 0, 2))
-
-    def _encode_one(view_tokens: Array, view_attn: Array, view_key: Array, view_dropout: Array) -> Array:
-        """Encode one view with a per-view dropout rate.
-
-        :param view_tokens: Tokens for one view of shape (B, T).
-        :param view_attn: Attention mask for the view.
-        :param view_key: PRNG key for dropout.
-        :param view_dropout: Dropout rate for the view.
-        :returns: Post-head token representations.
-        """
-        input_dropout_rate = view_dropout if input_dropout is True else jnp.asarray(0.0, dtype=jnp.float32)
-        _reps_pre, reps_post, _pooled_post = model.forward_with_intermediates(
-            view_tokens,
-            view_attn,
-            train=train,
-            key=view_key,
-            input_dropout_rate=input_dropout_rate,
-        )
-        return reps_post
-
-    token_post_v = jax.vmap(_encode_one, in_axes=(0, 0, 0, 0))(views_v, attn_v, view_keys, view_dropout)
-    token_post = jnp.transpose(token_post_v, (1, 0, 2, 3))
-    return views, token_post, mask_positions, view_attn, view_keys, view_dropout
+    flat_views = views.reshape((bsz * num_views, seq_len))
+    flat_mask = view_attn.reshape((bsz * num_views, seq_len))
+    _reps_pre, reps_post, _pooled_post = model.forward_with_intermediates(
+        flat_views,
+        flat_mask,
+        train=train,
+        key=model_key,
+    )
+    token_post = reps_post.reshape((bsz, num_views, seq_len, reps_post.shape[-1]))
+    return views, token_post, mask_positions, view_attn
 
 
 def _masked_mean(
     reps: Array,
     mask: Array,
 ) -> Array:
-    """Compute mean representations over attention-masked positions.
+    """Compute mean representations over masked positions.
 
     :param reps: Token representations of shape (B, V, T, D).
     :param mask: Boolean mask of shape (B, V, T).
@@ -679,27 +938,27 @@ def main() -> None:
     default_local_min = 0.40
     default_local_max = 0.45
 
-    if args.global_dropout_min is None:
-        args.global_dropout_min = default_global_min
-    if args.global_dropout_max is None:
-        args.global_dropout_max = default_global_max
-    if args.local_dropout_min is None:
-        args.local_dropout_min = default_local_min
-    if args.local_dropout_max is None:
-        args.local_dropout_max = default_local_max
+    if args.global_mask_min is None:
+        args.global_mask_min = default_global_min
+    if args.global_mask_max is None:
+        args.global_mask_max = default_global_max
+    if args.local_mask_min is None:
+        args.local_mask_min = default_local_min
+    if args.local_mask_max is None:
+        args.local_mask_max = default_local_max
 
-    if args.global_dropout_min < 0.0 or args.global_dropout_min > 1.0:
-        raise ValueError("global-dropout-min must be in [0, 1]")
-    if args.global_dropout_max < 0.0 or args.global_dropout_max > 1.0:
-        raise ValueError("global-dropout-max must be in [0, 1]")
-    if args.local_dropout_min < 0.0 or args.local_dropout_min > 1.0:
-        raise ValueError("local-dropout-min must be in [0, 1]")
-    if args.local_dropout_max < 0.0 or args.local_dropout_max > 1.0:
-        raise ValueError("local-dropout-max must be in [0, 1]")
-    if args.global_dropout_min > args.global_dropout_max:
-        raise ValueError("global-dropout-min must be <= global-dropout-max")
-    if args.local_dropout_min > args.local_dropout_max:
-        raise ValueError("local-dropout-min must be <= local-dropout-max")
+    if args.global_mask_min < 0.0 or args.global_mask_min > 1.0:
+        raise ValueError("global-mask-min must be in [0, 1]")
+    if args.global_mask_max < 0.0 or args.global_mask_max > 1.0:
+        raise ValueError("global-mask-max must be in [0, 1]")
+    if args.local_mask_min < 0.0 or args.local_mask_min > 1.0:
+        raise ValueError("local-mask-min must be in [0, 1]")
+    if args.local_mask_max < 0.0 or args.local_mask_max > 1.0:
+        raise ValueError("local-mask-max must be in [0, 1]")
+    if args.global_mask_min > args.global_mask_max:
+        raise ValueError("global-mask-min must be <= global-mask-max")
+    if args.local_mask_min > args.local_mask_max:
+        raise ValueError("local-mask-min must be <= local-mask-max")
     if args.sigreg_weight < 0.0 or args.sigreg_weight > 1.0:
         raise ValueError("sigreg-weight must be in [0, 1]")
     if args.tjepa_unmasked_keep_prob < 0.0 or args.tjepa_unmasked_keep_prob > 1.0:
@@ -714,6 +973,13 @@ def main() -> None:
         raise ValueError("at least one loss weight must be > 0")
     if args.num_global_views + args.num_local_views <= 0:
         raise ValueError("at least one view must be requested")
+    if args.num_global_views > 0:
+        if args.global_mask_max == 0.0:
+            if args.num_global_views != 1:
+                raise ValueError("global views must be 1 when global masking is disabled")
+        else:
+            if args.num_global_views < 2:
+                raise ValueError("global masking requires at least two global views")
     if args.tjepa_loss_weight > 0.0:
         if args.num_global_views <= 0:
             raise ValueError("tjepa requires at least one global view")
@@ -780,22 +1046,21 @@ def main() -> None:
         batch_tokens = next(iter(preview_iter))
         batch_tokens = np.where(batch_tokens == eos_id, pad_id, batch_tokens)
         key = jax.random.PRNGKey(args.seed)
-        views, _view_masks, _view_attn, _view_keys, view_dropout = _build_views(
+        _, global_views, _global_masks, _global_attn, local_views, _local_masks, _local_attn = _build_views(
             jnp.asarray(batch_tokens),
             key,
             num_global_views=args.num_global_views,
             num_local_views=args.num_local_views,
-            global_dropout_min=args.global_dropout_min,
-            global_dropout_max=args.global_dropout_max,
-            local_dropout_min=args.local_dropout_min,
-            local_dropout_max=args.local_dropout_max,
+            global_mask_min=args.global_mask_min,
+            global_mask_max=args.global_mask_max,
+            local_mask_min=args.local_mask_min,
+            local_mask_max=args.local_mask_max,
             pad_id=pad_id,
             eos_id=eos_id,
+            mask_id=mask_id,
+            use_mask_token=args.mask_token_input,
+            masking_mode=args.masking_mode,
         )
-        global_views = views[:, : args.num_global_views, :]
-        local_views = views[:, args.num_global_views :, :]
-        global_dropout = np.asarray(view_dropout[: args.num_global_views])
-        local_dropout = np.asarray(view_dropout[args.num_global_views :])
 
         for idx in range(batch_tokens.shape[0]):
             original = _decode_tokens(tokenizer, batch_tokens[idx], pad_id=pad_id)
@@ -806,16 +1071,18 @@ def main() -> None:
                 print("Global views:")
                 for view_idx in range(args.num_global_views):
                     view_tokens = np.asarray(global_views[idx, view_idx])
+                    view_mask = np.asarray(_global_masks[idx, view_idx])
+                    view_tokens = np.where(view_mask, mask_id, view_tokens)
                     decoded = _decode_tokens(tokenizer, view_tokens, pad_id=pad_id)
-                    rate = float(global_dropout[view_idx])
-                    print(f"  G{view_idx + 1} (dropout={rate:.3f}): {decoded}")
+                    print(f"  G{view_idx + 1}: {decoded}")
             if args.num_local_views > 0:
                 print("Local views:")
                 for view_idx in range(args.num_local_views):
                     view_tokens = np.asarray(local_views[idx, view_idx])
+                    view_mask = np.asarray(_local_masks[idx, view_idx])
+                    view_tokens = np.where(view_mask, mask_id, view_tokens)
                     decoded = _decode_tokens(tokenizer, view_tokens, pad_id=pad_id)
-                    rate = float(local_dropout[view_idx])
-                    print(f"  L{view_idx + 1} (dropout={rate:.3f}): {decoded}")
+                    print(f"  L{view_idx + 1}: {decoded}")
         dataset.close()
         return
 
@@ -828,7 +1095,7 @@ def main() -> None:
         raise ValueError("predictor-n-layers must be >= 0")
     if args.tjepa_loss_weight > 0.0 and (args.num_local_views > 0 or args.num_global_views > 1):
         if predictor_layers == 0:
-            raise ValueError("tjepa requires predictor-n-layers > 0 when local views or extra globals are enabled")
+            raise ValueError("tjepa requires predictor-n-layers > 0 when masked globals or locals are enabled")
 
     model_config = TextTransformerConfig(
         vocab_size=vocab_size,
@@ -879,10 +1146,12 @@ def main() -> None:
         "views": {
             "num_global_views": args.num_global_views,
             "num_local_views": args.num_local_views,
-            "global_dropout_min": args.global_dropout_min,
-            "global_dropout_max": args.global_dropout_max,
-            "local_dropout_min": args.local_dropout_min,
-            "local_dropout_max": args.local_dropout_max,
+            "global_mask_min": args.global_mask_min,
+            "global_mask_max": args.global_mask_max,
+            "local_mask_min": args.local_mask_min,
+            "local_mask_max": args.local_mask_max,
+            "mask_token_input": args.mask_token_input,
+            "masking_mode": args.masking_mode,
         },
         "loss": {
             "sigreg_weight": args.sigreg_weight,
@@ -1011,7 +1280,7 @@ def main() -> None:
         :param model_in: Replicated model.
         :param swa_params: SWA parameters used for global centers.
         :param batch_tokens: Token batches of shape (M, B, T).
-        :param key: PRNG key for view dropout.
+        :param key: PRNG key for view masking.
         :param global_step: Global step index for loss scheduling.
         :param micro_step0: Starting micro-step index for RNG folding.
         :param micro_steps: Number of valid micro-steps in the batch.
@@ -1030,25 +1299,27 @@ def main() -> None:
 
             :param model_inner: Model replica used for the loss computation.
             :param tokens: Token batch of shape (B, T).
-            :param tokens_key: PRNG key for view dropout.
+            :param tokens_key: PRNG key for masking.
             :returns: Tuple of (total loss, (tjepa rec loss, tjepa sigreg loss, tjepa loss,
                 encoder mlm loss, encoder mlm acc1, encoder mlm acc5)).
             """
             view_key, predictor_key, mlm_key, rec_key = jax.random.split(tokens_key, 4)
-            views, token_post, mask_positions, view_attn, view_keys, view_dropout = _encode_views(
+            views, token_post, mask_positions, view_attn = _encode_views(
                 model_inner,
                 tokens,
                 train=True,
                 key=view_key,
                 num_global_views=args.num_global_views,
                 num_local_views=args.num_local_views,
-                global_dropout_min=args.global_dropout_min,
-                global_dropout_max=args.global_dropout_max,
-                local_dropout_min=args.local_dropout_min,
-                local_dropout_max=args.local_dropout_max,
+                global_mask_min=args.global_mask_min,
+                global_mask_max=args.global_mask_max,
+                local_mask_min=args.local_mask_min,
+                local_mask_max=args.local_mask_max,
                 pad_id=pad_id,
                 eos_id=eos_id,
-                input_dropout=True,
+                mask_id=mask_id,
+                use_mask_token=args.mask_token_input,
+                masking_mode=args.masking_mode,
             )
 
             bsz, num_views, seq_len, dim = token_post.shape
@@ -1107,45 +1378,15 @@ def main() -> None:
 
                 global_views = views[:, :num_global, :]
                 global_attn = view_attn[:, :num_global, :]
-                global_keys = view_keys[:num_global]
-                global_dropout = view_dropout[:num_global]
-
-                sample_tokens = global_views[:, 0, :]
-                sample_attn = global_attn[:, 0, :]
-                _swa_pre, sample_post, _swa_pool = swa_model.forward_with_intermediates(
-                    sample_tokens,
-                    sample_attn,
+                flat_globals = global_views.reshape((bsz * num_global, seq_len))
+                flat_global_attn = global_attn.reshape((bsz * num_global, seq_len))
+                _swa_pre, swa_post, _swa_pool = swa_model.forward_with_intermediates(
+                    flat_globals,
+                    flat_global_attn,
                     train=False,
                     key=None,
                 )
-                if num_global > 1:
-                    other_views = global_views[:, 1:, :]
-                    other_attn = global_attn[:, 1:, :]
-                    other_keys = global_keys[1:]
-                    other_dropout = global_dropout[1:]
-
-                    other_views_v = jnp.transpose(other_views, (1, 0, 2))
-                    other_attn_v = jnp.transpose(other_attn, (1, 0, 2))
-
-                    def _encode_other(
-                        view_tokens: Array, view_attn: Array, view_key: Array, view_dropout: Array
-                    ) -> Array:
-                        _swa_pre, swa_post, _swa_pool = swa_model.forward_with_intermediates(
-                            view_tokens,
-                            view_attn,
-                            train=True,
-                            key=view_key,
-                            input_dropout_rate=view_dropout,
-                        )
-                        return swa_post
-
-                    other_post_v = jax.vmap(_encode_other, in_axes=(0, 0, 0, 0))(
-                        other_views_v, other_attn_v, other_keys, other_dropout
-                    )
-                    other_post = jnp.transpose(other_post_v, (1, 0, 2, 3))
-                    swa_post = jnp.concatenate([sample_post[:, None, :, :], other_post], axis=1)
-                else:
-                    swa_post = sample_post[:, None, :, :]
+                swa_post = swa_post.reshape((bsz, num_global, seq_len, dim))
                 global_center = jnp.mean(swa_post.astype(jnp.float32), axis=1)
                 global_center = jax.lax.stop_gradient(global_center)
 
@@ -1154,7 +1395,7 @@ def main() -> None:
                 total_pred_views = (num_global - 1) + num_local
                 if total_pred_views > 0:
                     if model_inner.predictor is None:
-                        raise ValueError("predictor must be enabled when local views or extra globals are active")
+                        raise ValueError("predictor must be enabled when masked globals or locals are active")
                     global_masks = mask_positions[:, 1:num_global, :]
                     global_attn = view_attn[:, 1:num_global, :]
                     local_reps = token_post[:, num_global:, :, :]
