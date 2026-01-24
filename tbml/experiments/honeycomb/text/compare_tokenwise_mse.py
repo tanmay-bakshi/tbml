@@ -372,9 +372,9 @@ def main() -> None:
     cand_attn = attn_all[1:]
 
     mask_positions = ref_tokens_arr == mask_id
-    use_mask_token = view_config.get("mask_token_input")
+    use_mask_token = view_config.get("mask_token_input", True)
     if isinstance(use_mask_token, bool) is False:
-        raise ValueError("mask_token_input missing from config")
+        raise ValueError("mask_token_input must be a boolean when provided")
     if use_mask_token is True:
         ref_attn_mask = ref_attn
     else:

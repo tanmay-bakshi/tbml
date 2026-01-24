@@ -168,6 +168,28 @@ class TokenEmbedding(eqx.Module):
         return logits
 
 
+def _apply_input_dropout(embeddings: Array, rate: Array, key: Array) -> Array:
+    """Apply dropout to token embeddings with a per-view rate.
+
+    :param embeddings: Embedded tokens of shape (B, T, D).
+    :param rate: Dropout rate scalar or shape (B,).
+    :param key: PRNG key for dropout.
+    :returns: Dropout-regularized embeddings.
+    """
+    rate_f = jnp.asarray(rate, dtype=jnp.float32)
+    keep = jnp.clip(1.0 - rate_f, 1e-6, 1.0)
+    if rate_f.ndim == 0:
+        mask = jax.random.bernoulli(key, p=keep, shape=embeddings.shape)
+        mask = mask.astype(embeddings.dtype)
+        return (embeddings * mask) / keep.astype(embeddings.dtype)
+    if rate_f.ndim == 1:
+        keep_b = keep[:, None, None]
+        mask = jax.random.bernoulli(key, p=keep_b, shape=embeddings.shape)
+        mask = mask.astype(embeddings.dtype)
+        return (embeddings * mask) / keep_b.astype(embeddings.dtype)
+    raise ValueError("input dropout rate must be a scalar or shape (B,)")
+
+
 class TextTransformerBlock(eqx.Module):
     """Transformer block with RMSNorm, positional attention, and SwiGLU MLP."""
 
@@ -497,7 +519,7 @@ class Predictor(eqx.Module):
                     qkv_kernel_init=qkv_kernel_init,
                     o_kernel_init=o_kernel_init,
                     mlp_kernel_init=mlp_kernel_init,
-                    is_causal=config.encoder_causal_attention,
+                    is_causal=config.predictor_causal_attention,
                     key=block_keys[idx],
                 )
             )
@@ -663,7 +685,7 @@ class TextTransformer(eqx.Module):
                     drop_path_prob=drop_rates[idx],
                     pope_base=config.pope_base,
                     attn_type=config.attn_type,
-                    is_causal=config.predictor_causal_attention,
+                    is_causal=config.encoder_causal_attention,
                     dtype=dtype,
                     param_dtype=param_dtype,
                     qkv_kernel_init=init,
@@ -705,6 +727,7 @@ class TextTransformer(eqx.Module):
         *,
         train: bool,
         key: Array | None,
+        input_dropout_rate: float | Array | None = None,
     ) -> tuple[Array, Array]:
         """Compute per-token and pooled sequence embeddings.
 
@@ -712,6 +735,7 @@ class TextTransformer(eqx.Module):
         :param attention_mask: Attention mask of shape (B, T).
         :param train: Whether to enable dropout.
         :param key: PRNG key for dropout and DropPath.
+        :param input_dropout_rate: Optional input dropout rate for embeddings.
         :returns: Tuple of (token_reps, pooled_reps).
         """
         if tokens.ndim != 2:
@@ -728,6 +752,7 @@ class TextTransformer(eqx.Module):
             attention_mask,
             train=train,
             key=key,
+            input_dropout_rate=input_dropout_rate,
         )
         return reps_post, pooled
 
@@ -738,6 +763,7 @@ class TextTransformer(eqx.Module):
         *,
         train: bool,
         key: Array | None,
+        input_dropout_rate: float | Array | None = None,
     ) -> tuple[Array, Array, Array]:
         """Compute pre-norm tokens, post-head tokens, and pooled embeddings.
 
@@ -745,6 +771,7 @@ class TextTransformer(eqx.Module):
         :param attention_mask: Attention mask of shape (B, T).
         :param train: Whether to enable dropout.
         :param key: PRNG key for dropout and DropPath.
+        :param input_dropout_rate: Optional input dropout rate for embeddings.
         :returns: Tuple of (pre_norm_tokens, post_head_tokens, pooled).
         """
         if tokens.ndim != 2:
@@ -757,11 +784,17 @@ class TextTransformer(eqx.Module):
             raise ValueError("sequence length exceeds max_seq_len")
 
         reps = self.token_embed(tokens)
-        if key is None:
+        dropout_key = key
+        if train is True and input_dropout_rate is not None:
+            if key is None:
+                raise ValueError("dropout key must be provided when input dropout is enabled")
+            input_key, dropout_key = jax.random.split(key, 2)
+            reps = _apply_input_dropout(reps, jnp.asarray(input_dropout_rate), input_key)
+        if dropout_key is None:
             block_keys: list[Array | None] = [None] * len(self.blocks)
             head_key = None
         else:
-            keys = list(jax.random.split(key, len(self.blocks) + 1))
+            keys = list(jax.random.split(dropout_key, len(self.blocks) + 1))
             block_keys = keys[:-1]
             head_key = keys[-1]
 
