@@ -2028,14 +2028,35 @@ def main() -> None:
                 log_start = time.perf_counter()
                 log_this_step = (global_step % args.log_every) == 0
                 if log_this_step:
-                    loss_val = float(np.mean(jax.device_get(loss)))
-                    tjepa_rec_val = float(np.mean(jax.device_get(tjepa_rec)))
-                    tjepa_sigreg_val = float(np.mean(jax.device_get(tjepa_sigreg)))
-                    tjepa_val = float(np.mean(jax.device_get(tjepa_loss)))
-                    encoder_mlm_val = float(np.mean(jax.device_get(encoder_mlm_loss)))
-                    encoder_mlm_acc1_val = float(np.mean(jax.device_get(encoder_mlm_acc1)))
-                    encoder_mlm_acc5_val = float(np.mean(jax.device_get(encoder_mlm_acc5)))
-                    decoder_loss_val = float(np.mean(jax.device_get(decoder_loss)))
+                    (
+                        loss_host,
+                        tjepa_rec_host,
+                        tjepa_sigreg_host,
+                        tjepa_host,
+                        encoder_mlm_host,
+                        encoder_mlm_acc1_host,
+                        encoder_mlm_acc5_host,
+                        decoder_loss_host,
+                    ) = jax.device_get(
+                        (
+                            loss,
+                            tjepa_rec,
+                            tjepa_sigreg,
+                            tjepa_loss,
+                            encoder_mlm_loss,
+                            encoder_mlm_acc1,
+                            encoder_mlm_acc5,
+                            decoder_loss,
+                        )
+                    )
+                    loss_val = float(np.mean(loss_host))
+                    tjepa_rec_val = float(np.mean(tjepa_rec_host))
+                    tjepa_sigreg_val = float(np.mean(tjepa_sigreg_host))
+                    tjepa_val = float(np.mean(tjepa_host))
+                    encoder_mlm_val = float(np.mean(encoder_mlm_host))
+                    encoder_mlm_acc1_val = float(np.mean(encoder_mlm_acc1_host))
+                    encoder_mlm_acc5_val = float(np.mean(encoder_mlm_acc5_host))
+                    decoder_loss_val = float(np.mean(decoder_loss_host))
                     last_loss_val = loss_val
                     last_tjepa_rec_val = tjepa_rec_val
                     last_tjepa_sigreg_val = tjepa_sigreg_val
