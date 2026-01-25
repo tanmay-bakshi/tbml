@@ -493,6 +493,27 @@ def _mask_spans(
     if masking_mode == "spans" and poisson_lambda <= 0.0:
         raise ValueError("poisson_lambda must be > 0")
 
+    if min_ratio == 0.0 and max_ratio == 0.0:
+        eligible = jnp.logical_and(tokens != pad_id, tokens != eos_id)
+        attention_mask = eligible
+
+        def _ensure_any(
+            attn: Array,
+            elig: Array,
+        ) -> Array:
+            def _with_fallback(_: None) -> Array:
+                fallback_idx = jnp.argmax(elig)
+                return attn.at[fallback_idx].set(True)
+
+            def _no_fallback(_: None) -> Array:
+                return attn
+
+            return jax.lax.cond(jnp.any(attn), _no_fallback, _with_fallback, operand=None)
+
+        attention_mask = jax.vmap(_ensure_any)(attention_mask, eligible)
+        mask = jnp.zeros(tokens.shape, dtype=jnp.bool_)
+        return tokens, mask, attention_mask
+
     key_ratio, key_spans = jax.random.split(key)
     ratios = jax.random.uniform(
         key_ratio,
@@ -502,64 +523,65 @@ def _mask_spans(
     )
     keys = jax.random.split(key_spans, tokens.shape[0])
     seq_len = tokens.shape[1]
-    idx = jnp.arange(seq_len, dtype=jnp.int32)
-    idx_row = idx[None, :]
-    all_lengths = jnp.arange(1, seq_len + 1, dtype=jnp.int32)[:, None]
+    if masking_mode == "spans":
+        idx = jnp.arange(seq_len, dtype=jnp.int32)
+        idx_row = idx[None, :]
+        all_lengths = jnp.arange(1, seq_len + 1, dtype=jnp.int32)[:, None]
 
-    def _one_sample_spans(
-        sample_tokens: Array,
-        ratio: Array,
-        sample_key: Array,
-    ) -> tuple[Array, Array, Array]:
-        """Mask spans for a single sequence.
+        def _one_sample_spans(
+            sample_tokens: Array,
+            ratio: Array,
+            sample_key: Array,
+        ) -> tuple[Array, Array, Array]:
+            """Mask spans for a single sequence.
 
-        :param sample_tokens: Token ids of shape (T,).
-        :param ratio: Masking ratio scalar.
-        :param sample_key: PRNG key.
-        :returns: Tuple of (masked tokens, mask positions, attention mask).
-        """
-        key_len, key_start = jax.random.split(sample_key)
-        eligible = jnp.logical_and(sample_tokens != pad_id, sample_tokens != eos_id)
-        valid_len = jnp.sum(eligible).astype(jnp.int32)
-        target = jnp.floor(ratio * valid_len).astype(jnp.int32)
-        target = jnp.minimum(target, jnp.maximum(valid_len - 1, 0))
-        span_lengths = jax.random.poisson(key_len, poisson_lambda, shape=(seq_len,))
-        span_lengths = jnp.maximum(span_lengths, 1)
-        start_scores = jax.random.uniform(key_start, shape=(seq_len, seq_len), minval=0.0, maxval=1.0)
+            :param sample_tokens: Token ids of shape (T,).
+            :param ratio: Masking ratio scalar.
+            :param sample_key: PRNG key.
+            :returns: Tuple of (masked tokens, mask positions, attention mask).
+            """
+            key_len, key_start = jax.random.split(sample_key)
+            eligible = jnp.logical_and(sample_tokens != pad_id, sample_tokens != eos_id)
+            valid_len = jnp.sum(eligible).astype(jnp.int32)
+            target = jnp.floor(ratio * valid_len).astype(jnp.int32)
+            target = jnp.minimum(target, jnp.maximum(valid_len - 1, 0))
+            span_lengths = jax.random.poisson(key_len, poisson_lambda, shape=(seq_len,))
+            span_lengths = jnp.maximum(span_lengths, 1)
+            start_scores = jax.random.uniform(key_start, shape=(seq_len, seq_len), minval=0.0, maxval=1.0)
 
-        def _body(i: int, state: tuple[Array, Array]) -> tuple[Array, Array]:
-            mask, masked_count = state
-            remaining = target - masked_count
-            use = remaining > 0
-            span_len = jnp.minimum(span_lengths[i], remaining)
-            span_len = jnp.maximum(span_len, 1)
-            valid = jnp.logical_and(eligible, jnp.logical_not(mask))
-            valid_int = valid.astype(jnp.int32)
-            prefix = jnp.concatenate(
-                [jnp.zeros((1,), dtype=jnp.int32), jnp.cumsum(valid_int)]
+            def _body(i: int, state: tuple[Array, Array]) -> tuple[Array, Array]:
+                mask, masked_count = state
+                remaining = target - masked_count
+                use = remaining > 0
+                span_len = jnp.minimum(span_lengths[i], remaining)
+                span_len = jnp.maximum(span_len, 1)
+                valid = jnp.logical_and(eligible, jnp.logical_not(mask))
+                valid_int = valid.astype(jnp.int32)
+                prefix = jnp.concatenate(
+                    [jnp.zeros((1,), dtype=jnp.int32), jnp.cumsum(valid_int)]
+                )
+                end = idx_row + all_lengths
+                valid_window = end <= seq_len
+                prefix_end = jnp.take(prefix, end, mode="clip")
+                prefix_start = prefix[idx_row]
+                window_sum = jnp.where(valid_window, prefix_end - prefix_start, 0)
+                length_index = jnp.maximum(span_len - 1, 0)
+                possible = jnp.take(window_sum, length_index, axis=0) == span_len
+                any_possible = jnp.any(possible)
+                scores = jnp.where(possible, start_scores[i], -jnp.inf)
+                start = jnp.argmax(scores)
+                span_positions = jnp.logical_and(idx >= start, idx < start + span_len)
+                apply = jnp.logical_and(use, any_possible)
+                new_mask = jnp.where(apply, jnp.logical_or(mask, span_positions), mask)
+                new_count = jnp.where(apply, masked_count + span_len, masked_count)
+                return new_mask, new_count
+
+            init_mask = jnp.zeros((seq_len,), dtype=jnp.bool_)
+            init_count = jnp.asarray(0, dtype=jnp.int32)
+            final_mask, _final_count = jax.lax.fori_loop(
+                0, seq_len, _body, (init_mask, init_count)
             )
-            end = idx_row + all_lengths
-            valid_window = end <= seq_len
-            prefix_end = jnp.take(prefix, end, mode="clip")
-            prefix_start = prefix[idx_row]
-            window_sum = jnp.where(valid_window, prefix_end - prefix_start, 0)
-            length_index = jnp.maximum(span_len - 1, 0)
-            possible = jnp.take(window_sum, length_index, axis=0) == span_len
-            any_possible = jnp.any(possible)
-            scores = jnp.where(possible, start_scores[i], -jnp.inf)
-            start = jnp.argmax(scores)
-            span_positions = jnp.logical_and(idx >= start, idx < start + span_len)
-            apply = jnp.logical_and(use, any_possible)
-            new_mask = jnp.where(apply, jnp.logical_or(mask, span_positions), mask)
-            new_count = jnp.where(apply, masked_count + span_len, masked_count)
-            return new_mask, new_count
-
-        init_mask = jnp.zeros((seq_len,), dtype=jnp.bool_)
-        init_count = jnp.asarray(0, dtype=jnp.int32)
-        final_mask, _final_count = jax.lax.fori_loop(
-            0, seq_len, _body, (init_mask, init_count)
-        )
-        return final_mask, eligible
+            return final_mask, eligible
 
     def _one_sample_tokens(
         sample_tokens: Array,
