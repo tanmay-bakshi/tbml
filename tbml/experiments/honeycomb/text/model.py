@@ -699,7 +699,7 @@ class DecoderLSTM(eqx.Module):
         fallback = fallback.at[:, 0].set(True)
         valid_mask = jnp.where(any_valid, predictor_mask, fallback)
 
-        scale = jnp.asarray(1.0 / jnp.sqrt(self.d_model), dtype=predictor_reps.dtype)
+        scale = jnp.asarray(1.0 / jnp.sqrt(self.d_model), dtype=jnp.float32)
         positions = jnp.arange(seq_len, dtype=jnp.int32)
         steps = seq_len + 1
         use_keys = key is not None
@@ -730,13 +730,16 @@ class DecoderLSTM(eqx.Module):
             attn_key_in = attn_key if use_keys is True else None
             logit_key_in = logit_key if use_keys is True else None
             query = self.attn_head(h_out, train=train, key=attn_key_in)
-            scores = jnp.einsum("bd,btd->bt", query, predictor_reps) * scale
-            neg_inf = jnp.asarray(-1e9, dtype=scores.dtype)
+            query_f = query.astype(jnp.float32)
+            reps_f = predictor_reps.astype(jnp.float32)
+            scores = jnp.einsum("bd,btd->bt", query_f, reps_f) * scale
+            neg_inf = jnp.asarray(-1e9, dtype=jnp.float32)
 
             def _attend(step_mask: Array) -> Array:
                 masked_scores = jnp.where(step_mask, scores, neg_inf)
                 weights = jax.nn.softmax(masked_scores, axis=-1)
-                return jnp.einsum("bt,btd->bd", weights, predictor_reps)
+                context_f = jnp.einsum("bt,btd->bd", weights, reps_f)
+                return context_f.astype(predictor_reps.dtype)
 
             if self.causal_attention is True:
                 cutoff = step_idx - 1
