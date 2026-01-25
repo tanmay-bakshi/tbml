@@ -9,13 +9,18 @@ from tbml.nn.rmsnorm import RMSNorm
 
 
 class LSTMCell(eqx.Module):
-    """LSTM cell with a single input/hidden projection."""
+    """LSTM cell with RMSNorm on gate projections and cell state."""
 
     input_dim: int
     hidden_dim: int
     dtype: jnp.dtype
     param_dtype: jnp.dtype
-    proj: Linear
+    proj_h: Linear
+    proj_x: Linear
+    bias: Array
+    norm_h: RMSNorm
+    norm_x: RMSNorm
+    norm_c: RMSNorm
 
     def __init__(
         self,
@@ -45,16 +50,32 @@ class LSTMCell(eqx.Module):
         self.hidden_dim = hidden_dim
         self.dtype = dtype
         self.param_dtype = param_dtype
-        self.proj = Linear(
-            in_features=input_dim + hidden_dim,
+        proj_h_key, proj_x_key, norm_h_key, norm_x_key, norm_c_key = jax.random.split(key, 5)
+        self.proj_h = Linear(
+            in_features=hidden_dim,
             out_features=4 * hidden_dim,
-            use_bias=True,
-            bias_value=0.0,
+            use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=kernel_init,
-            key=key,
+            key=proj_h_key,
         )
+        self.proj_x = Linear(
+            in_features=input_dim,
+            out_features=4 * hidden_dim,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=kernel_init,
+            key=proj_x_key,
+        )
+        self.bias = jnp.zeros((4 * hidden_dim,), dtype=param_dtype)
+        self.norm_h = RMSNorm(4 * hidden_dim, dtype=dtype, param_dtype=param_dtype)
+        self.norm_x = RMSNorm(4 * hidden_dim, dtype=dtype, param_dtype=param_dtype)
+        self.norm_c = RMSNorm(hidden_dim, dtype=dtype, param_dtype=param_dtype)
+        _ = norm_h_key
+        _ = norm_x_key
+        _ = norm_c_key
 
     def __call__(
         self,
@@ -76,23 +97,24 @@ class LSTMCell(eqx.Module):
         if c.shape[-1] != self.hidden_dim:
             raise ValueError("c last dimension must match hidden_dim")
 
-        combined = jnp.concatenate([x, h], axis=-1)
-        gates = self.proj(combined)
-        i_gate, f_gate, g_gate, o_gate = jnp.split(gates, 4, axis=-1)
-        i_gate = jax.nn.sigmoid(i_gate)
+        proj_h = self.proj_h(h)
+        proj_x = self.proj_x(x)
+        gates = self.norm_h(proj_h) + self.norm_x(proj_x) + self.bias.astype(self.dtype)
+        f_gate, i_gate, o_gate, g_gate = jnp.split(gates, 4, axis=-1)
         f_gate = jax.nn.sigmoid(f_gate)
+        i_gate = jax.nn.sigmoid(i_gate)
         o_gate = jax.nn.sigmoid(o_gate)
         g_gate = jnp.tanh(g_gate)
         new_c = f_gate * c + i_gate * g_gate
-        new_h = o_gate * jnp.tanh(new_c)
+        norm_c = self.norm_c(new_c)
+        new_h = o_gate * jnp.tanh(norm_c)
         return new_h, new_c
 
 
 class LSTMLayer(eqx.Module):
-    """Single LSTM layer with RMSNorm on the hidden state."""
+    """Single LSTM layer."""
 
     cell: LSTMCell
-    norm: RMSNorm
 
     def __init__(
         self,
@@ -122,7 +144,6 @@ class LSTMLayer(eqx.Module):
             kernel_init=kernel_init,
             key=cell_key,
         )
-        self.norm = RMSNorm(hidden_dim, dtype=dtype, param_dtype=param_dtype)
         _ = norm_key
 
     def __call__(
@@ -138,13 +159,11 @@ class LSTMLayer(eqx.Module):
         :param c: Cell state of shape (B, hidden_dim).
         :returns: Tuple of (new hidden, new cell).
         """
-        new_h, new_c = self.cell(x, h, c)
-        new_h = self.norm(new_h)
-        return new_h, new_c
+        return self.cell(x, h, c)
 
 
 class LSTMStack(eqx.Module):
-    """Stacked LSTM with RMSNorm between layers."""
+    """Stacked LSTM."""
 
     input_dim: int
     hidden_dim: int
@@ -320,7 +339,6 @@ class BiLSTMLayer(eqx.Module):
             def _step(carry: tuple[Array, Array], x_t: Array) -> tuple[tuple[Array, Array], Array]:
                 h_state, c_state = carry
                 h_next, c_next = layer.cell(x_t, h_state, c_state)
-                h_next = layer.norm(h_next)
                 return (h_next, c_next), h_next
 
             seq_time = jnp.swapaxes(seq, 0, 1)
