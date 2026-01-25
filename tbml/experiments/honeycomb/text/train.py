@@ -2044,16 +2044,15 @@ def main() -> None:
         devices=device_list,
     )  # type: ignore[call-overload]
 
-    params_repl = _replicate_tree(params, num_devices)
-    params_repl = jax.device_put(params_repl, device=data_sharding)
+    params_repl = jax.device_put_replicated(params, device_list)
     train_repl = eqx.combine(params_repl, model_static)
-    opt_state_repl = _replicate_tree(opt_state, num_devices)
-    opt_state_repl = jax.device_put(opt_state_repl, device=data_sharding)
+    opt_state_repl = jax.device_put_replicated(opt_state, device_list)
     if args.use_swa is True:
-        swa_params_repl = _replicate_tree(params, num_devices)
-        swa_params_repl = jax.device_put(swa_params_repl, device=data_sharding)
-        swa_count_repl = jnp.full((num_devices,), 1, dtype=jnp.int32)
-        swa_count_repl = jax.device_put(swa_count_repl, device=data_sharding)
+        swa_params_repl = jax.device_put_replicated(params, device_list)
+        swa_count_repl = jax.device_put_replicated(
+            jnp.asarray(1, dtype=jnp.int32),
+            device_list,
+        )
     else:
         swa_params_repl = params_repl
         swa_count_repl = None
