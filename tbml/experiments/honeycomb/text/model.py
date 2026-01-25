@@ -745,14 +745,10 @@ class DecoderLSTM(eqx.Module):
                 return context_f.astype(predictor_reps.dtype)
 
             if self.causal_attention is True:
-                cutoff = step_idx - 1
+                cutoff = step_idx
                 causal_mask = positions <= cutoff
                 step_mask = jnp.logical_and(valid_mask, causal_mask[None, :])
-
-                def _zero_context() -> Array:
-                    return jnp.zeros((batch_size, self.d_model), dtype=predictor_reps.dtype)
-
-                context = jax.lax.cond(step_idx == 0, _zero_context, lambda: _attend(step_mask))
+                context = _attend(step_mask)
             else:
                 context = _attend(valid_mask)
             logit_vec = self.logit_head(h_out, train=train, key=logit_key_in)
