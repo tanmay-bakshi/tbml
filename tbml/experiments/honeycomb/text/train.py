@@ -1798,15 +1798,25 @@ def main() -> None:
         encoder_mlm_acc5 = encoder_mlm_acc5 / scale
         decoder_loss = decoder_loss / scale
 
-        grads = jax.lax.pmean(grads, axis_name="data")
-        loss = jax.lax.pmean(loss, axis_name="data")
-        tjepa_rec_loss = jax.lax.pmean(tjepa_rec_loss, axis_name="data")
-        tjepa_sigreg_loss = jax.lax.pmean(tjepa_sigreg_loss, axis_name="data")
-        tjepa_loss = jax.lax.pmean(tjepa_loss, axis_name="data")
-        encoder_mlm_loss = jax.lax.pmean(encoder_mlm_loss, axis_name="data")
-        encoder_mlm_acc1 = jax.lax.pmean(encoder_mlm_acc1, axis_name="data")
-        encoder_mlm_acc5 = jax.lax.pmean(encoder_mlm_acc5, axis_name="data")
-        decoder_loss = jax.lax.pmean(decoder_loss, axis_name="data")
+        metrics = (
+            loss,
+            tjepa_rec_loss,
+            tjepa_loss,
+            encoder_mlm_loss,
+            encoder_mlm_acc1,
+            encoder_mlm_acc5,
+            decoder_loss,
+        )
+        grads, metrics = jax.lax.pmean((grads, metrics), axis_name="data")
+        (
+            loss,
+            tjepa_rec_loss,
+            tjepa_loss,
+            encoder_mlm_loss,
+            encoder_mlm_acc1,
+            encoder_mlm_acc5,
+            decoder_loss,
+        ) = metrics
         if args.grad_clip_norm > 0.0:
             grads, _grad_norm = _clip_grad_norm(grads, args.grad_clip_norm)
             _ = _grad_norm
