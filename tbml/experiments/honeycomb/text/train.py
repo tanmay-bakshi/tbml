@@ -69,6 +69,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--attn-type", type=str, default="pope", choices=["pope", "rope"])
     parser.add_argument("--encoder-causal-attention", type=str, default="true", choices=["true", "false"])
     parser.add_argument("--predictor-causal-attention", type=str, default="true", choices=["true", "false"])
+    parser.add_argument("--decoder-causal-attention", type=str, default="true", choices=["true", "false"])
 
     parser.add_argument("--num-global-views", type=int, default=1)
     parser.add_argument("--num-local-views", type=int, default=6)
@@ -922,6 +923,7 @@ def main() -> None:
     args = _parse_args()
     encoder_causal_attention = _parse_bool(args.encoder_causal_attention)
     predictor_causal_attention = _parse_bool(args.predictor_causal_attention)
+    decoder_causal_attention = _parse_bool(args.decoder_causal_attention)
 
     if args.max_train_steps < 0:
         raise ValueError("max-train-steps must be >= 0")
@@ -1139,6 +1141,7 @@ def main() -> None:
         embed_norm_scale=args.init_std,
         encoder_causal_attention=encoder_causal_attention,
         predictor_causal_attention=predictor_causal_attention,
+        decoder_causal_attention=decoder_causal_attention,
     )
     exclusion_patterns = list(TextTransformer.MUON_PARAM_EXCLUSION_PATTERNS)
     weight_decay_exclusions = [

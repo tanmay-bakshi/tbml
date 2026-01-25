@@ -32,6 +32,7 @@ class TextTransformerConfig(BaseModel):
     :ivar decoder_n_layers: Number of decoder LSTM layers.
     :ivar encoder_causal_attention: Whether encoder attention is causal.
     :ivar predictor_causal_attention: Whether predictor attention is causal.
+    :ivar decoder_causal_attention: Whether decoder attention is causal.
     """
 
     vocab_size: int = Field(default=50257)
@@ -52,6 +53,7 @@ class TextTransformerConfig(BaseModel):
     decoder_n_layers: int = Field(default=0)
     encoder_causal_attention: bool = Field(default=True)
     predictor_causal_attention: bool = Field(default=True)
+    decoder_causal_attention: bool = Field(default=True)
     causal_attention: bool | None = Field(default=None)
 
     @root_validator(pre=True)
@@ -571,6 +573,7 @@ class DecoderLSTM(eqx.Module):
     dtype: jnp.dtype = eqx.field(static=True)
     d_model: int
     num_layers: int
+    causal_attention: bool = eqx.field(static=True)
     start_vector: Array
     layers: tuple[LSTMLayer, ...]
     logit_head: SwiGLUFeedForward
@@ -601,6 +604,7 @@ class DecoderLSTM(eqx.Module):
         self.dtype = dtype
         self.d_model = config.d_model
         self.num_layers = config.decoder_n_layers
+        self.causal_attention = config.decoder_causal_attention
 
         init = truncated_normal_init(config.init_std)
         keys = jax.random.split(key, 3 + config.decoder_n_layers)
@@ -696,6 +700,7 @@ class DecoderLSTM(eqx.Module):
         valid_mask = jnp.where(any_valid, predictor_mask, fallback)
 
         scale = jnp.asarray(1.0 / jnp.sqrt(self.d_model), dtype=predictor_reps.dtype)
+        positions = jnp.arange(seq_len, dtype=jnp.int32)
         steps = seq_len + 1
         use_keys = key is not None
         if use_keys is True:
@@ -708,10 +713,10 @@ class DecoderLSTM(eqx.Module):
 
         def _step(
             carry: tuple[tuple[Array, ...], tuple[Array, ...], Array],
-            keys_t: tuple[Array, Array],
+            inputs: tuple[Array, Array, Array],
         ) -> tuple[tuple[tuple[Array, ...], tuple[Array, ...], Array], Array]:
             h_list, c_list, x_t = carry
-            attn_key, logit_key = keys_t
+            attn_key, logit_key, step_idx = inputs
             new_h: list[Array] = []
             new_c: list[Array] = []
             layer_in = x_t
@@ -727,16 +732,31 @@ class DecoderLSTM(eqx.Module):
             query = self.attn_head(h_out, train=train, key=attn_key_in)
             scores = jnp.einsum("bd,btd->bt", query, predictor_reps) * scale
             neg_inf = jnp.asarray(-1e9, dtype=scores.dtype)
-            scores = jnp.where(valid_mask, scores, neg_inf)
-            weights = jax.nn.softmax(scores, axis=-1)
-            context = jnp.einsum("bt,btd->bd", weights, predictor_reps)
+
+            def _attend(step_mask: Array) -> Array:
+                masked_scores = jnp.where(step_mask, scores, neg_inf)
+                weights = jax.nn.softmax(masked_scores, axis=-1)
+                return jnp.einsum("bt,btd->bd", weights, predictor_reps)
+
+            if self.causal_attention is True:
+                cutoff = step_idx - 1
+                causal_mask = positions <= cutoff
+                step_mask = jnp.logical_and(valid_mask, causal_mask[None, :])
+
+                def _zero_context() -> Array:
+                    return jnp.zeros((batch_size, self.d_model), dtype=predictor_reps.dtype)
+
+                context = jax.lax.cond(step_idx == 0, _zero_context, lambda: _attend(step_mask))
+            else:
+                context = _attend(valid_mask)
             logit_vec = self.logit_head(h_out, train=train, key=logit_key_in)
             return (tuple(new_h), tuple(new_c), context), logit_vec
 
+        step_indices = jnp.arange(steps, dtype=jnp.int32)
         (_final_h, _final_c, _final_x), outputs = jax.lax.scan(
             _step,
             (init_h, init_c, start),
-            xs=(attn_keys, logit_keys),
+            xs=(attn_keys, logit_keys, step_indices),
         )
         outputs = jnp.swapaxes(outputs, 0, 1)
         return outputs[:, 1:, :]
