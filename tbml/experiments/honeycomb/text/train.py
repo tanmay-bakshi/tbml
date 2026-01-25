@@ -1380,7 +1380,7 @@ def main() -> None:
             values,
         )
 
-    def grad_step(
+    def _grad_step_impl(
         model_in: TextTransformer,
         swa_params: eqx.Module,
         batch_tokens: Array,
@@ -1388,6 +1388,7 @@ def main() -> None:
         global_step: Array,
         micro_step0: Array,
         micro_steps: Array,
+        use_cond: bool,
     ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array, Array]:
         """Compute accumulated gradients and metrics across micro-steps.
 
@@ -1398,6 +1399,7 @@ def main() -> None:
         :param global_step: Global step index for loss scheduling.
         :param micro_step0: Starting micro-step index for RNG folding.
         :param micro_steps: Number of valid micro-steps in the batch.
+        :param use_cond: Whether to guard micro-step evaluation with a conditional.
         :returns: Tuple of (grads, total loss, tjepa rec loss, tjepa sigreg loss, tjepa loss,
             encoder mlm loss, encoder mlm acc1, encoder mlm acc5, decoder loss).
         """
@@ -1671,77 +1673,85 @@ def main() -> None:
 
         step_indices = jnp.arange(batch_tokens.shape[0], dtype=jnp.int32)
 
-        def _accum_body(
-            carry: tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array],
-            inputs: tuple[Array, Array],
-        ) -> tuple[tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array], None]:
-            """Accumulate gradients and metrics for one micro-step.
+        def _compute_step(
+            grads_acc: eqx.Module,
+            loss_acc: Array,
+            tjepa_rec_acc: Array,
+            tjepa_sigreg_acc: Array,
+            tjepa_acc: Array,
+            encoder_mlm_acc: Array,
+            encoder_mlm_acc1_acc: Array,
+            encoder_mlm_acc5_acc: Array,
+            decoder_loss_acc: Array,
+            tokens: Array,
+            tokens_key: Array,
+        ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array]:
+            """Evaluate gradients and accumulate metrics for one micro-step.
 
-            :param carry: Tuple of (grads, total loss, tjepa rec loss, tjepa sigreg loss,
-                tjepa loss, encoder mlm loss, encoder mlm acc1, encoder mlm acc5, decoder loss).
-            :param inputs: Tuple of (micro step index, token batch).
-            :returns: Updated carry and unused output.
+            :param grads_acc: Accumulated gradients so far.
+            :param loss_acc: Accumulated total loss.
+            :param tjepa_rec_acc: Accumulated TJepa reconstruction loss.
+            :param tjepa_sigreg_acc: Accumulated TJepa sigreg loss.
+            :param tjepa_acc: Accumulated TJepa loss.
+            :param encoder_mlm_acc: Accumulated encoder MLM loss.
+            :param encoder_mlm_acc1_acc: Accumulated encoder MLM top-1 accuracy.
+            :param encoder_mlm_acc5_acc: Accumulated encoder MLM top-5 accuracy.
+            :param decoder_loss_acc: Accumulated decoder loss.
+            :param tokens: Token batch for this micro-step.
+            :param tokens_key: PRNG key for this micro-step.
+            :returns: Updated accumulators for gradients and metrics.
             """
             (
-                grads_acc,
-                loss_acc,
-                tjepa_rec_acc,
-                tjepa_sigreg_acc,
-                tjepa_acc,
-                encoder_mlm_acc,
-                encoder_mlm_acc1_acc,
-                encoder_mlm_acc5_acc,
-                decoder_loss_acc,
-            ) = carry
-            step_idx, tokens = inputs
-            step_idx_global = micro_step0 + step_idx
-            tokens_key = jax.random.fold_in(key, step_idx_global)
-
-            def _do_compute(
-                _: None,
-            ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array]:
+                loss,
                 (
-                    loss,
-                    (
-                        tjepa_rec_loss,
-                        tjepa_sigreg_loss,
-                        tjepa_loss,
-                        encoder_mlm_loss,
-                        encoder_mlm_acc1,
-                        encoder_mlm_acc5,
-                        decoder_loss,
-                    ),
-                ), grads = value_and_grad(
-                    model_in,
-                    tokens,
-                    tokens_key,
-                )
-                grads = _cast_tree_dtype(grads, jnp.float32)
-                grads_accum = _add_trees(grads_acc, grads)
-                loss_accum = loss_acc + loss
-                tjepa_rec_accum = tjepa_rec_acc + tjepa_rec_loss
-                tjepa_sigreg_accum = tjepa_sigreg_acc + tjepa_sigreg_loss
-                tjepa_accum = tjepa_acc + tjepa_loss
-                encoder_mlm_accum = encoder_mlm_acc + encoder_mlm_loss
-                encoder_mlm_acc1_accum = encoder_mlm_acc1_acc + encoder_mlm_acc1
-                encoder_mlm_acc5_accum = encoder_mlm_acc5_acc + encoder_mlm_acc5
-                decoder_loss_accum = decoder_loss_acc + decoder_loss
-                return (
-                    grads_accum,
-                    loss_accum,
-                    tjepa_rec_accum,
-                    tjepa_sigreg_accum,
-                    tjepa_accum,
-                    encoder_mlm_accum,
-                    encoder_mlm_acc1_accum,
-                    encoder_mlm_acc5_accum,
-                    decoder_loss_accum,
-                )
+                    tjepa_rec_loss,
+                    tjepa_sigreg_loss,
+                    tjepa_loss,
+                    encoder_mlm_loss,
+                    encoder_mlm_acc1,
+                    encoder_mlm_acc5,
+                    decoder_loss,
+                ),
+            ), grads = value_and_grad(
+                model_in,
+                tokens,
+                tokens_key,
+            )
+            grads = _cast_tree_dtype(grads, jnp.float32)
+            grads_accum = _add_trees(grads_acc, grads)
+            loss_accum = loss_acc + loss
+            tjepa_rec_accum = tjepa_rec_acc + tjepa_rec_loss
+            tjepa_sigreg_accum = tjepa_sigreg_acc + tjepa_sigreg_loss
+            tjepa_accum = tjepa_acc + tjepa_loss
+            encoder_mlm_accum = encoder_mlm_acc + encoder_mlm_loss
+            encoder_mlm_acc1_accum = encoder_mlm_acc1_acc + encoder_mlm_acc1
+            encoder_mlm_acc5_accum = encoder_mlm_acc5_acc + encoder_mlm_acc5
+            decoder_loss_accum = decoder_loss_acc + decoder_loss
+            return (
+                grads_accum,
+                loss_accum,
+                tjepa_rec_accum,
+                tjepa_sigreg_accum,
+                tjepa_accum,
+                encoder_mlm_accum,
+                encoder_mlm_acc1_accum,
+                encoder_mlm_acc5_accum,
+                decoder_loss_accum,
+            )
 
-            def _skip_compute(
-                _: None,
-            ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array]:
-                return (
+        if use_cond is True:
+            def _accum_body(
+                carry: tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array],
+                inputs: tuple[Array, Array],
+            ) -> tuple[tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array], None]:
+                """Accumulate gradients and metrics for one micro-step.
+
+                :param carry: Tuple of (grads, total loss, tjepa rec loss, tjepa sigreg loss,
+                    tjepa loss, encoder mlm loss, encoder mlm acc1, encoder mlm acc5, decoder loss).
+                :param inputs: Tuple of (micro step index, token batch).
+                :returns: Updated carry and unused output.
+                """
+                (
                     grads_acc,
                     loss_acc,
                     tjepa_rec_acc,
@@ -1751,11 +1761,86 @@ def main() -> None:
                     encoder_mlm_acc1_acc,
                     encoder_mlm_acc5_acc,
                     decoder_loss_acc,
-                )
+                ) = carry
+                step_idx, tokens = inputs
+                step_idx_global = micro_step0 + step_idx
+                tokens_key = jax.random.fold_in(key, step_idx_global)
 
-            active = step_idx < micro_steps
-            new_carry = jax.lax.cond(active, _do_compute, _skip_compute, operand=None)
-            return new_carry, None
+                def _do_compute(
+                    _: None,
+                ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array]:
+                    return _compute_step(
+                        grads_acc,
+                        loss_acc,
+                        tjepa_rec_acc,
+                        tjepa_sigreg_acc,
+                        tjepa_acc,
+                        encoder_mlm_acc,
+                        encoder_mlm_acc1_acc,
+                        encoder_mlm_acc5_acc,
+                        decoder_loss_acc,
+                        tokens,
+                        tokens_key,
+                    )
+
+                def _skip_compute(
+                    _: None,
+                ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array]:
+                    return (
+                        grads_acc,
+                        loss_acc,
+                        tjepa_rec_acc,
+                        tjepa_sigreg_acc,
+                        tjepa_acc,
+                        encoder_mlm_acc,
+                        encoder_mlm_acc1_acc,
+                        encoder_mlm_acc5_acc,
+                        decoder_loss_acc,
+                    )
+
+                active = step_idx < micro_steps
+                new_carry = jax.lax.cond(active, _do_compute, _skip_compute, operand=None)
+                return new_carry, None
+        else:
+            def _accum_body(
+                carry: tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array],
+                inputs: tuple[Array, Array],
+            ) -> tuple[tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array], None]:
+                """Accumulate gradients and metrics for one micro-step.
+
+                :param carry: Tuple of (grads, total loss, tjepa rec loss, tjepa sigreg loss,
+                    tjepa loss, encoder mlm loss, encoder mlm acc1, encoder mlm acc5, decoder loss).
+                :param inputs: Tuple of (micro step index, token batch).
+                :returns: Updated carry and unused output.
+                """
+                (
+                    grads_acc,
+                    loss_acc,
+                    tjepa_rec_acc,
+                    tjepa_sigreg_acc,
+                    tjepa_acc,
+                    encoder_mlm_acc,
+                    encoder_mlm_acc1_acc,
+                    encoder_mlm_acc5_acc,
+                    decoder_loss_acc,
+                ) = carry
+                step_idx, tokens = inputs
+                step_idx_global = micro_step0 + step_idx
+                tokens_key = jax.random.fold_in(key, step_idx_global)
+                new_carry = _compute_step(
+                    grads_acc,
+                    loss_acc,
+                    tjepa_rec_acc,
+                    tjepa_sigreg_acc,
+                    tjepa_acc,
+                    encoder_mlm_acc,
+                    encoder_mlm_acc1_acc,
+                    encoder_mlm_acc5_acc,
+                    decoder_loss_acc,
+                    tokens,
+                    tokens_key,
+                )
+                return new_carry, None
 
         (
             grads,
@@ -1832,6 +1917,70 @@ def main() -> None:
             decoder_loss,
         )
 
+    def grad_step(
+        model_in: TextTransformer,
+        swa_params: eqx.Module,
+        batch_tokens: Array,
+        key: Array,
+        global_step: Array,
+        micro_step0: Array,
+        micro_steps: Array,
+    ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array, Array]:
+        """Compute accumulated gradients with conditional micro-step guards.
+
+        :param model_in: Replicated model.
+        :param swa_params: SWA parameters used for global centers (ignored when SWA is disabled).
+        :param batch_tokens: Token batches of shape (M, B, T).
+        :param key: PRNG key for view masking.
+        :param global_step: Global step index for loss scheduling.
+        :param micro_step0: Starting micro-step index for RNG folding.
+        :param micro_steps: Number of valid micro-steps in the batch.
+        :returns: Tuple of (grads, total loss, tjepa rec loss, tjepa sigreg loss, tjepa loss,
+            encoder mlm loss, encoder mlm acc1, encoder mlm acc5, decoder loss).
+        """
+        return _grad_step_impl(
+            model_in,
+            swa_params,
+            batch_tokens,
+            key,
+            global_step,
+            micro_step0,
+            micro_steps,
+            use_cond=True,
+        )
+
+    def grad_step_full(
+        model_in: TextTransformer,
+        swa_params: eqx.Module,
+        batch_tokens: Array,
+        key: Array,
+        global_step: Array,
+        micro_step0: Array,
+        micro_steps: Array,
+    ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array, Array]:
+        """Compute accumulated gradients when all micro-steps are active.
+
+        :param model_in: Replicated model.
+        :param swa_params: SWA parameters used for global centers (ignored when SWA is disabled).
+        :param batch_tokens: Token batches of shape (M, B, T).
+        :param key: PRNG key for view masking.
+        :param global_step: Global step index for loss scheduling.
+        :param micro_step0: Starting micro-step index for RNG folding.
+        :param micro_steps: Number of valid micro-steps in the batch.
+        :returns: Tuple of (grads, total loss, tjepa rec loss, tjepa sigreg loss, tjepa loss,
+            encoder mlm loss, encoder mlm acc1, encoder mlm acc5, decoder loss).
+        """
+        return _grad_step_impl(
+            model_in,
+            swa_params,
+            batch_tokens,
+            key,
+            global_step,
+            micro_step0,
+            micro_steps,
+            use_cond=False,
+        )
+
     def apply_step(
         model_in: TextTransformer,
         state_in: MuonWithAdamWFallbackState,
@@ -1875,6 +2024,11 @@ def main() -> None:
 
     grad_step_pmap = eqx.filter_pmap(
         grad_step,
+        axis_name="data",
+        devices=device_list,
+    )  # type: ignore[call-overload]
+    grad_step_full_pmap = eqx.filter_pmap(
+        grad_step_full,
         axis_name="data",
         devices=device_list,
     )  # type: ignore[call-overload]
@@ -1985,6 +2139,10 @@ def main() -> None:
                 device_keys = jax.device_put(device_keys, device=data_sharding)
 
                 compute_start = time.perf_counter()
+                if micro_steps == args.grad_accum_steps:
+                    grad_fn = grad_step_full_pmap
+                else:
+                    grad_fn = grad_step_pmap
                 (
                     grads,
                     loss,
@@ -1995,7 +2153,7 @@ def main() -> None:
                     encoder_mlm_acc1,
                     encoder_mlm_acc5,
                     decoder_loss,
-                ) = grad_step_pmap(
+                ) = grad_fn(
                     train_repl,
                     swa_params_repl,
                     batch_tokens,
