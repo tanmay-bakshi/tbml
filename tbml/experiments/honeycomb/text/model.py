@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, root_validator
 
 from tbml.nn import DropPath, PoPESelfAttention, RMSNorm, RoPESelfAttention, SwiGLUFeedForward
 from tbml.nn.init import Initializer, truncated_normal_init
+from tbml.nn.recurrent import LSTMLayer
 
 
 class TextTransformerConfig(BaseModel):
@@ -28,6 +29,7 @@ class TextTransformerConfig(BaseModel):
     :ivar embed_norm: Whether to apply RMSNorm to token embeddings.
     :ivar embed_norm_scale: Scale applied after embedding RMSNorm.
     :ivar predictor_n_layers: Number of predictor blocks.
+    :ivar decoder_n_layers: Number of decoder LSTM layers.
     :ivar encoder_causal_attention: Whether encoder attention is causal.
     :ivar predictor_causal_attention: Whether predictor attention is causal.
     """
@@ -47,6 +49,7 @@ class TextTransformerConfig(BaseModel):
     embed_norm: bool = Field(default=False)
     embed_norm_scale: float = Field(default=1.0)
     predictor_n_layers: int = Field(default=2)
+    decoder_n_layers: int = Field(default=0)
     encoder_causal_attention: bool = Field(default=True)
     predictor_causal_attention: bool = Field(default=True)
     causal_attention: bool | None = Field(default=None)
@@ -497,7 +500,7 @@ class Predictor(eqx.Module):
                     qkv_kernel_init=qkv_kernel_init,
                     o_kernel_init=o_kernel_init,
                     mlp_kernel_init=mlp_kernel_init,
-                    is_causal=config.encoder_causal_attention,
+                    is_causal=config.predictor_causal_attention,
                     key=block_keys[idx],
                 )
             )
@@ -562,8 +565,185 @@ class Predictor(eqx.Module):
         return self.output_ffn(x, train=train, key=head_key)
 
 
+class DecoderLSTM(eqx.Module):
+    """LSTM decoder conditioned on predictor outputs."""
+
+    dtype: jnp.dtype = eqx.field(static=True)
+    d_model: int
+    num_layers: int
+    start_vector: Array
+    layers: tuple[LSTMLayer, ...]
+    logit_head: SwiGLUFeedForward
+    attn_head: SwiGLUFeedForward
+
+    def __init__(
+        self,
+        config: TextTransformerConfig,
+        *,
+        dtype: jnp.dtype,
+        param_dtype: jnp.dtype,
+        kernel_init: Initializer,
+        key: Array,
+    ) -> None:
+        """Initialize the decoder LSTM.
+
+        :param config: Base model configuration.
+        :param dtype: Compute dtype.
+        :param param_dtype: Parameter dtype.
+        :param kernel_init: Initializer for decoder parameters.
+        :param key: PRNG key for parameter initialization.
+        """
+        if config.decoder_n_layers <= 0:
+            raise ValueError("decoder_n_layers must be > 0")
+        if config.d_model <= 0:
+            raise ValueError("d_model must be > 0")
+
+        self.dtype = dtype
+        self.d_model = config.d_model
+        self.num_layers = config.decoder_n_layers
+
+        init = truncated_normal_init(config.init_std)
+        keys = jax.random.split(key, 3 + config.decoder_n_layers)
+        start_key = keys[0]
+        layer_keys = keys[1 : 1 + config.decoder_n_layers]
+        logit_key = keys[-2]
+        attn_key = keys[-1]
+
+        self.start_vector = init(start_key, (config.d_model,), param_dtype)
+
+        layers: list[LSTMLayer] = []
+        for idx in range(config.decoder_n_layers):
+            layer_input_dim = config.d_model if idx == 0 else config.d_model
+            layers.append(
+                LSTMLayer(
+                    layer_input_dim,
+                    config.d_model,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    kernel_init=kernel_init,
+                    key=layer_keys[idx],
+                )
+            )
+        self.layers = tuple(layers)
+
+        mlp_hidden_dim = int(config.d_model * config.mlp_ratio)
+        if mlp_hidden_dim <= 0:
+            raise ValueError("mlp_hidden_dim must be > 0")
+
+        self.logit_head = SwiGLUFeedForward(
+            d_model=config.d_model,
+            hidden_dim=mlp_hidden_dim,
+            resid_dropout=config.resid_dropout,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            gate_up_kernel_init=kernel_init,
+            down_kernel_init=kernel_init,
+            key=logit_key,
+        )
+        self.attn_head = SwiGLUFeedForward(
+            d_model=config.d_model,
+            hidden_dim=mlp_hidden_dim,
+            resid_dropout=config.resid_dropout,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            gate_up_kernel_init=kernel_init,
+            down_kernel_init=kernel_init,
+            key=attn_key,
+        )
+
+    def __call__(
+        self,
+        predictor_reps: Array,
+        predictor_mask: Array,
+        *,
+        train: bool,
+        key: Array | None,
+    ) -> Array:
+        """Run the decoder over predictor representations.
+
+        :param predictor_reps: Predictor outputs of shape (B, T, d_model).
+        :param predictor_mask: Boolean mask for valid tokens of shape (B, T).
+        :param train: Whether to enable dropout in decoder heads.
+        :param key: PRNG key for dropout (unused when head dropout is disabled).
+        :returns: Logit head vectors of shape (B, T, d_model).
+        """
+        if predictor_reps.ndim != 3:
+            raise ValueError("predictor_reps must have shape (B, T, d_model)")
+        if predictor_mask.ndim != 2:
+            raise ValueError("predictor_mask must have shape (B, T)")
+        if predictor_reps.shape[:2] != predictor_mask.shape:
+            raise ValueError("predictor_reps and predictor_mask must align on (B, T)")
+        if predictor_reps.shape[2] != self.d_model:
+            raise ValueError("predictor_reps last dimension must match d_model")
+        if predictor_reps.shape[1] == 0:
+            raise ValueError("predictor_reps must have sequence length > 0")
+
+        batch_size, seq_len, _ = predictor_reps.shape
+        start = jnp.broadcast_to(self.start_vector.astype(predictor_reps.dtype), (batch_size, self.d_model))
+
+        init_h = tuple(
+            jnp.zeros((batch_size, self.d_model), dtype=predictor_reps.dtype)
+            for _ in range(self.num_layers)
+        )
+        init_c = tuple(
+            jnp.zeros((batch_size, self.d_model), dtype=predictor_reps.dtype)
+            for _ in range(self.num_layers)
+        )
+
+        any_valid = jnp.any(predictor_mask, axis=1, keepdims=True)
+        fallback = jnp.zeros_like(predictor_mask)
+        fallback = fallback.at[:, 0].set(True)
+        valid_mask = jnp.where(any_valid, predictor_mask, fallback)
+
+        scale = jnp.asarray(1.0 / jnp.sqrt(self.d_model), dtype=predictor_reps.dtype)
+        steps = seq_len + 1
+        use_keys = key is not None
+        if use_keys is True:
+            key_arr = jax.random.split(key, steps * 2)
+            attn_keys = key_arr[:steps]
+            logit_keys = key_arr[steps:]
+        else:
+            attn_keys = jnp.zeros((steps, 2), dtype=jnp.uint32)
+            logit_keys = jnp.zeros((steps, 2), dtype=jnp.uint32)
+
+        def _step(
+            carry: tuple[tuple[Array, ...], tuple[Array, ...], Array],
+            keys_t: tuple[Array, Array],
+        ) -> tuple[tuple[tuple[Array, ...], tuple[Array, ...], Array], Array]:
+            h_list, c_list, x_t = carry
+            attn_key, logit_key = keys_t
+            new_h: list[Array] = []
+            new_c: list[Array] = []
+            layer_in = x_t
+            for layer, h_state, c_state in zip(self.layers, h_list, c_list):
+                h_next, c_next = layer(layer_in, h_state, c_state)
+                layer_in = h_next
+                new_h.append(h_next)
+                new_c.append(c_next)
+            h_out = layer_in
+
+            attn_key_in = attn_key if use_keys is True else None
+            logit_key_in = logit_key if use_keys is True else None
+            query = self.attn_head(h_out, train=train, key=attn_key_in)
+            scores = jnp.einsum("bd,btd->bt", query, predictor_reps) * scale
+            neg_inf = jnp.asarray(-1e9, dtype=scores.dtype)
+            scores = jnp.where(valid_mask, scores, neg_inf)
+            weights = jax.nn.softmax(scores, axis=-1)
+            context = jnp.einsum("bt,btd->bd", weights, predictor_reps)
+            logit_vec = self.logit_head(h_out, train=train, key=logit_key_in)
+            return (tuple(new_h), tuple(new_c), context), logit_vec
+
+        (_final_h, _final_c, _final_x), outputs = jax.lax.scan(
+            _step,
+            (init_h, init_c, start),
+            xs=(attn_keys, logit_keys),
+        )
+        outputs = jnp.swapaxes(outputs, 0, 1)
+        return outputs[:, 1:, :]
+
+
 class TextTransformer(eqx.Module):
-    """Text encoder with an optional predictor stack."""
+    """Text encoder with optional predictor and decoder stacks."""
 
     MUON_PARAM_EXCLUSION_PATTERNS: ClassVar[list[str]] = [
         r"^token_embed\..*$",
@@ -571,6 +751,7 @@ class TextTransformer(eqx.Module):
         r"^final_norm\..*$",
         r"^predictor\.mask_tokens$",
         r"^predictor\.final_norm\..*$",
+        r"^decoder\..*$",
         r"^.*attn\.delta$",
     ]
 
@@ -580,6 +761,7 @@ class TextTransformer(eqx.Module):
     final_norm: RMSNorm
     output_ffn: SwiGLUFeedForward
     predictor: Predictor | None
+    decoder: DecoderLSTM | None
 
     def __init__(
         self,
@@ -626,13 +808,16 @@ class TextTransformer(eqx.Module):
             raise ValueError("attn_type must be 'pope' or 'rope'")
         if config.predictor_n_layers < 0:
             raise ValueError("predictor_n_layers must be >= 0")
+        if config.decoder_n_layers < 0:
+            raise ValueError("decoder_n_layers must be >= 0")
 
         init = truncated_normal_init(config.init_std)
-        keys = jax.random.split(key, 3 + config.n_layers)
+        keys = jax.random.split(key, 4 + config.n_layers)
         embed_key = keys[0]
         output_key = keys[1]
         block_keys = keys[2 : 2 + config.n_layers]
-        predictor_key = keys[-1]
+        predictor_key = keys[-2]
+        decoder_key = keys[-1]
 
         self.config = config
         self.token_embed = TokenEmbedding(
@@ -663,7 +848,7 @@ class TextTransformer(eqx.Module):
                     drop_path_prob=drop_rates[idx],
                     pope_base=config.pope_base,
                     attn_type=config.attn_type,
-                    is_causal=config.predictor_causal_attention,
+                    is_causal=config.encoder_causal_attention,
                     dtype=dtype,
                     param_dtype=param_dtype,
                     qkv_kernel_init=init,
@@ -697,6 +882,16 @@ class TextTransformer(eqx.Module):
             )
         else:
             self.predictor = None
+        if config.decoder_n_layers > 0:
+            self.decoder = DecoderLSTM(
+                config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                kernel_init=init,
+                key=decoder_key,
+            )
+        else:
+            self.decoder = None
 
     def __call__(
         self,
