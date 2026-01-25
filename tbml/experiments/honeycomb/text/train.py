@@ -44,6 +44,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--shuffle-buffer", type=int, default=1024)
     parser.add_argument("--max-train-steps", type=int, default=0)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
+    parser.add_argument("--grad-clip-norm", type=float, default=0.0)
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--checkpoint-every", type=int, default=1000)
     parser.add_argument("--profile", action="store_true")
@@ -318,6 +319,43 @@ def _cast_tree_dtype(tree: T, dtype: jnp.dtype) -> T:
             tree,
         ),
     )
+
+
+def _clip_grad_norm(tree: T, max_norm: float) -> tuple[T, Array]:
+    """Clip gradients by global norm.
+
+    :param tree: Gradient PyTree containing arrays or None entries.
+    :param max_norm: Maximum allowed L2 norm.
+    :returns: Tuple of (clipped gradients, pre-clip norm).
+    """
+    if max_norm <= 0.0:
+        return tree, jnp.asarray(0.0, dtype=jnp.float32)
+
+    def _leaf_sqsum(value: object) -> Array:
+        if value is None:
+            return jnp.asarray(0.0, dtype=jnp.float32)
+        if isinstance(value, jax.Array):
+            return jnp.sum(jnp.square(value.astype(jnp.float32)))
+        return jnp.asarray(0.0, dtype=jnp.float32)
+
+    sums = jax.tree_util.tree_map(_leaf_sqsum, tree)
+    total = jax.tree_util.tree_reduce(
+        lambda acc, val: acc + val,
+        sums,
+        initializer=jnp.asarray(0.0, dtype=jnp.float32),
+    )
+    norm = jnp.sqrt(total)
+    max_norm_f = jnp.asarray(max_norm, dtype=jnp.float32)
+    denom = norm + jnp.asarray(1e-6, dtype=jnp.float32)
+    scale = jnp.minimum(jnp.asarray(1.0, dtype=jnp.float32), max_norm_f / denom)
+    clipped = cast(
+        T,
+        jax.tree_util.tree_map(
+            lambda value: value * scale if value is not None else None,
+            tree,
+        ),
+    )
+    return clipped, norm
 
 
 def _build_sharding(devices: list[jax.Device]) -> tuple[Mesh, NamedSharding, NamedSharding]:
@@ -929,6 +967,8 @@ def main() -> None:
         raise ValueError("max-train-steps must be >= 0")
     if args.grad_accum_steps <= 0:
         raise ValueError("grad-accum-steps must be > 0")
+    if args.grad_clip_norm < 0.0:
+        raise ValueError("grad-clip-norm must be >= 0")
     if args.log_every <= 0:
         raise ValueError("log-every must be > 0")
     if args.checkpoint_every <= 0:
@@ -1210,6 +1250,7 @@ def main() -> None:
         "training": {
             "max_train_steps": args.max_train_steps,
             "grad_accum_steps": args.grad_accum_steps,
+            "grad_clip_norm": args.grad_clip_norm,
             "per_device_batch_size": args.per_device_batch_size,
             "num_devices": num_devices,
             "seed": args.seed,
@@ -1706,6 +1747,9 @@ def main() -> None:
         encoder_mlm_acc1 = jax.lax.pmean(encoder_mlm_acc1, axis_name="data")
         encoder_mlm_acc5 = jax.lax.pmean(encoder_mlm_acc5, axis_name="data")
         decoder_loss = jax.lax.pmean(decoder_loss, axis_name="data")
+        if args.grad_clip_norm > 0.0:
+            grads, _grad_norm = _clip_grad_norm(grads, args.grad_clip_norm)
+            _ = _grad_norm
         return (
             grads,
             loss,
