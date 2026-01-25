@@ -915,6 +915,24 @@ def _encode_views(
     mask_positions = _mask_positions
 
     bsz, num_views, seq_len = views.shape
+    if use_mask_token is True:
+        eligible = jnp.logical_and(tokens != pad_id, tokens != eos_id)
+
+        def _ensure_any(
+            attn: Array,
+            elig: Array,
+        ) -> Array:
+            def _with_fallback(_: None) -> Array:
+                fallback_idx = jnp.argmax(elig)
+                return attn.at[fallback_idx].set(True)
+
+            def _no_fallback(_: None) -> Array:
+                return attn
+
+            return jax.lax.cond(jnp.any(attn), _no_fallback, _with_fallback, operand=None)
+
+        base_attn = jax.vmap(_ensure_any)(eligible, eligible)
+        view_attn = jnp.broadcast_to(base_attn[:, None, :], (bsz, num_views, seq_len))
     flat_views = views.reshape((bsz * num_views, seq_len))
     flat_mask = view_attn.reshape((bsz * num_views, seq_len))
     _reps_pre, reps_post, _pooled_post = model.forward_with_intermediates(
@@ -1492,7 +1510,10 @@ def main() -> None:
                 pred_in_reps = jnp.concatenate([masked_global_reps, local_reps], axis=1)
                 pred_in_masks = jnp.concatenate([global_masks, local_masks], axis=1)
                 pred_in_attn = jnp.concatenate([global_attn, local_attn], axis=1)
-                predictor_attn = jnp.logical_or(pred_in_attn, pred_in_masks)
+                if args.mask_token_input is True:
+                    predictor_attn = pred_in_attn
+                else:
+                    predictor_attn = jnp.logical_or(pred_in_attn, pred_in_masks)
 
                 flat_tokens = pred_in_reps.reshape((bsz * total_pred_views, seq_len, dim))
                 flat_attn = predictor_attn.reshape((bsz * total_pred_views, seq_len))
@@ -1533,13 +1554,16 @@ def main() -> None:
                     view_reps = pred_reps
                     diffs = view_reps.astype(jnp.float32) - global_center[:, None, :, :]
                     mse = jnp.mean(jnp.square(diffs), axis=-1)
-                    unmasked = jnp.logical_and(pred_in_attn, jnp.logical_not(pred_in_masks))
-                    if args.tjepa_unmasked_keep_prob > 0.0:
-                        keep_noise = jax.random.uniform(rec_key, shape=unmasked.shape)
-                        keep_unmasked = jnp.logical_and(unmasked, keep_noise < args.tjepa_unmasked_keep_prob)
+                    if args.tjepa_unmasked_keep_prob >= 1.0:
+                        rec_mask = jnp.logical_or(pred_in_attn, pred_in_masks)
                     else:
-                        keep_unmasked = jnp.zeros_like(unmasked)
-                    rec_mask = jnp.logical_or(pred_in_masks, keep_unmasked)
+                        unmasked = jnp.logical_and(pred_in_attn, jnp.logical_not(pred_in_masks))
+                        if args.tjepa_unmasked_keep_prob > 0.0:
+                            keep_noise = jax.random.uniform(rec_key, shape=unmasked.shape)
+                            keep_unmasked = jnp.logical_and(unmasked, keep_noise < args.tjepa_unmasked_keep_prob)
+                            rec_mask = jnp.logical_or(pred_in_masks, keep_unmasked)
+                        else:
+                            rec_mask = pred_in_masks
                     rec_mask_f = rec_mask.astype(jnp.float32)
                     loss_sum = jnp.sum(mse * rec_mask_f)
                     count = jnp.sum(rec_mask_f)
