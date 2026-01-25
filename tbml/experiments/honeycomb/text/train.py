@@ -1147,9 +1147,13 @@ def main() -> None:
     weight_decay_exclusions = [
         r"^token_embed\..*$",
         r"^.*norm\d*\..*$",
+        r"^.*norm.*$",
         r"^final_norm\..*$",
         r"^predictor\.final_norm\..*$",
         r"^predictor\.mask_tokens$",
+        r"^head_norm\..*$",
+        r"^predictor\.head_norm\..*$",
+        r"^decoder\.start_vector$",
     ]
 
     run_config: dict[str, object] = {
