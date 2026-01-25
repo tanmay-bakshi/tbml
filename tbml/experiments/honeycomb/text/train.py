@@ -1402,6 +1402,8 @@ def main() -> None:
             num_global = args.num_global_views
             num_local = args.num_local_views
             global_reps = token_post[:, :num_global, :, :]
+            sample_global_reps = global_reps[:, :1, :, :]
+            sample_global_attn = view_attn[:, :1, :]
             masked_global_reps = global_reps[:, 1:, :, :]
             local_reps = token_post[:, num_global:, :, :]
             global_masks = mask_positions[:, 1:num_global, :]
@@ -1493,10 +1495,15 @@ def main() -> None:
                     raise ValueError("decoder must be enabled when decoder loss is active")
                 if total_pred_views <= 0:
                     raise ValueError("decoder loss requires masked global or local views")
+                if num_global <= 0:
+                    raise ValueError("decoder loss requires at least one global view")
                 if pred_reps is None or predictor_attn is None:
                     raise ValueError("predictor outputs missing for decoder loss")
-                flat_pred = pred_reps.reshape((bsz * total_pred_views, seq_len, dim))
-                flat_mask = predictor_attn.reshape((bsz * total_pred_views, seq_len))
+                decoder_reps = jnp.concatenate([pred_reps, sample_global_reps], axis=1)
+                decoder_mask = jnp.concatenate([predictor_attn, sample_global_attn], axis=1)
+                total_decoder_views = total_pred_views + 1
+                flat_pred = decoder_reps.reshape((bsz * total_decoder_views, seq_len, dim))
+                flat_mask = decoder_mask.reshape((bsz * total_decoder_views, seq_len))
                 decoder_vectors = model_inner.decoder(
                     flat_pred,
                     flat_mask,
@@ -1504,7 +1511,7 @@ def main() -> None:
                     key=decoder_key,
                 )
                 logits = model_inner.token_embed.unembed(decoder_vectors)
-                targets = jnp.repeat(tokens_no_eos, repeats=total_pred_views, axis=0)
+                targets = jnp.repeat(tokens_no_eos, repeats=total_decoder_views, axis=0)
                 loss_mask = targets != pad_id
                 log_probs = jax.nn.log_softmax(logits, axis=-1)
                 target_logp = jnp.take_along_axis(log_probs, targets[..., None], axis=-1).squeeze(-1)
