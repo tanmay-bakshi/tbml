@@ -1507,9 +1507,14 @@ def main() -> None:
             if total_pred_views > 0 and (args.tjepa_loss_weight > 0.0 or args.decoder_loss_weight > 0.0):
                 if model_inner.predictor is None:
                     raise ValueError("predictor must be enabled when masked globals or locals are active")
-                pred_in_reps = jnp.concatenate([masked_global_reps, local_reps], axis=1)
-                pred_in_masks = jnp.concatenate([global_masks, local_masks], axis=1)
-                pred_in_attn = jnp.concatenate([global_attn, local_attn], axis=1)
+                if num_global == 1:
+                    pred_in_reps = local_reps
+                    pred_in_masks = local_masks
+                    pred_in_attn = local_attn
+                else:
+                    pred_in_reps = jnp.concatenate([masked_global_reps, local_reps], axis=1)
+                    pred_in_masks = jnp.concatenate([global_masks, local_masks], axis=1)
+                    pred_in_attn = jnp.concatenate([global_attn, local_attn], axis=1)
                 if args.mask_token_input is True:
                     predictor_attn = pred_in_attn
                 else:
@@ -1543,10 +1548,16 @@ def main() -> None:
                         key=None,
                     )
                     swa_post = swa_post.reshape((bsz, num_global, seq_len, dim))
-                    global_center = jnp.mean(swa_post.astype(jnp.float32), axis=1)
+                    if num_global == 1:
+                        global_center = swa_post[:, 0, :, :].astype(jnp.float32)
+                    else:
+                        global_center = jnp.mean(swa_post.astype(jnp.float32), axis=1)
                     global_center = jax.lax.stop_gradient(global_center)
                 else:
-                    global_center = jnp.mean(global_reps.astype(jnp.float32), axis=1)
+                    if num_global == 1:
+                        global_center = global_reps[:, 0, :, :].astype(jnp.float32)
+                    else:
+                        global_center = jnp.mean(global_reps.astype(jnp.float32), axis=1)
 
                 if total_pred_views > 0:
                     if pred_reps is None or pred_in_attn is None or pred_in_masks is None:
