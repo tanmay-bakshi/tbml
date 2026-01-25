@@ -1979,8 +1979,7 @@ def main() -> None:
                     for _ in range(pad_count):
                         micro_batches.append(last_batch)
 
-                batch_tokens = jnp.stack(micro_batches, axis=0)
-                batch_tokens = jnp.transpose(batch_tokens, (1, 0, 2, 3))
+                batch_tokens = jnp.stack(micro_batches, axis=1)
                 batch_tokens = jax.device_put(batch_tokens, device=data_sharding)
                 device_keys = jax.random.split(step_key, num_devices)
                 device_keys = jax.device_put(device_keys, device=data_sharding)
