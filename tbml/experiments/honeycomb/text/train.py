@@ -1616,7 +1616,10 @@ def main() -> None:
                     key=decoder_key,
                 )
                 logits = model_inner.token_embed.unembed(decoder_vectors)
-                targets = jnp.repeat(tokens_no_eos, repeats=total_decoder_views, axis=0)
+                targets = jnp.broadcast_to(
+                    tokens_no_eos[:, None, :],
+                    (bsz, total_decoder_views, seq_len),
+                ).reshape((bsz * total_decoder_views, seq_len))
                 loss_mask = targets != pad_id
                 log_probs = jax.nn.log_softmax(logits, axis=-1)
                 target_logp = jnp.take_along_axis(log_probs, targets[..., None], axis=-1).squeeze(-1)
