@@ -442,7 +442,6 @@ class Predictor(eqx.Module):
     blocks: tuple[PredictorBlock, ...]
     final_norm: RMSNorm
     output_ffn: SwiGLUFeedForward
-    head_norm: RMSNorm
 
     def __init__(
         self,
@@ -519,7 +518,6 @@ class Predictor(eqx.Module):
             down_kernel_init=mlp_kernel_init,
             key=output_key,
         )
-        self.head_norm = RMSNorm(config.d_model, dtype=dtype, param_dtype=param_dtype)
 
     def __call__(
         self,
@@ -566,8 +564,7 @@ class Predictor(eqx.Module):
         for block, block_key in zip(self.blocks, block_keys):
             x = block(x, attention_mask=attention_mask, train=train, key=block_key)
         x = self.final_norm(x)
-        x = self.output_ffn(x, train=train, key=head_key)
-        return self.head_norm(x)
+        return self.output_ffn(x, train=train, key=head_key)
 
 
 class DecoderLSTM(eqx.Module):
@@ -783,7 +780,6 @@ class TextTransformer(eqx.Module):
     blocks: tuple[TextTransformerBlock, ...]
     final_norm: RMSNorm
     output_ffn: SwiGLUFeedForward
-    head_norm: RMSNorm
     predictor: Predictor | None
     decoder: DecoderLSTM | None
 
@@ -894,7 +890,6 @@ class TextTransformer(eqx.Module):
             down_kernel_init=init,
             key=output_key,
         )
-        self.head_norm = RMSNorm(config.d_model, dtype=dtype, param_dtype=param_dtype)
         if config.predictor_n_layers > 0:
             self.predictor = Predictor(
                 config,
@@ -991,8 +986,7 @@ class TextTransformer(eqx.Module):
         reps_pre = reps
         reps_norm = self.final_norm(reps_pre)
         reps_post = self.output_ffn(reps_norm, train=train, key=head_key)
-        reps_post = self.head_norm(reps_post)
-
+        
         mask = attention_mask.astype(bool)
         positions = jnp.arange(reps_post.shape[1], dtype=jnp.int32)
         positions = jnp.broadcast_to(positions[None, :], mask.shape)

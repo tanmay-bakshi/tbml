@@ -1235,8 +1235,6 @@ def main() -> None:
         r"^final_norm\..*$",
         r"^predictor\.final_norm\..*$",
         r"^predictor\.mask_tokens$",
-        r"^head_norm\..*$",
-        r"^predictor\.head_norm\..*$",
         r"^decoder\.start_vector$",
     ]
 
