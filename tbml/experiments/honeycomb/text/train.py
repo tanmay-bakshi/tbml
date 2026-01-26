@@ -90,6 +90,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--encoder-mlm-keep-prob", type=float, default=0.0)
     parser.add_argument("--decoder-loss-weight", type=float, default=0.0)
     parser.add_argument("--mask-token-input", action="store_true")
+    parser.add_argument("--disable-predictor", action="store_true")
     parser.add_argument("--use-swa", dest="use_swa", action="store_true")
     parser.add_argument("--no-swa", dest="use_swa", action="store_false")
 
@@ -1180,6 +1181,8 @@ def main() -> None:
     predictor_layers = args.predictor_n_layers
     if predictor_layers is None:
         predictor_layers = args.n_layers
+    if args.disable_predictor is True:
+        predictor_layers = 0
     if predictor_layers < 0:
         raise ValueError("predictor-n-layers must be >= 0")
 
@@ -1193,16 +1196,16 @@ def main() -> None:
         raise ValueError("decoder-n-layers must be >= 0")
 
     if args.tjepa_loss_weight > 0.0 and (args.num_local_views > 0 or args.num_global_views > 1):
-        if predictor_layers == 0:
-            raise ValueError("tjepa requires predictor-n-layers > 0 when masked globals or locals are enabled")
+        if predictor_layers == 0 and args.disable_predictor is False and args.decoder_loss_weight <= 0.0:
+            raise ValueError("tjepa requires predictor or decoder when masked globals or locals are enabled")
     if args.decoder_loss_weight > 0.0:
         if predictor_layers == 0:
-            raise ValueError("decoder loss requires predictor-n-layers > 0")
+            if args.disable_predictor is False:
+                raise ValueError("decoder loss requires predictor-n-layers > 0")
         if decoder_layers == 0:
             raise ValueError("decoder loss requires decoder-n-layers > 0")
         if args.num_local_views == 0 and args.num_global_views <= 1:
             raise ValueError("decoder loss requires masked global or local views")
-
     model_config = TextTransformerConfig(
         vocab_size=vocab_size,
         max_seq_len=max_seq_len,
@@ -1263,6 +1266,7 @@ def main() -> None:
             "local_mask_min": args.local_mask_min,
             "local_mask_max": args.local_mask_max,
             "mask_token_input": args.mask_token_input,
+            "disable_predictor": args.disable_predictor,
             "masking_mode": args.masking_mode,
         },
         "loss": {
@@ -1509,8 +1513,6 @@ def main() -> None:
             predictor_attn: Array | None = None
 
             if total_pred_views > 0 and (args.tjepa_loss_weight > 0.0 or args.decoder_loss_weight > 0.0):
-                if model_inner.predictor is None:
-                    raise ValueError("predictor must be enabled when masked globals or locals are active")
                 if num_global == 1:
                     pred_in_reps = local_reps
                     pred_in_masks = local_masks
@@ -1524,18 +1526,23 @@ def main() -> None:
                 else:
                     predictor_attn = jnp.logical_or(pred_in_attn, pred_in_masks)
 
-                flat_tokens = pred_in_reps.reshape((bsz * total_pred_views, seq_len, dim))
-                flat_attn = predictor_attn.reshape((bsz * total_pred_views, seq_len))
-                flat_mask = pred_in_masks.reshape((bsz * total_pred_views, seq_len))
+                if args.disable_predictor is True:
+                    pred_reps = pred_in_reps
+                else:
+                    if model_inner.predictor is None:
+                        raise ValueError("predictor must be enabled when masked globals or locals are active")
+                    flat_tokens = pred_in_reps.reshape((bsz * total_pred_views, seq_len, dim))
+                    flat_attn = predictor_attn.reshape((bsz * total_pred_views, seq_len))
+                    flat_mask = pred_in_masks.reshape((bsz * total_pred_views, seq_len))
 
-                pred_reps = model_inner.predictor(
-                    flat_tokens,
-                    flat_attn,
-                    flat_mask,
-                    train=True,
-                    key=predictor_key,
-                )
-                pred_reps = pred_reps.reshape((bsz, total_pred_views, seq_len, dim))
+                    pred_reps = model_inner.predictor(
+                        flat_tokens,
+                        flat_attn,
+                        flat_mask,
+                        train=True,
+                        key=predictor_key,
+                    )
+                    pred_reps = pred_reps.reshape((bsz, total_pred_views, seq_len, dim))
 
             if args.tjepa_loss_weight > 0.0:
                 if args.use_swa is True:

@@ -390,23 +390,23 @@ def main() -> None:
         )
     ref_model = swa_model if args.reference_use_swa else model
     cand_model = swa_model if args.candidates_use_swa else model
-    if ref_model.predictor is None:
-        raise ValueError("predictor is required for this comparison")
-
     _ref_pre, ref_post, _ref_pool = ref_model.forward_with_intermediates(
         jnp.asarray(ref_tokens_arr),
         jnp.asarray(ref_attn_mask),
         train=False,
         key=None,
     )
-    pred_attn = np.logical_or(ref_attn_mask, mask_positions)
-    pred_reps = ref_model.predictor(
-        ref_post,
-        jnp.asarray(pred_attn),
-        jnp.asarray(mask_positions),
-        train=False,
-        key=None,
-    )
+    if ref_model.predictor is None:
+        pred_reps = ref_post
+    else:
+        pred_attn = np.logical_or(ref_attn_mask, mask_positions)
+        pred_reps = ref_model.predictor(
+            ref_post,
+            jnp.asarray(pred_attn),
+            jnp.asarray(mask_positions),
+            train=False,
+            key=None,
+        )
 
     _cand_pre, cand_post, _cand_pool = cand_model.forward_with_intermediates(
         jnp.asarray(cand_tokens_arr),

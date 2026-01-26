@@ -144,18 +144,19 @@ def main() -> None:
     )
     encoder_reps = reps_post[0]
 
-    if inference.model.predictor is None:
-        raise ValueError("predictor is not enabled in this checkpoint")
     predictor_attn = np.logical_or(encoder_attn, mask_positions)
-    predictor_attn_jax = jnp.asarray(predictor_attn[None, :])
-    mask_positions_jax = jnp.asarray(mask_positions[None, :])
-    pred_reps = inference.model.predictor(
-        reps_post,
-        predictor_attn_jax,
-        mask_positions_jax,
-        train=False,
-        key=None,
-    )
+    if inference.model.predictor is None:
+        pred_reps = reps_post
+    else:
+        predictor_attn_jax = jnp.asarray(predictor_attn[None, :])
+        mask_positions_jax = jnp.asarray(mask_positions[None, :])
+        pred_reps = inference.model.predictor(
+            reps_post,
+            predictor_attn_jax,
+            mask_positions_jax,
+            train=False,
+            key=None,
+        )
 
     if inference.model.decoder is None:
         raise ValueError("decoder is not enabled in this checkpoint")

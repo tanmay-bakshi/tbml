@@ -229,14 +229,17 @@ def main() -> None:
         train=False,
         key=None,
     )
-    predictor_attn = np.logical_or(masked_attn, mask_positions)
-    pred_reps = model.predictor(
-        token_post,
-        jnp.asarray(predictor_attn),
-        jnp.asarray(mask_positions),
-        train=False,
-        key=None,
-    )
+    if model.predictor is None:
+        pred_reps = token_post
+    else:
+        predictor_attn = np.logical_or(masked_attn, mask_positions)
+        pred_reps = model.predictor(
+            token_post,
+            jnp.asarray(predictor_attn),
+            jnp.asarray(mask_positions),
+            train=False,
+            key=None,
+        )
     pred_span = _masked_mean(pred_reps, jnp.asarray(mask_positions))
     pred_span = jax.device_get(pred_span)[0]
 
