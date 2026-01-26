@@ -18,7 +18,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec, Sharding
 from tensorboardX import SummaryWriter  # type: ignore[import-untyped]
 from tqdm import tqdm  # type: ignore[import-untyped]
 
-from tbml.experiments.honeycomb.loss import sigreg_loss_views
+from tbml.experiments.honeycomb.loss import sigreg_loss_masked, sigreg_loss_views
 from tbml.experiments.honeycomb.text.dataset import (
     MMapTokenDataset,
     _build_tokenizer,
@@ -83,6 +83,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sigreg-weight", type=float, default=0.25)
     parser.add_argument("--sigreg-slices", type=int, default=256)
     parser.add_argument("--sigreg-seed", type=int, default=0)
+    parser.add_argument("--sigreg-tokenwise", action="store_true")
     parser.add_argument("--tjepa-loss-weight", type=float, default=1.0)
     parser.add_argument("--tjepa-unmasked-keep-prob", type=float, default=0.1)
     parser.add_argument("--encoder-mlm-loss-weight", type=float, default=0.0)
@@ -1268,6 +1269,7 @@ def main() -> None:
             "sigreg_weight": args.sigreg_weight,
             "sigreg_slices": args.sigreg_slices,
             "sigreg_seed": args.sigreg_seed,
+            "sigreg_tokenwise": args.sigreg_tokenwise,
             "tjepa_loss_weight": args.tjepa_loss_weight,
             "tjepa_unmasked_keep_prob": args.tjepa_unmasked_keep_prob,
             "encoder_mlm_weight": args.encoder_mlm_loss_weight,
@@ -1583,14 +1585,34 @@ def main() -> None:
                     tjepa_rec_loss = jnp.where(count > 0.0, loss_sum / count, 0.0)
 
                 if args.sigreg_weight > 0.0:
-                    view_reps = _masked_mean(token_post, view_attn)
-                    tjepa_sigreg_loss = sigreg_loss_views(
-                        view_reps,
-                        global_step=global_step,
-                        num_slices=args.sigreg_slices,
-                        seed=args.sigreg_seed,
-                        axis_name="data",
-                    )
+                    if args.sigreg_tokenwise is True:
+                        view_losses: list[Array] = []
+                        for view_idx in range(num_views):
+                            view_reps = token_post[:, view_idx, :, :]
+                            view_tokens = views[:, view_idx, :]
+                            view_mask = view_tokens != pad_id
+                            flat_reps = view_reps.reshape((bsz * seq_len, dim))
+                            flat_mask = view_mask.reshape((bsz * seq_len,))
+                            view_losses.append(
+                                sigreg_loss_masked(
+                                    flat_reps,
+                                    flat_mask,
+                                    global_step=global_step,
+                                    num_slices=args.sigreg_slices,
+                                    seed=args.sigreg_seed,
+                                    axis_name="data",
+                                )
+                            )
+                        tjepa_sigreg_loss = jnp.mean(jnp.stack(view_losses, axis=0))
+                    else:
+                        view_reps = _masked_mean(token_post, view_attn)
+                        tjepa_sigreg_loss = sigreg_loss_views(
+                            view_reps,
+                            global_step=global_step,
+                            num_slices=args.sigreg_slices,
+                            seed=args.sigreg_seed,
+                            axis_name="data",
+                        )
 
                 if args.sigreg_weight > 0.0:
                     tjepa_loss = (1.0 - args.sigreg_weight) * tjepa_rec_loss + args.sigreg_weight * tjepa_sigreg_loss
