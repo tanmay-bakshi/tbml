@@ -18,7 +18,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec, Sharding
 from tensorboardX import SummaryWriter  # type: ignore[import-untyped]
 from tqdm import tqdm  # type: ignore[import-untyped]
 
-from tbml.experiments.honeycomb.loss import sigreg_loss_masked, sigreg_loss_views
+from tbml.experiments.honeycomb.loss import sigreg_loss_views, sigreg_loss_views_masked
 from tbml.experiments.honeycomb.text.dataset import (
     MMapTokenDataset,
     _build_tokenizer,
@@ -1593,24 +1593,18 @@ def main() -> None:
 
                 if args.sigreg_weight > 0.0:
                     if args.sigreg_tokenwise is True:
-                        view_losses: list[Array] = []
-                        for view_idx in range(num_views):
-                            view_reps = token_post[:, view_idx, :, :]
-                            view_tokens = views[:, view_idx, :]
-                            view_mask = view_tokens != pad_id
-                            flat_reps = view_reps.reshape((bsz * seq_len, dim))
-                            flat_mask = view_mask.reshape((bsz * seq_len,))
-                            view_losses.append(
-                                sigreg_loss_masked(
-                                    flat_reps,
-                                    flat_mask,
-                                    global_step=global_step,
-                                    num_slices=args.sigreg_slices,
-                                    seed=args.sigreg_seed,
-                                    axis_name="data",
-                                )
-                            )
-                        tjepa_sigreg_loss = jnp.mean(jnp.stack(view_losses, axis=0))
+                        view_tokens = views
+                        view_mask = view_tokens != pad_id
+                        flat_reps = jnp.transpose(token_post, (0, 2, 1, 3)).reshape((bsz * seq_len, num_views, dim))
+                        flat_mask = jnp.transpose(view_mask, (0, 2, 1)).reshape((bsz * seq_len, num_views))
+                        tjepa_sigreg_loss = sigreg_loss_views_masked(
+                            flat_reps,
+                            flat_mask,
+                            global_step=global_step,
+                            num_slices=args.sigreg_slices,
+                            seed=args.sigreg_seed,
+                            axis_name="data",
+                        )
                     else:
                         view_reps = _masked_mean(token_post, view_attn)
                         tjepa_sigreg_loss = sigreg_loss_views(

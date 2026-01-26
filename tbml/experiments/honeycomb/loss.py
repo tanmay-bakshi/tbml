@@ -239,6 +239,86 @@ def sigreg_loss_views(
     return jnp.mean(jnp.mean(ep_stat * total_batch, axis=-1))
 
 
+def sigreg_loss_views_masked(
+    embeddings: Array,
+    mask: Array,
+    *,
+    global_step: Array,
+    num_slices: int = 256,
+    seed: int = 0,
+    axis_name: str | None = None,
+    t_min: float = -5.0,
+    t_max: float = 5.0,
+    num_knots: int = 17,
+) -> Array:
+    """Compute the SIGReg loss across multiple views with per-embedding masks.
+
+    :param embeddings: Embeddings of shape (B, V, K).
+    :param mask: Boolean mask of shape (B, V) indicating valid embeddings.
+    :param global_step: Global training step used to sync random directions.
+    :param num_slices: Number of random projection directions.
+    :param seed: Random seed for direction sampling.
+    :param axis_name: Optional pmapped axis name for cross-device aggregation.
+    :param t_min: Lower bound for integration points.
+    :param t_max: Upper bound for integration points.
+    :param num_knots: Number of integration knots.
+    :returns: Scalar SIGReg loss averaged over views.
+    """
+    if embeddings.ndim != 3:
+        raise ValueError("embeddings must have shape (B, V, K)")
+    if mask.ndim != 2:
+        raise ValueError("mask must have shape (B, V)")
+    if embeddings.shape[:2] != mask.shape:
+        raise ValueError("mask must align with embeddings")
+    if num_slices <= 0:
+        raise ValueError("num_slices must be > 0")
+    if num_knots <= 1:
+        raise ValueError("num_knots must be > 1")
+    if t_min >= t_max:
+        raise ValueError("t_min must be < t_max")
+
+    batch_size, num_views, dim = embeddings.shape
+    if batch_size <= 0:
+        raise ValueError("embeddings must have a positive batch size")
+    if num_views <= 0:
+        raise ValueError("embeddings must have a positive number of views")
+    if dim <= 0:
+        raise ValueError("embeddings must have a positive feature dimension")
+
+    key = jax.random.PRNGKey(seed)
+    step = jnp.asarray(global_step, dtype=jnp.int32)
+    key = jax.random.fold_in(key, step)
+    embeddings_f32 = embeddings.astype(jnp.float32)
+    directions = jax.random.normal(key, (dim, num_slices), dtype=jnp.float32)
+    directions = directions / jnp.linalg.norm(directions, axis=0, keepdims=True)
+
+    t = jnp.linspace(t_min, t_max, num_knots, dtype=jnp.float32)
+    exp_f = jnp.exp(-0.5 * jnp.square(t))
+
+    projections = jnp.einsum("bvk,ks->bvs", embeddings_f32, directions)
+    x_t = projections[:, :, :, None] * t[None, None, None, :]
+    weights = mask.astype(jnp.float32)
+    weights = weights[:, :, None, None]
+    cos_sum = jnp.sum(jnp.cos(x_t) * weights, axis=0)
+    sin_sum = jnp.sum(jnp.sin(x_t) * weights, axis=0)
+    weight_sum = jnp.sum(weights, axis=0).squeeze(-1).squeeze(-1)
+
+    if axis_name is not None:
+        cos_sum = jax.lax.psum(cos_sum, axis_name)
+        sin_sum = jax.lax.psum(sin_sum, axis_name)
+        weight_sum = jax.lax.psum(weight_sum, axis_name)
+
+    weight_safe = jnp.maximum(weight_sum, 1.0)
+    ecf_real = cos_sum / weight_safe[:, None, None]
+    ecf_imag = sin_sum / weight_safe[:, None, None]
+
+    err = (jnp.square(ecf_real - exp_f[None, None, :]) + jnp.square(ecf_imag)) * exp_f[None, None, :]
+    ep_stat = _trapz(err, t, axis=-1)
+    view_loss = jnp.mean(ep_stat * weight_sum[:, None], axis=-1)
+    view_loss = jnp.where(weight_sum > 0.0, view_loss, 0.0)
+    return jnp.mean(view_loss)
+
+
 def lejepa_loss(
     embeddings: Array,
     num_global_views: int,
