@@ -38,6 +38,11 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run the reference text through the SWA weights instead of the base weights.",
     )
+    parser.add_argument(
+        "--masked-only",
+        action="store_true",
+        help="Restrict MSE computation to masked positions in the reference.",
+    )
     return parser.parse_args()
 
 
@@ -415,7 +420,10 @@ def main() -> None:
         key=None,
     )
 
-    rec_mask = np.logical_or(ref_attn_mask, mask_positions)
+    if args.masked_only is True:
+        rec_mask = np.logical_and(ref_attn_mask, mask_positions)
+    else:
+        rec_mask = np.logical_or(ref_attn_mask, mask_positions)
     pred_mse = _masked_mean_square_error(pred_reps[0], cand_post, jnp.asarray(rec_mask[0]))
     pred_mse = np.asarray(jax.device_get(pred_mse))
     enc_mse = _masked_mean_square_error(ref_post[0], cand_post, jnp.asarray(rec_mask[0]))
