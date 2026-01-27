@@ -1214,6 +1214,7 @@ def main() -> None:
         n_heads=args.n_heads,
         n_layers=args.n_layers,
         predictor_n_layers=int(predictor_layers),
+        predictor_keep_unmasked=args.predictor_keep_unmasked,
         decoder_n_layers=int(decoder_layers),
         mlp_ratio=args.mlp_ratio,
         attn_dropout=args.attn_dropout,
@@ -1543,8 +1544,6 @@ def main() -> None:
                         key=predictor_key,
                     )
                     pred_reps = pred_reps.reshape((bsz, total_pred_views, seq_len, dim))
-                    if args.predictor_keep_unmasked is True:
-                        pred_reps = jnp.where(pred_in_masks[..., None], pred_reps, pred_in_reps)
 
             if args.tjepa_loss_weight > 0.0:
                 if args.use_swa is True:

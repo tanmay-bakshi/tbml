@@ -29,6 +29,7 @@ class TextTransformerConfig(BaseModel):
     :ivar embed_norm: Whether to apply RMSNorm to token embeddings.
     :ivar embed_norm_scale: Scale applied after embedding RMSNorm.
     :ivar predictor_n_layers: Number of predictor blocks.
+    :ivar predictor_keep_unmasked: Whether predictor outputs retain encoder outputs on unmasked positions.
     :ivar decoder_n_layers: Number of decoder LSTM layers.
     :ivar encoder_causal_attention: Whether encoder attention is causal.
     :ivar predictor_causal_attention: Whether predictor attention is causal.
@@ -50,6 +51,7 @@ class TextTransformerConfig(BaseModel):
     embed_norm: bool = Field(default=False)
     embed_norm_scale: float = Field(default=1.0)
     predictor_n_layers: int = Field(default=2)
+    predictor_keep_unmasked: bool = Field(default=False)
     decoder_n_layers: int = Field(default=0)
     encoder_causal_attention: bool = Field(default=True)
     predictor_causal_attention: bool = Field(default=True)
@@ -438,6 +440,7 @@ class Predictor(eqx.Module):
 
     dtype: jnp.dtype = eqx.field(static=True)
     max_seq_len: int
+    keep_unmasked: bool = eqx.field(static=True)
     mask_tokens: Array
     blocks: tuple[PredictorBlock, ...]
     final_norm: RMSNorm
@@ -471,6 +474,7 @@ class Predictor(eqx.Module):
 
         self.dtype = dtype
         self.max_seq_len = config.max_seq_len
+        self.keep_unmasked = config.predictor_keep_unmasked
 
         init = truncated_normal_init(config.init_std)
         keys = jax.random.split(key, 2 + config.predictor_n_layers)
@@ -564,7 +568,10 @@ class Predictor(eqx.Module):
         for block, block_key in zip(self.blocks, block_keys):
             x = block(x, attention_mask=attention_mask, train=train, key=block_key)
         x = self.final_norm(x)
-        return self.output_ffn(x, train=train, key=head_key)
+        x = self.output_ffn(x, train=train, key=head_key)
+        if self.keep_unmasked is True:
+            x = jnp.where(mask_positions[..., None], x, reps)
+        return x
 
 
 class DecoderLSTM(eqx.Module):
