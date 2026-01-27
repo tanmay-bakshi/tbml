@@ -421,7 +421,7 @@ def main() -> None:
     )
 
     if args.masked_only is True:
-        rec_mask = np.logical_and(ref_attn_mask, mask_positions)
+        rec_mask = np.logical_and(mask_positions, ref_tokens_arr != pad_id)
     else:
         rec_mask = np.logical_or(ref_attn_mask, mask_positions)
     pred_mse = _masked_mean_square_error(pred_reps[0], cand_post, jnp.asarray(rec_mask[0]))
