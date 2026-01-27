@@ -90,6 +90,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--encoder-mlm-keep-prob", type=float, default=0.0)
     parser.add_argument("--decoder-loss-weight", type=float, default=0.0)
     parser.add_argument("--mask-token-input", action="store_true")
+    parser.add_argument("--predictor-keep-unmasked", action="store_true")
     parser.add_argument("--disable-predictor", action="store_true")
     parser.add_argument("--use-swa", dest="use_swa", action="store_true")
     parser.add_argument("--no-swa", dest="use_swa", action="store_false")
@@ -1264,6 +1265,7 @@ def main() -> None:
             "local_mask_min": args.local_mask_min,
             "local_mask_max": args.local_mask_max,
             "mask_token_input": args.mask_token_input,
+            "predictor_keep_unmasked": args.predictor_keep_unmasked,
             "disable_predictor": args.disable_predictor,
             "masking_mode": args.masking_mode,
         },
@@ -1541,6 +1543,8 @@ def main() -> None:
                         key=predictor_key,
                     )
                     pred_reps = pred_reps.reshape((bsz, total_pred_views, seq_len, dim))
+                    if args.predictor_keep_unmasked is True:
+                        pred_reps = jnp.where(pred_in_masks[..., None], pred_reps, pred_in_reps)
 
             if args.tjepa_loss_weight > 0.0:
                 if args.use_swa is True:
