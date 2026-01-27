@@ -1393,7 +1393,7 @@ def main() -> None:
         micro_step0: Array,
         micro_steps: Array,
         use_cond: bool,
-    ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array, Array]:
+    ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array, Array, Array, Array]:
         """Compute accumulated gradients and metrics across micro-steps.
 
         :param model_in: Replicated model.
@@ -1405,7 +1405,8 @@ def main() -> None:
         :param micro_steps: Number of valid micro-steps in the batch.
         :param use_cond: Whether to guard micro-step evaluation with a conditional.
         :returns: Tuple of (grads, total loss, tjepa rec loss, tjepa sigreg loss, tjepa loss,
-            encoder mlm loss, encoder mlm acc1, encoder mlm acc5, decoder loss).
+            encoder mlm loss, encoder mlm acc1, encoder mlm acc5, decoder loss,
+            tjepa sigreg final, tjepa sigreg delta).
         """
 
         if args.use_swa is True:
@@ -1417,14 +1418,15 @@ def main() -> None:
             model_inner: TextTransformer,
             tokens: Array,
             tokens_key: Array,
-        ) -> tuple[Array, tuple[Array, Array, Array, Array, Array, Array]]:
+        ) -> tuple[Array, tuple[Array, Array, Array, Array, Array, Array, Array, Array, Array]]:
             """Compute the total loss and its components.
 
             :param model_inner: Model replica used for the loss computation.
             :param tokens: Token batch of shape (B, T).
             :param tokens_key: PRNG key for masking.
             :returns: Tuple of (total loss, (tjepa rec loss, tjepa sigreg loss, tjepa loss,
-                encoder mlm loss, encoder mlm acc1, encoder mlm acc5, decoder loss)).
+                encoder mlm loss, encoder mlm acc1, encoder mlm acc5, decoder loss,
+                tjepa sigreg final, tjepa sigreg delta)).
             """
             view_key, predictor_key, mlm_key, rec_key, decoder_key = jax.random.split(tokens_key, 5)
             views, token_post, mask_positions, view_attn = _encode_views(
@@ -1491,6 +1493,8 @@ def main() -> None:
 
             tjepa_rec_loss = jnp.asarray(0.0, dtype=jnp.float32)
             tjepa_sigreg_loss = jnp.asarray(0.0, dtype=jnp.float32)
+            tjepa_sigreg_final = jnp.asarray(0.0, dtype=jnp.float32)
+            tjepa_sigreg_delta = jnp.asarray(0.0, dtype=jnp.float32)
             tjepa_loss = jnp.asarray(0.0, dtype=jnp.float32)
             decoder_loss = jnp.asarray(0.0, dtype=jnp.float32)
             num_global = args.num_global_views
@@ -1590,28 +1594,45 @@ def main() -> None:
                     tjepa_rec_loss = jnp.where(count > 0.0, loss_sum / count, 0.0)
 
                 if args.sigreg_weight > 0.0:
-                    if args.sigreg_tokenwise is True:
-                        view_tokens = views
-                        view_mask = view_tokens != pad_id
-                        flat_reps = jnp.transpose(token_post, (0, 2, 1, 3)).reshape((bsz * seq_len, num_views, dim))
-                        flat_mask = jnp.transpose(view_mask, (0, 2, 1)).reshape((bsz * seq_len, num_views))
-                        tjepa_sigreg_loss = sigreg_loss_views_masked(
-                            flat_reps,
-                            flat_mask,
-                            global_step=global_step,
-                            num_slices=args.sigreg_slices,
-                            seed=args.sigreg_seed,
-                            axis_name="data",
-                        )
+                    valid_mask = jnp.logical_and(views != pad_id, views != eos_id)
+                    positions = jnp.arange(seq_len, dtype=jnp.int32)
+                    positions = jnp.broadcast_to(positions[None, None, :], valid_mask.shape)
+                    masked_positions = jnp.where(valid_mask, positions, jnp.full_like(positions, -1))
+                    last_idx = jnp.max(masked_positions, axis=2)
+                    last_idx = jnp.maximum(last_idx, 0)
+                    idx = last_idx[:, :, None, None]
+                    idx = jnp.broadcast_to(idx, (bsz, num_views, 1, dim))
+                    final_reps = jnp.take_along_axis(token_post, idx, axis=2).squeeze(axis=2)
+                    final_mask = jnp.any(valid_mask, axis=2)
+                    tjepa_sigreg_final = sigreg_loss_views_masked(
+                        final_reps,
+                        final_mask,
+                        global_step=global_step,
+                        num_slices=args.sigreg_slices,
+                        seed=args.sigreg_seed,
+                        axis_name="data",
+                    )
+
+                    if seq_len <= 1:
+                        tjepa_sigreg_delta = jnp.asarray(0.0, dtype=jnp.float32)
                     else:
-                        view_reps = _masked_mean(token_post, view_attn)
-                        tjepa_sigreg_loss = sigreg_loss_views(
-                            view_reps,
+                        delta_reps = token_post[:, :, 1:, :] - token_post[:, :, :-1, :]
+                        delta_mask = views[:, :, 1:] != pad_id
+                        flat_delta = jnp.transpose(delta_reps, (0, 2, 1, 3)).reshape(
+                            (bsz * (seq_len - 1), num_views, dim)
+                        )
+                        flat_delta_mask = jnp.transpose(delta_mask, (0, 2, 1)).reshape(
+                            (bsz * (seq_len - 1), num_views)
+                        )
+                        tjepa_sigreg_delta = sigreg_loss_views_masked(
+                            flat_delta,
+                            flat_delta_mask,
                             global_step=global_step,
                             num_slices=args.sigreg_slices,
                             seed=args.sigreg_seed,
                             axis_name="data",
                         )
+                    tjepa_sigreg_loss = 0.5 * (tjepa_sigreg_final + tjepa_sigreg_delta)
 
                 if args.sigreg_weight > 0.0:
                     tjepa_loss = (1.0 - args.sigreg_weight) * tjepa_rec_loss + args.sigreg_weight * tjepa_sigreg_loss
@@ -1674,6 +1695,8 @@ def main() -> None:
                     encoder_mlm_acc1,
                     encoder_mlm_acc5,
                     decoder_loss,
+                    tjepa_sigreg_final,
+                    tjepa_sigreg_delta,
                 ),
             )
 
@@ -1686,6 +1709,8 @@ def main() -> None:
         loss_init = jnp.asarray(0.0, dtype=jnp.float32)
         tjepa_rec_init = jnp.asarray(0.0, dtype=jnp.float32)
         tjepa_sigreg_init = jnp.asarray(0.0, dtype=jnp.float32)
+        tjepa_sigreg_final_init = jnp.asarray(0.0, dtype=jnp.float32)
+        tjepa_sigreg_delta_init = jnp.asarray(0.0, dtype=jnp.float32)
         tjepa_init = jnp.asarray(0.0, dtype=jnp.float32)
         encoder_mlm_init = jnp.asarray(0.0, dtype=jnp.float32)
         encoder_mlm_acc1_init = jnp.asarray(0.0, dtype=jnp.float32)
@@ -1704,9 +1729,11 @@ def main() -> None:
             encoder_mlm_acc1_acc: Array,
             encoder_mlm_acc5_acc: Array,
             decoder_loss_acc: Array,
+            tjepa_sigreg_final_acc: Array,
+            tjepa_sigreg_delta_acc: Array,
             tokens: Array,
             tokens_key: Array,
-        ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array]:
+        ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array, Array, Array]:
             """Evaluate gradients and accumulate metrics for one micro-step.
 
             :param grads_acc: Accumulated gradients so far.
@@ -1718,6 +1745,8 @@ def main() -> None:
             :param encoder_mlm_acc1_acc: Accumulated encoder MLM top-1 accuracy.
             :param encoder_mlm_acc5_acc: Accumulated encoder MLM top-5 accuracy.
             :param decoder_loss_acc: Accumulated decoder loss.
+            :param tjepa_sigreg_final_acc: Accumulated final-token SIGReg.
+            :param tjepa_sigreg_delta_acc: Accumulated delta SIGReg.
             :param tokens: Token batch for this micro-step.
             :param tokens_key: PRNG key for this micro-step.
             :returns: Updated accumulators for gradients and metrics.
@@ -1732,6 +1761,8 @@ def main() -> None:
                     encoder_mlm_acc1,
                     encoder_mlm_acc5,
                     decoder_loss,
+                    tjepa_sigreg_final,
+                    tjepa_sigreg_delta,
                 ),
             ), grads = value_and_grad(
                 model_in,
@@ -1748,6 +1779,8 @@ def main() -> None:
             encoder_mlm_acc1_accum = encoder_mlm_acc1_acc + encoder_mlm_acc1
             encoder_mlm_acc5_accum = encoder_mlm_acc5_acc + encoder_mlm_acc5
             decoder_loss_accum = decoder_loss_acc + decoder_loss
+            tjepa_sigreg_final_accum = tjepa_sigreg_final_acc + tjepa_sigreg_final
+            tjepa_sigreg_delta_accum = tjepa_sigreg_delta_acc + tjepa_sigreg_delta
             return (
                 grads_accum,
                 loss_accum,
@@ -1758,13 +1791,15 @@ def main() -> None:
                 encoder_mlm_acc1_accum,
                 encoder_mlm_acc5_accum,
                 decoder_loss_accum,
+                tjepa_sigreg_final_accum,
+                tjepa_sigreg_delta_accum,
             )
 
         if use_cond is True:
             def _accum_body(
-                carry: tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array],
+                carry: tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array, Array, Array],
                 inputs: tuple[Array, Array],
-            ) -> tuple[tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array], None]:
+            ) -> tuple[tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array, Array, Array], None]:
                 """Accumulate gradients and metrics for one micro-step.
 
                 :param carry: Tuple of (grads, total loss, tjepa rec loss, tjepa sigreg loss,
@@ -1782,6 +1817,8 @@ def main() -> None:
                     encoder_mlm_acc1_acc,
                     encoder_mlm_acc5_acc,
                     decoder_loss_acc,
+                    tjepa_sigreg_final_acc,
+                    tjepa_sigreg_delta_acc,
                 ) = carry
                 step_idx, tokens = inputs
                 step_idx_global = micro_step0 + step_idx
@@ -1789,7 +1826,7 @@ def main() -> None:
 
                 def _do_compute(
                     _: None,
-                ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array]:
+                ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array, Array, Array]:
                     return _compute_step(
                         grads_acc,
                         loss_acc,
@@ -1800,13 +1837,15 @@ def main() -> None:
                         encoder_mlm_acc1_acc,
                         encoder_mlm_acc5_acc,
                         decoder_loss_acc,
+                        tjepa_sigreg_final_acc,
+                        tjepa_sigreg_delta_acc,
                         tokens,
                         tokens_key,
                     )
 
                 def _skip_compute(
                     _: None,
-                ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array]:
+                ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array, Array, Array]:
                     return (
                         grads_acc,
                         loss_acc,
@@ -1817,6 +1856,8 @@ def main() -> None:
                         encoder_mlm_acc1_acc,
                         encoder_mlm_acc5_acc,
                         decoder_loss_acc,
+                        tjepa_sigreg_final_acc,
+                        tjepa_sigreg_delta_acc,
                     )
 
                 active = step_idx < micro_steps
@@ -1824,9 +1865,9 @@ def main() -> None:
                 return new_carry, None
         else:
             def _accum_body(
-                carry: tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array],
+                carry: tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array, Array, Array],
                 inputs: tuple[Array, Array],
-            ) -> tuple[tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array], None]:
+            ) -> tuple[tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array, Array, Array], None]:
                 """Accumulate gradients and metrics for one micro-step.
 
                 :param carry: Tuple of (grads, total loss, tjepa rec loss, tjepa sigreg loss,
@@ -1844,6 +1885,8 @@ def main() -> None:
                     encoder_mlm_acc1_acc,
                     encoder_mlm_acc5_acc,
                     decoder_loss_acc,
+                    tjepa_sigreg_final_acc,
+                    tjepa_sigreg_delta_acc,
                 ) = carry
                 step_idx, tokens = inputs
                 step_idx_global = micro_step0 + step_idx
@@ -1858,6 +1901,8 @@ def main() -> None:
                     encoder_mlm_acc1_acc,
                     encoder_mlm_acc5_acc,
                     decoder_loss_acc,
+                    tjepa_sigreg_final_acc,
+                    tjepa_sigreg_delta_acc,
                     tokens,
                     tokens_key,
                 )
@@ -1873,6 +1918,8 @@ def main() -> None:
             encoder_mlm_acc1,
             encoder_mlm_acc5,
             decoder_loss,
+            tjepa_sigreg_final,
+            tjepa_sigreg_delta,
         ), _ = jax.lax.scan(
             _accum_body,
             (
@@ -1885,6 +1932,8 @@ def main() -> None:
                 encoder_mlm_acc1_init,
                 encoder_mlm_acc5_init,
                 decoder_loss_init,
+                tjepa_sigreg_final_init,
+                tjepa_sigreg_delta_init,
             ),
             (step_indices, batch_tokens),
         )
@@ -1898,6 +1947,8 @@ def main() -> None:
         loss = loss / scale
         tjepa_rec_loss = tjepa_rec_loss / scale
         tjepa_sigreg_loss = tjepa_sigreg_loss / scale
+        tjepa_sigreg_final = tjepa_sigreg_final / scale
+        tjepa_sigreg_delta = tjepa_sigreg_delta / scale
         tjepa_loss = tjepa_loss / scale
         encoder_mlm_loss = encoder_mlm_loss / scale
         encoder_mlm_acc1 = encoder_mlm_acc1 / scale
@@ -1907,21 +1958,27 @@ def main() -> None:
         metrics = (
             loss,
             tjepa_rec_loss,
+            tjepa_sigreg_loss,
             tjepa_loss,
             encoder_mlm_loss,
             encoder_mlm_acc1,
             encoder_mlm_acc5,
             decoder_loss,
+            tjepa_sigreg_final,
+            tjepa_sigreg_delta,
         )
         grads, metrics = jax.lax.pmean((grads, metrics), axis_name="data")
         (
             loss,
             tjepa_rec_loss,
+            tjepa_sigreg_loss,
             tjepa_loss,
             encoder_mlm_loss,
             encoder_mlm_acc1,
             encoder_mlm_acc5,
             decoder_loss,
+            tjepa_sigreg_final,
+            tjepa_sigreg_delta,
         ) = metrics
         if args.grad_clip_norm > 0.0:
             grads, _grad_norm = _clip_grad_norm(grads, args.grad_clip_norm)
@@ -1936,6 +1993,8 @@ def main() -> None:
             encoder_mlm_acc1,
             encoder_mlm_acc5,
             decoder_loss,
+            tjepa_sigreg_final,
+            tjepa_sigreg_delta,
         )
 
     def grad_step(
@@ -1946,7 +2005,7 @@ def main() -> None:
         global_step: Array,
         micro_step0: Array,
         micro_steps: Array,
-    ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array, Array]:
+    ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array, Array, Array, Array]:
         """Compute accumulated gradients with conditional micro-step guards.
 
         :param model_in: Replicated model.
@@ -1957,7 +2016,8 @@ def main() -> None:
         :param micro_step0: Starting micro-step index for RNG folding.
         :param micro_steps: Number of valid micro-steps in the batch.
         :returns: Tuple of (grads, total loss, tjepa rec loss, tjepa sigreg loss, tjepa loss,
-            encoder mlm loss, encoder mlm acc1, encoder mlm acc5, decoder loss).
+            encoder mlm loss, encoder mlm acc1, encoder mlm acc5, decoder loss,
+            tjepa sigreg final, tjepa sigreg delta).
         """
         return _grad_step_impl(
             model_in,
@@ -1978,7 +2038,7 @@ def main() -> None:
         global_step: Array,
         micro_step0: Array,
         micro_steps: Array,
-    ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array, Array]:
+    ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array, Array, Array, Array]:
         """Compute accumulated gradients when all micro-steps are active.
 
         :param model_in: Replicated model.
@@ -1989,7 +2049,8 @@ def main() -> None:
         :param micro_step0: Starting micro-step index for RNG folding.
         :param micro_steps: Number of valid micro-steps in the batch.
         :returns: Tuple of (grads, total loss, tjepa rec loss, tjepa sigreg loss, tjepa loss,
-            encoder mlm loss, encoder mlm acc1, encoder mlm acc5, decoder loss).
+            encoder mlm loss, encoder mlm acc1, encoder mlm acc5, decoder loss,
+            tjepa sigreg final, tjepa sigreg delta).
         """
         return _grad_step_impl(
             model_in,
@@ -2088,6 +2149,8 @@ def main() -> None:
     last_loss_val = 0.0
     last_tjepa_rec_val = 0.0
     last_tjepa_sigreg_val = 0.0
+    last_tjepa_sigreg_final_val = 0.0
+    last_tjepa_sigreg_delta_val = 0.0
     last_tjepa_val = 0.0
     last_encoder_mlm_val = 0.0
     last_encoder_mlm_acc1_val = 0.0
@@ -2173,6 +2236,8 @@ def main() -> None:
                     encoder_mlm_acc1,
                     encoder_mlm_acc5,
                     decoder_loss,
+                    tjepa_sigreg_final,
+                    tjepa_sigreg_delta,
                 ) = grad_fn(
                     train_repl,
                     swa_params_repl,
@@ -2215,6 +2280,8 @@ def main() -> None:
                         encoder_mlm_acc1_host,
                         encoder_mlm_acc5_host,
                         decoder_loss_host,
+                        tjepa_sigreg_final_host,
+                        tjepa_sigreg_delta_host,
                     ) = jax.device_get(
                         (
                             loss,
@@ -2225,11 +2292,15 @@ def main() -> None:
                             encoder_mlm_acc1,
                             encoder_mlm_acc5,
                             decoder_loss,
+                            tjepa_sigreg_final,
+                            tjepa_sigreg_delta,
                         )
                     )
                     loss_val = float(np.mean(loss_host))
                     tjepa_rec_val = float(np.mean(tjepa_rec_host))
                     tjepa_sigreg_val = float(np.mean(tjepa_sigreg_host))
+                    tjepa_sigreg_final_val = float(np.mean(tjepa_sigreg_final_host))
+                    tjepa_sigreg_delta_val = float(np.mean(tjepa_sigreg_delta_host))
                     tjepa_val = float(np.mean(tjepa_host))
                     encoder_mlm_val = float(np.mean(encoder_mlm_host))
                     encoder_mlm_acc1_val = float(np.mean(encoder_mlm_acc1_host))
@@ -2238,6 +2309,8 @@ def main() -> None:
                     last_loss_val = loss_val
                     last_tjepa_rec_val = tjepa_rec_val
                     last_tjepa_sigreg_val = tjepa_sigreg_val
+                    last_tjepa_sigreg_final_val = tjepa_sigreg_final_val
+                    last_tjepa_sigreg_delta_val = tjepa_sigreg_delta_val
                     last_tjepa_val = tjepa_val
                     last_encoder_mlm_val = encoder_mlm_val
                     last_encoder_mlm_acc1_val = encoder_mlm_acc1_val
@@ -2247,6 +2320,8 @@ def main() -> None:
                     writer.add_scalar("train/total_loss", loss_val, global_step)
                     writer.add_scalar("train/tjepa_rec_loss", tjepa_rec_val, global_step)
                     writer.add_scalar("train/tjepa_sigreg_loss", tjepa_sigreg_val, global_step)
+                    writer.add_scalar("train/tjepa_sigreg_final", tjepa_sigreg_final_val, global_step)
+                    writer.add_scalar("train/tjepa_sigreg_delta", tjepa_sigreg_delta_val, global_step)
                     writer.add_scalar("train/tjepa_loss", tjepa_val, global_step)
                     writer.add_scalar("train/encoder_mlm_loss", encoder_mlm_val, global_step)
                     writer.add_scalar("train/encoder_mlm_acc1", encoder_mlm_acc1_val, global_step)
@@ -2258,6 +2333,8 @@ def main() -> None:
                         total=f"{last_loss_val:.4f}",
                         tj_rec=f"{last_tjepa_rec_val:.4f}",
                         tj_sig=f"{last_tjepa_sigreg_val:.4f}",
+                        tj_sig_f=f"{last_tjepa_sigreg_final_val:.4f}",
+                        tj_sig_d=f"{last_tjepa_sigreg_delta_val:.4f}",
                         tj=f"{last_tjepa_val:.4f}",
                         mlm=f"{last_encoder_mlm_val:.4f}",
                         mlm1=f"{last_encoder_mlm_acc1_val:.4f}",
