@@ -31,12 +31,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--candidates-use-swa",
         action="store_true",
-        help="Run candidate texts through the SWA weights while keeping the reference on the base weights.",
+        help="Run candidate texts through the EMA teacher weights while keeping the reference on the base weights.",
     )
     parser.add_argument(
         "--reference-use-swa",
         action="store_true",
-        help="Run the reference text through the SWA weights instead of the base weights.",
+        help="Run the reference text through the EMA teacher weights instead of the base weights.",
     )
     parser.add_argument(
         "--masked-only",
@@ -377,15 +377,20 @@ def main() -> None:
     cand_attn = attn_all[1:]
 
     mask_positions = ref_tokens_arr == mask_id
-    use_mask_token = view_config.get("mask_token_input")
+    use_mask_token = view_config.get("mask_token_input", False)
     if isinstance(use_mask_token, bool) is False:
-        raise ValueError("mask_token_input missing from config")
+        raise ValueError("mask_token_input must be a boolean if present in the config")
     if use_mask_token is True:
         ref_attn_mask = ref_attn
     else:
         ref_attn_mask = np.logical_and(ref_attn, np.logical_not(mask_positions))
 
     model = _load_model(ckpt_dir, dtype=dtype, model_config=model_config)
+    swa_path = os.path.join(ckpt_dir, "swa.eqx")
+    if os.path.isfile(swa_path) is True:
+        if args.reference_use_swa is False and args.candidates_use_swa is False:
+            args.reference_use_swa = True
+            args.candidates_use_swa = True
     swa_model: TextTransformer | None = None
     if args.candidates_use_swa is True or args.reference_use_swa is True:
         swa_model = _load_swa_model(

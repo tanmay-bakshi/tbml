@@ -18,7 +18,6 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec, Sharding
 from tensorboardX import SummaryWriter  # type: ignore[import-untyped]
 from tqdm import tqdm  # type: ignore[import-untyped]
 
-from tbml.experiments.honeycomb.loss import sigreg_loss_views, sigreg_loss_views_masked
 from tbml.experiments.honeycomb.text.dataset import (
     MMapTokenDataset,
     _build_tokenizer,
@@ -38,7 +37,7 @@ def _parse_args() -> argparse.Namespace:
 
     :returns: Parsed arguments namespace.
     """
-    parser = argparse.ArgumentParser(description="Train a text encoder with TJepa.")
+    parser = argparse.ArgumentParser(description="Train a text encoder with data2vec-style objectives.")
     parser.add_argument("--runs-folder", type=str, required=True)
     parser.add_argument("--data-folder", type=str, required=True)
     parser.add_argument("--shuffle-buffer", type=int, default=1024)
@@ -60,7 +59,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--n-heads", type=int, default=12)
     parser.add_argument("--n-layers", type=int, default=12)
     parser.add_argument("--predictor-n-layers", type=int, default=None)
-    parser.add_argument("--decoder-n-layers", type=int, default=None)
     parser.add_argument("--mlp-ratio", type=float, default=4.0)
     parser.add_argument("--attn-dropout", type=float, default=0.0)
     parser.add_argument("--resid-dropout", type=float, default=0.0)
@@ -68,32 +66,20 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--pope-base", type=float, default=10000.0)
     parser.add_argument("--init-std", type=float, default=0.02)
     parser.add_argument("--attn-type", type=str, default="pope", choices=["pope", "rope"])
-    parser.add_argument("--encoder-causal-attention", type=str, default="true", choices=["true", "false"])
-    parser.add_argument("--predictor-causal-attention", type=str, default="true", choices=["true", "false"])
-    parser.add_argument("--decoder-causal-attention", type=str, default="true", choices=["true", "false"])
 
-    parser.add_argument("--num-global-views", type=int, default=1)
-    parser.add_argument("--num-local-views", type=int, default=6)
-    parser.add_argument("--global-mask-min", type=float, default=None)
-    parser.add_argument("--global-mask-max", type=float, default=None)
-    parser.add_argument("--local-mask-min", type=float, default=None)
-    parser.add_argument("--local-mask-max", type=float, default=None)
-    parser.add_argument("--masking-mode", type=str, default="spans", choices=["spans", "tokens"])
+    parser.add_argument("--num-views", type=int, default=6)
+    parser.add_argument("--mask-ratio", type=float, default=0.42)
+    parser.add_argument("--mask-ratio-adjust", type=float, default=0.1)
+    parser.add_argument("--mask-block-size", type=int, default=3)
 
-    parser.add_argument("--sigreg-weight", type=float, default=0.25)
-    parser.add_argument("--sigreg-slices", type=int, default=256)
-    parser.add_argument("--sigreg-seed", type=int, default=0)
-    parser.add_argument("--sigreg-tokenwise", action="store_true")
-    parser.add_argument("--tjepa-loss-weight", type=float, default=1.0)
-    parser.add_argument("--tjepa-unmasked-keep-prob", type=float, default=0.1)
+    parser.add_argument("--data2vec-loss-weight", type=float, default=1.0)
+    parser.add_argument("--teacher-ema-start", type=float, default=0.9999)
+    parser.add_argument("--teacher-ema-end", type=float, default=1.0)
+    parser.add_argument("--teacher-ema-steps", type=int, default=100000)
+    parser.add_argument("--teacher-top-k", type=int, default=12)
     parser.add_argument("--encoder-mlm-loss-weight", type=float, default=0.0)
     parser.add_argument("--encoder-mlm-keep-prob", type=float, default=0.0)
-    parser.add_argument("--decoder-loss-weight", type=float, default=0.0)
-    parser.add_argument("--mask-token-input", action="store_true")
     parser.add_argument("--predictor-keep-unmasked", action="store_true")
-    parser.add_argument("--disable-predictor", action="store_true")
-    parser.add_argument("--use-swa", dest="use_swa", action="store_true")
-    parser.add_argument("--no-swa", dest="use_swa", action="store_false")
 
     parser.add_argument("--muon-lr", type=float, default=1e-3)
     parser.add_argument("--muon-momentum", type=float, default=0.95)
@@ -108,7 +94,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--adamw-eps", type=float, default=1e-8)
     parser.add_argument("--adamw-weight-decay", type=float, default=0.01)
 
-    parser.set_defaults(muon_nesterov=True, use_swa=True)
+    parser.set_defaults(muon_nesterov=True)
     return parser.parse_args()
 
 
@@ -122,20 +108,6 @@ def _parse_betas(value: str) -> tuple[float, float]:
     if len(parts) != 2:
         raise ValueError("expected two comma-separated values for betas")
     return float(parts[0]), float(parts[1])
-
-
-def _parse_bool(value: str) -> bool:
-    """Parse a boolean string.
-
-    :param value: Input string ("true" or "false").
-    :returns: Parsed boolean.
-    """
-    lowered = value.lower()
-    if lowered == "true":
-        return True
-    if lowered == "false":
-        return False
-    raise ValueError("expected 'true' or 'false'")
 
 
 def _dtype_from_name(name: str) -> jnp.dtype:
@@ -456,54 +428,116 @@ def _iter_batches(
         yield tokens
 
 
-def _mask_spans(
+def _inverse_block_mask(
     tokens: Array,
     key: Array,
     *,
-    min_ratio: float,
-    max_ratio: float,
+    mask_ratio: float,
+    mask_ratio_adjust: float,
+    block_size: int,
     pad_id: int,
     eos_id: int,
-    mask_id: int,
-    use_mask_token: bool,
-    masking_mode: str,
-    poisson_lambda: float = 3.0,
 ) -> tuple[Array, Array, Array]:
-    """Apply masking to tokens using span or token sampling.
+    """Apply inverse-block masking to tokens.
 
     Masked tokens are excluded from attention but the sequence length is unchanged.
 
     :param tokens: Token ids of shape (B, T).
     :param key: PRNG key.
-    :param min_ratio: Minimum masking ratio.
-    :param max_ratio: Maximum masking ratio.
+    :param mask_ratio: Masking ratio in [0, 1].
+    :param mask_ratio_adjust: Adjustment factor for the number of preserved blocks.
+    :param block_size: Size of preserved blocks.
     :param pad_id: Padding token id.
     :param eos_id: EOS token id.
-    :param mask_id: Mask token id.
-    :param use_mask_token: Whether to replace masked positions with mask tokens.
-    :param masking_mode: Masking mode ("spans" or "tokens").
-    :param poisson_lambda: Poisson lambda for span lengths.
     :returns: Tuple of (token ids, mask positions, attention mask).
     """
-    if min_ratio < 0.0 or min_ratio > 1.0:
-        raise ValueError("min_ratio must be in [0, 1]")
-    if max_ratio < 0.0 or max_ratio > 1.0:
-        raise ValueError("max_ratio must be in [0, 1]")
-    if min_ratio > max_ratio:
-        raise ValueError("min_ratio must be <= max_ratio")
-    if masking_mode not in ("spans", "tokens"):
-        raise ValueError("masking_mode must be 'spans' or 'tokens'")
-    if masking_mode == "spans" and poisson_lambda <= 0.0:
-        raise ValueError("poisson_lambda must be > 0")
+    if mask_ratio < 0.0 or mask_ratio > 1.0:
+        raise ValueError("mask_ratio must be in [0, 1]")
+    if block_size <= 0:
+        raise ValueError("block_size must be > 0")
+    if mask_ratio_adjust < 0.0 or mask_ratio_adjust > 1.0:
+        raise ValueError("mask_ratio_adjust must be in [0, 1]")
 
-    if min_ratio == 0.0 and max_ratio == 0.0:
-        eligible = jnp.logical_and(tokens != pad_id, tokens != eos_id)
-        attention_mask = eligible
+    seq_len = tokens.shape[1]
+    keys = jax.random.split(key, tokens.shape[0])
+    positions = jnp.arange(seq_len, dtype=jnp.int32)
+    left = block_size // 2
+    right = block_size - left - 1
 
-        def _ensure_any(
-            attn: Array,
-            elig: Array,
-        ) -> Array:
+    def _one_sample(
+        sample_tokens: Array,
+        sample_key: Array,
+    ) -> tuple[Array, Array, Array]:
+        """Mask tokens for a single sequence using inverse-block masking.
+
+        :param sample_tokens: Token ids of shape (T,).
+        :param sample_key: PRNG key.
+        :returns: Tuple of (masked tokens, mask positions, attention mask).
+        """
+        key_starts, key_drop, key_add = jax.random.split(sample_key, 3)
+        eligible = jnp.logical_and(sample_tokens != pad_id, sample_tokens != eos_id)
+        valid_len = jnp.sum(eligible).astype(jnp.int32)
+        target_keep = jnp.floor((1.0 - mask_ratio) * valid_len).astype(jnp.int32)
+        target_keep = jnp.minimum(target_keep, valid_len)
+        target_keep = jnp.maximum(target_keep, 1)
+        target_keep = jnp.where(valid_len > 0, target_keep, 0)
+
+        starts_f = valid_len.astype(jnp.float32) * (
+            (1.0 - mask_ratio) + mask_ratio_adjust
+        )
+        starts_f = starts_f / float(block_size)
+        num_starts = jnp.floor(starts_f).astype(jnp.int32)
+        num_starts = jnp.minimum(num_starts, valid_len)
+        num_starts = jnp.maximum(num_starts, jnp.where(valid_len > 0, 1, 0))
+
+        start_scores = jax.random.uniform(key_starts, shape=(seq_len,), minval=0.0, maxval=1.0)
+        start_scores = jnp.where(eligible, start_scores, -jnp.inf)
+        order = jnp.argsort(-start_scores)
+        ranks = jnp.argsort(order)
+        start_mask = ranks < num_starts
+
+        pos = positions[:, None]
+        starts = positions[None, :]
+        in_block = jnp.logical_and(pos >= starts - left, pos <= starts + right)
+        active = start_mask[None, :]
+        keep_mask = jnp.any(jnp.logical_and(in_block, active), axis=1)
+        keep_mask = jnp.logical_and(keep_mask, eligible)
+
+        keep_count = jnp.sum(keep_mask).astype(jnp.int32)
+
+        def _drop(_: None) -> Array:
+            scores = jax.random.uniform(key_drop, shape=(seq_len,), minval=0.0, maxval=1.0)
+            scores = jnp.where(keep_mask, scores, -jnp.inf)
+            order = jnp.argsort(-scores)
+            ranks = jnp.argsort(order)
+            new_keep = ranks < target_keep
+            return jnp.logical_and(new_keep, keep_mask)
+
+        def _no_drop(_: None) -> Array:
+            return keep_mask
+
+        keep_mask = jax.lax.cond(keep_count > target_keep, _drop, _no_drop, operand=None)
+        keep_count = jnp.sum(keep_mask).astype(jnp.int32)
+        add_count = target_keep - keep_count
+
+        def _add(_: None) -> Array:
+            scores = jax.random.uniform(key_add, shape=(seq_len,), minval=0.0, maxval=1.0)
+            available = jnp.logical_and(eligible, jnp.logical_not(keep_mask))
+            scores = jnp.where(available, scores, -jnp.inf)
+            order = jnp.argsort(-scores)
+            ranks = jnp.argsort(order)
+            add_mask = ranks < add_count
+            add_mask = jnp.logical_and(add_mask, available)
+            return jnp.logical_or(keep_mask, add_mask)
+
+        def _no_add(_: None) -> Array:
+            return keep_mask
+
+        keep_mask = jax.lax.cond(add_count > 0, _add, _no_add, operand=None)
+        mask = jnp.logical_and(eligible, jnp.logical_not(keep_mask))
+        attention_mask = keep_mask
+
+        def _ensure_any(attn: Array, elig: Array) -> Array:
             def _with_fallback(_: None) -> Array:
                 fallback_idx = jnp.argmax(elig)
                 return attn.at[fallback_idx].set(True)
@@ -513,152 +547,10 @@ def _mask_spans(
 
             return jax.lax.cond(jnp.any(attn), _no_fallback, _with_fallback, operand=None)
 
-        attention_mask = jax.vmap(_ensure_any)(attention_mask, eligible)
-        mask = jnp.zeros(tokens.shape, dtype=jnp.bool_)
-        return tokens, mask, attention_mask
+        attention_mask = _ensure_any(attention_mask, eligible)
+        return sample_tokens, mask, attention_mask
 
-    key_ratio, key_spans = jax.random.split(key)
-    ratios = jax.random.uniform(
-        key_ratio,
-        shape=(tokens.shape[0],),
-        minval=min_ratio,
-        maxval=max_ratio,
-    )
-    keys = jax.random.split(key_spans, tokens.shape[0])
-    seq_len = tokens.shape[1]
-    if masking_mode == "spans":
-        idx = jnp.arange(seq_len, dtype=jnp.int32)
-        idx_row = idx[None, :]
-        all_lengths = jnp.arange(1, seq_len + 1, dtype=jnp.int32)[:, None]
-
-        def _one_sample_spans(
-            sample_tokens: Array,
-            ratio: Array,
-            sample_key: Array,
-        ) -> tuple[Array, Array, Array]:
-            """Mask spans for a single sequence.
-
-            :param sample_tokens: Token ids of shape (T,).
-            :param ratio: Masking ratio scalar.
-            :param sample_key: PRNG key.
-            :returns: Tuple of (masked tokens, mask positions, attention mask).
-            """
-            key_len, key_start = jax.random.split(sample_key)
-            eligible = jnp.logical_and(sample_tokens != pad_id, sample_tokens != eos_id)
-            valid_len = jnp.sum(eligible).astype(jnp.int32)
-            target = jnp.floor(ratio * valid_len).astype(jnp.int32)
-            target = jnp.minimum(target, jnp.maximum(valid_len - 1, 0))
-            span_lengths = jax.random.poisson(key_len, poisson_lambda, shape=(seq_len,))
-            span_lengths = jnp.maximum(span_lengths, 1)
-            start_scores = jax.random.uniform(key_start, shape=(seq_len, seq_len), minval=0.0, maxval=1.0)
-
-            def _body(i: int, state: tuple[Array, Array]) -> tuple[Array, Array]:
-                mask, masked_count = state
-                remaining = target - masked_count
-                use = remaining > 0
-                span_len = jnp.minimum(span_lengths[i], remaining)
-                span_len = jnp.maximum(span_len, 1)
-                valid = jnp.logical_and(eligible, jnp.logical_not(mask))
-                valid_int = valid.astype(jnp.int32)
-                prefix = jnp.concatenate(
-                    [jnp.zeros((1,), dtype=jnp.int32), jnp.cumsum(valid_int)]
-                )
-                end = idx_row + all_lengths
-                valid_window = end <= seq_len
-                prefix_end = jnp.take(prefix, end, mode="clip")
-                prefix_start = prefix[idx_row]
-                window_sum = jnp.where(valid_window, prefix_end - prefix_start, 0)
-                length_index = jnp.maximum(span_len - 1, 0)
-                possible = jnp.take(window_sum, length_index, axis=0) == span_len
-                any_possible = jnp.any(possible)
-                scores = jnp.where(possible, start_scores[i], -jnp.inf)
-                start = jnp.argmax(scores)
-                span_positions = jnp.logical_and(idx >= start, idx < start + span_len)
-                apply = jnp.logical_and(use, any_possible)
-                new_mask = jnp.where(apply, jnp.logical_or(mask, span_positions), mask)
-                new_count = jnp.where(apply, masked_count + span_len, masked_count)
-                return new_mask, new_count
-
-            init_mask = jnp.zeros((seq_len,), dtype=jnp.bool_)
-            init_count = jnp.asarray(0, dtype=jnp.int32)
-            final_mask, _final_count = jax.lax.fori_loop(
-                0, seq_len, _body, (init_mask, init_count)
-            )
-            return final_mask, eligible
-
-    def _one_sample_tokens(
-        sample_tokens: Array,
-        ratio: Array,
-        sample_key: Array,
-    ) -> tuple[Array, Array]:
-        """Mask individual tokens for a single sequence.
-
-        :param sample_tokens: Token ids of shape (T,).
-        :param ratio: Masking ratio scalar.
-        :param sample_key: PRNG key.
-        :returns: Tuple of (mask positions, eligibility mask).
-        """
-        eligible = jnp.logical_and(sample_tokens != pad_id, sample_tokens != eos_id)
-        valid_len = jnp.sum(eligible).astype(jnp.int32)
-        target = jnp.floor(ratio * valid_len).astype(jnp.int32)
-        target = jnp.minimum(target, jnp.maximum(valid_len - 1, 0))
-        scores = jax.random.uniform(sample_key, shape=(seq_len,), minval=0.0, maxval=1.0)
-        scores = jnp.where(eligible, scores, -jnp.inf)
-        order = jnp.argsort(-scores)
-        ranks = jnp.argsort(order)
-        mask = ranks < target
-        mask = jnp.logical_and(mask, eligible)
-        return mask, eligible
-
-    def _apply_mask(
-        sample_tokens: Array,
-        mask: Array,
-        eligible: Array,
-    ) -> tuple[Array, Array, Array]:
-        if use_mask_token is True:
-            attention_mask = eligible
-        else:
-            attention_mask = jnp.logical_and(eligible, jnp.logical_not(mask))
-
-        def _with_fallback(_: None) -> tuple[Array, Array]:
-            fallback_idx = jnp.argmax(eligible)
-            attn = attention_mask.at[fallback_idx].set(True)
-            new_mask = mask.at[fallback_idx].set(False)
-            return attn, new_mask
-
-        def _no_fallback(_: None) -> tuple[Array, Array]:
-            return attention_mask, mask
-
-        attention_mask, final_mask = jax.lax.cond(
-            jnp.any(attention_mask),
-            _no_fallback,
-            _with_fallback,
-            operand=None,
-        )
-        if use_mask_token is True:
-            masked_tokens = jnp.where(final_mask, jnp.asarray(mask_id, dtype=sample_tokens.dtype), sample_tokens)
-        else:
-            masked_tokens = sample_tokens
-        return masked_tokens, final_mask, attention_mask
-
-    if masking_mode == "spans":
-        def _one_sample(
-            sample_tokens: Array,
-            ratio: Array,
-            sample_key: Array,
-        ) -> tuple[Array, Array, Array]:
-            mask, eligible = _one_sample_spans(sample_tokens, ratio, sample_key)
-            return _apply_mask(sample_tokens, mask, eligible)
-    else:
-        def _one_sample(
-            sample_tokens: Array,
-            ratio: Array,
-            sample_key: Array,
-        ) -> tuple[Array, Array, Array]:
-            mask, eligible = _one_sample_tokens(sample_tokens, ratio, sample_key)
-            return _apply_mask(sample_tokens, mask, eligible)
-
-    masked, positions, attn_mask = jax.vmap(_one_sample)(tokens, ratios, keys)
+    masked, positions, attn_mask = jax.vmap(_one_sample)(tokens, keys)
     return masked, positions, attn_mask
 
 
@@ -667,26 +559,22 @@ def _mask_views(
     key: Array,
     *,
     num_views: int,
-    min_ratio: float,
-    max_ratio: float,
+    mask_ratio: float,
+    mask_ratio_adjust: float,
+    mask_block_size: int,
     pad_id: int,
     eos_id: int,
-    mask_id: int,
-    use_mask_token: bool,
-    masking_mode: str,
 ) -> tuple[Array, Array, Array]:
     """Generate multiple masked views of the token batch.
 
     :param tokens: Token ids of shape (B, T).
     :param key: PRNG key.
     :param num_views: Number of views to generate.
-    :param min_ratio: Minimum masking ratio.
-    :param max_ratio: Maximum masking ratio.
+    :param mask_ratio: Masking ratio for inverse-block masking.
+    :param mask_ratio_adjust: Adjustment factor for inverse-block masking.
+    :param mask_block_size: Block size for inverse-block masking.
     :param pad_id: Padding token id.
     :param eos_id: EOS token id.
-    :param mask_id: Mask token id.
-    :param use_mask_token: Whether to replace masked positions with mask tokens.
-    :param masking_mode: Masking mode ("spans" or "tokens").
     :returns: Tuple of (masked views, mask positions, attention masks).
     """
     if num_views == 0:
@@ -703,16 +591,14 @@ def _mask_views(
         :param view_key: PRNG key for masking.
         :returns: Tuple of (masked token ids, mask positions, attention mask).
         """
-        return _mask_spans(
+        return _inverse_block_mask(
             tokens,
             view_key,
-            min_ratio=min_ratio,
-            max_ratio=max_ratio,
+            mask_ratio=mask_ratio,
+            mask_ratio_adjust=mask_ratio_adjust,
+            block_size=mask_block_size,
             pad_id=pad_id,
             eos_id=eos_id,
-            mask_id=mask_id,
-            use_mask_token=use_mask_token,
-            masking_mode=masking_mode,
         )
 
     views, masks, attn_masks = jax.vmap(_one_view)(keys)
@@ -727,119 +613,37 @@ def _build_views(
     tokens: Array,
     key: Array,
     *,
-    num_global_views: int,
-    num_local_views: int,
-    global_mask_min: float,
-    global_mask_max: float,
-    local_mask_min: float,
-    local_mask_max: float,
+    num_views: int,
+    mask_ratio: float,
+    mask_ratio_adjust: float,
+    mask_block_size: int,
     pad_id: int,
     eos_id: int,
-    mask_id: int,
-    use_mask_token: bool,
-    masking_mode: str,
-) -> tuple[Array, Array, Array, Array, Array, Array, Array]:
-    """Build masked views for global and local crops.
+) -> tuple[Array, Array, Array, Array]:
+    """Build masked views for multi-mask training.
 
     :param tokens: Token ids of shape (B, T).
     :param key: PRNG key.
-    :param num_global_views: Number of global views.
-    :param num_local_views: Number of local views.
-    :param global_mask_min: Minimum global masking ratio.
-    :param global_mask_max: Maximum global masking ratio.
-    :param local_mask_min: Minimum local masking ratio.
-    :param local_mask_max: Maximum local masking ratio.
+    :param num_views: Number of masked views to generate per sample.
+    :param mask_ratio: Masking ratio in [0, 1].
+    :param mask_ratio_adjust: Adjustment factor for inverse-block masking.
+    :param mask_block_size: Block size for inverse-block masking.
     :param pad_id: Padding token id.
     :param eos_id: EOS token id.
-    :param mask_id: Mask token id.
-    :param use_mask_token: Whether to replace masked positions with mask tokens.
-    :param masking_mode: Masking mode ("spans" or "tokens").
-    :returns: Tuple of (model key, global views, global masks, global attn, local views, local masks, local attn).
+    :returns: Tuple of (model key, views, masks, attention masks).
     """
-    model_key, global_key, local_key = jax.random.split(key, 3)
-    if num_global_views == 0:
-        global_views = jnp.zeros((tokens.shape[0], 0, tokens.shape[1]), dtype=tokens.dtype)
-        global_masks = jnp.zeros((tokens.shape[0], 0, tokens.shape[1]), dtype=jnp.bool_)
-        global_attn = jnp.zeros((tokens.shape[0], 0, tokens.shape[1]), dtype=jnp.bool_)
-    else:
-        sample_key, masked_key = jax.random.split(global_key, 2)
-        sample_views, sample_masks, sample_attn = _mask_views(
-            tokens,
-            sample_key,
-            num_views=1,
-            min_ratio=0.0,
-            max_ratio=0.0,
-            pad_id=pad_id,
-            eos_id=eos_id,
-            mask_id=mask_id,
-            use_mask_token=use_mask_token,
-            masking_mode=masking_mode,
-        )
-        if num_global_views > 1:
-            other_views, other_masks, other_attn = _mask_views(
-                tokens,
-                masked_key,
-                num_views=num_global_views - 1,
-                min_ratio=global_mask_min,
-                max_ratio=global_mask_max,
-                pad_id=pad_id,
-                eos_id=eos_id,
-                mask_id=mask_id,
-                use_mask_token=use_mask_token,
-                masking_mode=masking_mode,
-            )
-            global_views = jnp.concatenate([sample_views, other_views], axis=1)
-            global_masks = jnp.concatenate([sample_masks, other_masks], axis=1)
-            global_attn = jnp.concatenate([sample_attn, other_attn], axis=1)
-        else:
-            global_views = sample_views
-            global_masks = sample_masks
-            global_attn = sample_attn
-    local_views, local_masks, local_attn = _mask_views(
+    model_key, view_key = jax.random.split(key, 2)
+    views, masks, attn = _mask_views(
         tokens,
-        local_key,
-        num_views=num_local_views,
-        min_ratio=local_mask_min,
-        max_ratio=local_mask_max,
+        view_key,
+        num_views=num_views,
+        mask_ratio=mask_ratio,
+        mask_ratio_adjust=mask_ratio_adjust,
+        mask_block_size=mask_block_size,
         pad_id=pad_id,
         eos_id=eos_id,
-        mask_id=mask_id,
-        use_mask_token=use_mask_token,
-        masking_mode=masking_mode,
     )
-    return (
-        model_key,
-        global_views,
-        global_masks,
-        global_attn,
-        local_views,
-        local_masks,
-        local_attn,
-    )
-
-
-def _combine_views(
-    global_views: Array,
-    global_masks: Array,
-    global_attn: Array,
-    local_views: Array,
-    local_masks: Array,
-    local_attn: Array,
-) -> tuple[Array, Array, Array]:
-    """Combine global and local views into a single view batch.
-
-    :param global_views: Global view tokens.
-    :param global_masks: Global view mask positions.
-    :param global_attn: Global view attention masks.
-    :param local_views: Local view tokens.
-    :param local_masks: Local view mask positions.
-    :param local_attn: Local view attention masks.
-    :returns: Tuple of (views, mask positions, attention masks).
-    """
-    views = jnp.concatenate([global_views, local_views], axis=1)
-    mask_positions = jnp.concatenate([global_masks, local_masks], axis=1)
-    view_attn = jnp.concatenate([global_attn, local_attn], axis=1)
-    return views, mask_positions, view_attn
+    return model_key, views, masks, attn
 
 
 def _encode_views(
@@ -848,17 +652,12 @@ def _encode_views(
     *,
     train: bool,
     key: Array,
-    num_global_views: int,
-    num_local_views: int,
-    global_mask_min: float,
-    global_mask_max: float,
-    local_mask_min: float,
-    local_mask_max: float,
+    num_views: int,
+    mask_ratio: float,
+    mask_ratio_adjust: float,
+    mask_block_size: int,
     pad_id: int,
     eos_id: int,
-    mask_id: int,
-    use_mask_token: bool,
-    masking_mode: str,
 ) -> tuple[Array, Array, Array, Array]:
     """Encode masked views into token representations.
 
@@ -866,76 +665,36 @@ def _encode_views(
     :param tokens: Token ids of shape (B, T).
     :param train: Whether to enable dropout.
     :param key: PRNG key.
-    :param num_global_views: Number of global views.
-    :param num_local_views: Number of local views.
-    :param global_mask_min: Minimum global masking ratio.
-    :param global_mask_max: Maximum global masking ratio.
-    :param local_mask_min: Minimum local masking ratio.
-    :param local_mask_max: Maximum local masking ratio.
+    :param num_views: Number of masked views per sample.
+    :param mask_ratio: Masking ratio in [0, 1].
+    :param mask_ratio_adjust: Adjustment factor for inverse-block masking.
+    :param mask_block_size: Block size for inverse-block masking.
     :param pad_id: Padding token id.
     :param eos_id: EOS token id.
-    :param mask_id: Mask token id.
-    :param use_mask_token: Whether to replace masked positions with mask tokens.
-    :param masking_mode: Masking mode ("spans" or "tokens").
     :returns: Tuple of (views, token_post, mask_positions, view_attn).
     """
-    if num_global_views + num_local_views <= 0:
+    if num_views <= 0:
         raise ValueError("at least one view must be requested")
 
     tokens = jnp.where(tokens == eos_id, jnp.asarray(pad_id, dtype=tokens.dtype), tokens)
 
     (
         model_key,
-        global_views,
-        global_masks,
-        global_attn,
-        local_views,
-        local_masks,
-        local_attn,
+        views,
+        mask_positions,
+        view_attn,
     ) = _build_views(
         tokens,
         key,
-        num_global_views=num_global_views,
-        num_local_views=num_local_views,
-        global_mask_min=global_mask_min,
-        global_mask_max=global_mask_max,
-        local_mask_min=local_mask_min,
-        local_mask_max=local_mask_max,
+        num_views=num_views,
+        mask_ratio=mask_ratio,
+        mask_ratio_adjust=mask_ratio_adjust,
+        mask_block_size=mask_block_size,
         pad_id=pad_id,
         eos_id=eos_id,
-        mask_id=mask_id,
-        use_mask_token=use_mask_token,
-        masking_mode=masking_mode,
     )
-    views, _mask_positions, view_attn = _combine_views(
-        global_views,
-        global_masks,
-        global_attn,
-        local_views,
-        local_masks,
-        local_attn,
-    )
-    mask_positions = _mask_positions
 
     bsz, num_views, seq_len = views.shape
-    if use_mask_token is True:
-        eligible = jnp.logical_and(tokens != pad_id, tokens != eos_id)
-
-        def _ensure_any(
-            attn: Array,
-            elig: Array,
-        ) -> Array:
-            def _with_fallback(_: None) -> Array:
-                fallback_idx = jnp.argmax(elig)
-                return attn.at[fallback_idx].set(True)
-
-            def _no_fallback(_: None) -> Array:
-                return attn
-
-            return jax.lax.cond(jnp.any(attn), _no_fallback, _with_fallback, operand=None)
-
-        base_attn = jax.vmap(_ensure_any)(eligible, eligible)
-        view_attn = jnp.broadcast_to(base_attn[:, None, :], (bsz, num_views, seq_len))
     flat_views = views.reshape((bsz * num_views, seq_len))
     flat_mask = view_attn.reshape((bsz * num_views, seq_len))
     _reps_pre, reps_post, _pooled_post = model.forward_with_intermediates(
@@ -973,11 +732,79 @@ def _masked_mean(
     return summed / denom[..., None]
 
 
+def _instance_norm(
+    reps: Array,
+    mask: Array,
+    *,
+    eps: float = 1e-5,
+) -> Array:
+    """Apply instance normalization over the sequence dimension.
+
+    :param reps: Representations of shape (B, T, D).
+    :param mask: Boolean mask of shape (B, T) for valid positions.
+    :param eps: Numerical stability epsilon.
+    :returns: Instance-normalized reps of shape (B, T, D).
+    """
+    if reps.ndim != 3:
+        raise ValueError("reps must have shape (B, T, D)")
+    if mask.ndim != 2:
+        raise ValueError("mask must have shape (B, T)")
+    if reps.shape[:2] != mask.shape:
+        raise ValueError("reps and mask must align on (B, T)")
+
+    reps_f = reps.astype(jnp.float32)
+    mask_f = mask.astype(jnp.float32)
+    count = jnp.sum(mask_f, axis=1, keepdims=True)
+    count = jnp.maximum(count, 1.0)
+    mean = jnp.sum(reps_f * mask_f[:, :, None], axis=1, keepdims=True) / count[:, None]
+    var = jnp.sum(jnp.square(reps_f - mean) * mask_f[:, :, None], axis=1, keepdims=True) / count[:, None]
+    return (reps_f - mean) / jnp.sqrt(var + eps)
+
+
+def _teacher_targets(
+    model: TextTransformer,
+    tokens: Array,
+    attention_mask: Array,
+    *,
+    top_k: int,
+    eps: float = 1e-5,
+) -> Array:
+    """Compute data2vec teacher targets from top-K encoder blocks.
+
+    :param model: Teacher model.
+    :param tokens: Token ids of shape (B, T).
+    :param attention_mask: Boolean mask of shape (B, T) for valid positions.
+    :param top_k: Number of top FFN blocks to average.
+    :param eps: Instance norm epsilon.
+    :returns: Target representations of shape (B, T, D) in float32.
+    """
+    if top_k <= 0:
+        raise ValueError("top_k must be > 0")
+    if tokens.ndim != 2:
+        raise ValueError("tokens must have shape (B, T)")
+    if attention_mask.ndim != 2:
+        raise ValueError("attention_mask must have shape (B, T)")
+    if tokens.shape != attention_mask.shape:
+        raise ValueError("tokens and attention_mask must have the same shape")
+    if top_k > len(model.blocks):
+        raise ValueError("top_k must be <= number of encoder blocks")
+
+    reps = model.token_embed(tokens)
+    outputs: list[Array] = []
+    for block in model.blocks:
+        reps = block(reps, attention_mask=attention_mask, train=False, key=None)
+        outputs.append(reps)
+    selected = outputs[-top_k:]
+    normed = [_instance_norm(layer_out, attention_mask, eps=eps) for layer_out in selected]
+    stacked = jnp.stack(normed, axis=0)
+    return jnp.mean(stacked, axis=0)
+
+
 def _save_checkpoint(
     run_dir: str,
     step: int,
     model: TextTransformer,
-    swa_params: eqx.Module,
+    teacher_params: eqx.Module,
     opt_state: eqx.Module,
     metadata: dict[str, object],
 ) -> None:
@@ -986,14 +813,14 @@ def _save_checkpoint(
     :param run_dir: Run directory path.
     :param step: Global step index.
     :param model: Model to serialize.
-    :param swa_params: SWA parameters to serialize.
+    :param teacher_params: EMA teacher parameters to serialize.
     :param opt_state: Optimizer state to serialize.
     :param metadata: Metadata to persist.
     """
     ckpt_dir = os.path.join(run_dir, f"checkpoint_step_{step:08d}")
     os.makedirs(ckpt_dir, exist_ok=False)
     eqx.tree_serialise_leaves(os.path.join(ckpt_dir, "model.eqx"), model)
-    eqx.tree_serialise_leaves(os.path.join(ckpt_dir, "swa.eqx"), swa_params)
+    eqx.tree_serialise_leaves(os.path.join(ckpt_dir, "swa.eqx"), teacher_params)
     eqx.tree_serialise_leaves(os.path.join(ckpt_dir, "optimizer.eqx"), opt_state)
     with open(os.path.join(ckpt_dir, "metadata.json"), "w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2)
@@ -1002,9 +829,8 @@ def _save_checkpoint(
 def main() -> None:
     """Run the text training loop."""
     args = _parse_args()
-    encoder_causal_attention = _parse_bool(args.encoder_causal_attention)
-    predictor_causal_attention = _parse_bool(args.predictor_causal_attention)
-    decoder_causal_attention = _parse_bool(args.decoder_causal_attention)
+    encoder_causal_attention = False
+    predictor_causal_attention = False
 
     if args.max_train_steps < 0:
         raise ValueError("max-train-steps must be >= 0")
@@ -1018,62 +844,37 @@ def main() -> None:
         raise ValueError("checkpoint-every must be > 0")
     if args.profile_warmup_steps < 0:
         raise ValueError("profile-warmup-steps must be >= 0")
-    if args.num_global_views < 0:
-        raise ValueError("num-global-views must be >= 0")
-    if args.num_local_views < 0:
-        raise ValueError("num-local-views must be >= 0")
-    default_global_min = 0.0
-    default_global_max = 0.0
-    default_local_min = 0.40
-    default_local_max = 0.45
-
-    if args.global_mask_min is None:
-        args.global_mask_min = default_global_min
-    if args.global_mask_max is None:
-        args.global_mask_max = default_global_max
-    if args.local_mask_min is None:
-        args.local_mask_min = default_local_min
-    if args.local_mask_max is None:
-        args.local_mask_max = default_local_max
-
-    if args.global_mask_min < 0.0 or args.global_mask_min > 1.0:
-        raise ValueError("global-mask-min must be in [0, 1]")
-    if args.global_mask_max < 0.0 or args.global_mask_max > 1.0:
-        raise ValueError("global-mask-max must be in [0, 1]")
-    if args.local_mask_min < 0.0 or args.local_mask_min > 1.0:
-        raise ValueError("local-mask-min must be in [0, 1]")
-    if args.local_mask_max < 0.0 or args.local_mask_max > 1.0:
-        raise ValueError("local-mask-max must be in [0, 1]")
-    if args.global_mask_min > args.global_mask_max:
-        raise ValueError("global-mask-min must be <= global-mask-max")
-    if args.local_mask_min > args.local_mask_max:
-        raise ValueError("local-mask-min must be <= local-mask-max")
-    if args.sigreg_weight < 0.0 or args.sigreg_weight > 1.0:
-        raise ValueError("sigreg-weight must be in [0, 1]")
-    if args.tjepa_unmasked_keep_prob < 0.0 or args.tjepa_unmasked_keep_prob > 1.0:
-        raise ValueError("tjepa-unmasked-keep-prob must be in [0, 1]")
-    if args.tjepa_loss_weight < 0.0:
-        raise ValueError("tjepa-loss-weight must be >= 0")
+    if args.num_views <= 0:
+        raise ValueError("num-views must be > 0")
+    if args.mask_ratio < 0.0 or args.mask_ratio > 1.0:
+        raise ValueError("mask-ratio must be in [0, 1]")
+    if args.mask_ratio_adjust < 0.0 or args.mask_ratio_adjust > 1.0:
+        raise ValueError("mask-ratio-adjust must be in [0, 1]")
+    if args.mask_block_size <= 0:
+        raise ValueError("mask-block-size must be > 0")
+    if args.data2vec_loss_weight < 0.0:
+        raise ValueError("data2vec-loss-weight must be >= 0")
+    if args.teacher_ema_start < 0.0 or args.teacher_ema_start > 1.0:
+        raise ValueError("teacher-ema-start must be in [0, 1]")
+    if args.teacher_ema_end < 0.0 or args.teacher_ema_end > 1.0:
+        raise ValueError("teacher-ema-end must be in [0, 1]")
+    if args.teacher_ema_start > args.teacher_ema_end:
+        raise ValueError("teacher-ema-start must be <= teacher-ema-end")
+    if args.teacher_ema_steps < 0:
+        raise ValueError("teacher-ema-steps must be >= 0")
+    if args.teacher_top_k <= 0:
+        raise ValueError("teacher-top-k must be > 0")
     if args.encoder_mlm_loss_weight < 0.0:
         raise ValueError("encoder-mlm-loss-weight must be >= 0")
     if args.encoder_mlm_keep_prob < 0.0 or args.encoder_mlm_keep_prob > 1.0:
         raise ValueError("encoder-mlm-keep-prob must be in [0, 1]")
-    if args.decoder_loss_weight < 0.0:
-        raise ValueError("decoder-loss-weight must be >= 0")
-    if args.tjepa_loss_weight + args.encoder_mlm_loss_weight + args.decoder_loss_weight <= 0.0:
+    if args.data2vec_loss_weight + args.encoder_mlm_loss_weight <= 0.0:
         raise ValueError("at least one loss weight must be > 0")
-    if args.num_global_views + args.num_local_views <= 0:
-        raise ValueError("at least one view must be requested")
-    if args.num_global_views > 0:
-        if args.global_mask_max == 0.0:
-            if args.num_global_views != 1:
-                raise ValueError("global views must be 1 when global masking is disabled")
-        else:
-            if args.num_global_views < 2:
-                raise ValueError("global masking requires at least two global views")
-    if args.tjepa_loss_weight > 0.0:
-        if args.num_global_views <= 0:
-            raise ValueError("tjepa requires at least one global view")
+    if args.data2vec_loss_weight > 0.0:
+        if args.num_views <= 0:
+            raise ValueError("data2vec requires at least one view")
+        if args.mask_ratio <= 0.0:
+            raise ValueError("data2vec requires mask-ratio > 0")
 
     dtype = _dtype_from_name(args.dtype)
     if dtype in (jnp.bfloat16, jnp.float16):
@@ -1137,20 +938,15 @@ def main() -> None:
         batch_tokens = next(iter(preview_iter))
         batch_tokens = np.where(batch_tokens == eos_id, pad_id, batch_tokens)
         key = jax.random.PRNGKey(args.seed)
-        _, global_views, _global_masks, _global_attn, local_views, _local_masks, _local_attn = _build_views(
+        _, views, view_masks, _view_attn = _build_views(
             jnp.asarray(batch_tokens),
             key,
-            num_global_views=args.num_global_views,
-            num_local_views=args.num_local_views,
-            global_mask_min=args.global_mask_min,
-            global_mask_max=args.global_mask_max,
-            local_mask_min=args.local_mask_min,
-            local_mask_max=args.local_mask_max,
+            num_views=args.num_views,
+            mask_ratio=args.mask_ratio,
+            mask_ratio_adjust=args.mask_ratio_adjust,
+            mask_block_size=args.mask_block_size,
             pad_id=pad_id,
             eos_id=eos_id,
-            mask_id=mask_id,
-            use_mask_token=args.mask_token_input,
-            masking_mode=args.masking_mode,
         )
 
         for idx in range(batch_tokens.shape[0]):
@@ -1158,22 +954,14 @@ def main() -> None:
             print(f"\nSample {idx + 1}")
             print("Original:")
             print(original)
-            if args.num_global_views > 0:
-                print("Global views:")
-                for view_idx in range(args.num_global_views):
-                    view_tokens = np.asarray(global_views[idx, view_idx])
-                    view_mask = np.asarray(_global_masks[idx, view_idx])
+            if args.num_views > 0:
+                print("Masked views:")
+                for view_idx in range(args.num_views):
+                    view_tokens = np.asarray(views[idx, view_idx])
+                    view_mask = np.asarray(view_masks[idx, view_idx])
                     view_tokens = np.where(view_mask, mask_id, view_tokens)
                     decoded = _decode_tokens(tokenizer, view_tokens, pad_id=pad_id)
-                    print(f"  G{view_idx + 1}: {decoded}")
-            if args.num_local_views > 0:
-                print("Local views:")
-                for view_idx in range(args.num_local_views):
-                    view_tokens = np.asarray(local_views[idx, view_idx])
-                    view_mask = np.asarray(_local_masks[idx, view_idx])
-                    view_tokens = np.where(view_mask, mask_id, view_tokens)
-                    decoded = _decode_tokens(tokenizer, view_tokens, pad_id=pad_id)
-                    print(f"  L{view_idx + 1}: {decoded}")
+                    print(f"  V{view_idx + 1}: {decoded}")
         dataset.close()
         return
 
@@ -1181,32 +969,14 @@ def main() -> None:
 
     predictor_layers = args.predictor_n_layers
     if predictor_layers is None:
-        predictor_layers = args.n_layers
-    if args.disable_predictor is True:
-        predictor_layers = 0
-    if predictor_layers < 0:
-        raise ValueError("predictor-n-layers must be >= 0")
-
-    decoder_layers = args.decoder_n_layers
-    if decoder_layers is None:
-        if args.decoder_loss_weight > 0.0:
-            decoder_layers = args.n_layers
+        if args.data2vec_loss_weight > 0.0:
+            predictor_layers = args.n_layers
         else:
-            decoder_layers = 0
-    if decoder_layers < 0:
-        raise ValueError("decoder-n-layers must be >= 0")
-
-    if args.tjepa_loss_weight > 0.0 and (args.num_local_views > 0 or args.num_global_views > 1):
-        if predictor_layers == 0 and args.disable_predictor is False and args.decoder_loss_weight <= 0.0:
-            raise ValueError("tjepa requires predictor or decoder when masked globals or locals are enabled")
-    if args.decoder_loss_weight > 0.0:
-        if predictor_layers == 0:
-            if args.disable_predictor is False:
-                raise ValueError("decoder loss requires predictor-n-layers > 0")
-        if decoder_layers == 0:
-            raise ValueError("decoder loss requires decoder-n-layers > 0")
-        if args.num_local_views == 0 and args.num_global_views <= 1:
-            raise ValueError("decoder loss requires masked global or local views")
+            predictor_layers = 0
+    if args.data2vec_loss_weight > 0.0 and predictor_layers <= 0:
+        raise ValueError("predictor-n-layers must be > 0 when data2vec loss is enabled")
+    if args.teacher_top_k > args.n_layers:
+        raise ValueError("teacher-top-k must be <= n-layers")
     model_config = TextTransformerConfig(
         vocab_size=vocab_size,
         max_seq_len=max_seq_len,
@@ -1215,7 +985,7 @@ def main() -> None:
         n_layers=args.n_layers,
         predictor_n_layers=int(predictor_layers),
         predictor_keep_unmasked=args.predictor_keep_unmasked,
-        decoder_n_layers=int(decoder_layers),
+        decoder_n_layers=0,
         mlp_ratio=args.mlp_ratio,
         attn_dropout=args.attn_dropout,
         resid_dropout=args.resid_dropout,
@@ -1227,7 +997,7 @@ def main() -> None:
         embed_norm_scale=args.init_std,
         encoder_causal_attention=encoder_causal_attention,
         predictor_causal_attention=predictor_causal_attention,
-        decoder_causal_attention=decoder_causal_attention,
+        decoder_causal_attention=False,
     )
     exclusion_patterns = list(TextTransformer.MUON_PARAM_EXCLUSION_PATTERNS)
     weight_decay_exclusions = [
@@ -1237,7 +1007,6 @@ def main() -> None:
         r"^final_norm\..*$",
         r"^predictor\.final_norm\..*$",
         r"^predictor\.mask_tokens$",
-        r"^decoder\.start_vector$",
     ]
 
     run_config: dict[str, object] = {
@@ -1259,27 +1028,20 @@ def main() -> None:
             "num_samples": total_samples,
         },
         "views": {
-            "num_global_views": args.num_global_views,
-            "num_local_views": args.num_local_views,
-            "global_mask_min": args.global_mask_min,
-            "global_mask_max": args.global_mask_max,
-            "local_mask_min": args.local_mask_min,
-            "local_mask_max": args.local_mask_max,
-            "mask_token_input": args.mask_token_input,
+            "num_views": args.num_views,
+            "mask_ratio": args.mask_ratio,
+            "mask_ratio_adjust": args.mask_ratio_adjust,
+            "mask_block_size": args.mask_block_size,
             "predictor_keep_unmasked": args.predictor_keep_unmasked,
-            "disable_predictor": args.disable_predictor,
-            "masking_mode": args.masking_mode,
         },
         "loss": {
-            "sigreg_weight": args.sigreg_weight,
-            "sigreg_slices": args.sigreg_slices,
-            "sigreg_seed": args.sigreg_seed,
-            "sigreg_tokenwise": args.sigreg_tokenwise,
-            "tjepa_loss_weight": args.tjepa_loss_weight,
-            "tjepa_unmasked_keep_prob": args.tjepa_unmasked_keep_prob,
+            "data2vec_loss_weight": args.data2vec_loss_weight,
+            "teacher_ema_start": args.teacher_ema_start,
+            "teacher_ema_end": args.teacher_ema_end,
+            "teacher_ema_steps": args.teacher_ema_steps,
+            "teacher_top_k": args.teacher_top_k,
             "encoder_mlm_weight": args.encoder_mlm_loss_weight,
             "encoder_mlm_keep_prob": args.encoder_mlm_keep_prob,
-            "decoder_loss_weight": args.decoder_loss_weight,
         },
         "optimizer": {
             "muon_lr": args.muon_lr,
@@ -1307,7 +1069,6 @@ def main() -> None:
             "profile": args.profile,
             "profile_warmup_steps": args.profile_warmup_steps,
             "prefetch": args.prefetch,
-            "use_swa": args.use_swa,
         },
     }
 
@@ -1389,67 +1150,59 @@ def main() -> None:
 
     def _grad_step_impl(
         model_in: TextTransformer,
-        swa_params: eqx.Module,
+        teacher_params: eqx.Module,
         batch_tokens: Array,
         key: Array,
         global_step: Array,
         micro_step0: Array,
         micro_steps: Array,
         use_cond: bool,
-    ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array, Array]:
+    ) -> tuple[eqx.Module, Array, Array, Array, Array, Array]:
         """Compute accumulated gradients and metrics across micro-steps.
 
         :param model_in: Replicated model.
-        :param swa_params: SWA parameters used for global centers (ignored when SWA is disabled).
+        :param teacher_params: EMA teacher parameters used for target generation.
         :param batch_tokens: Token batches of shape (M, B, T).
         :param key: PRNG key for view masking.
         :param global_step: Global step index for loss scheduling.
         :param micro_step0: Starting micro-step index for RNG folding.
         :param micro_steps: Number of valid micro-steps in the batch.
         :param use_cond: Whether to guard micro-step evaluation with a conditional.
-        :returns: Tuple of (grads, total loss, tjepa rec loss, tjepa sigreg loss, tjepa loss,
-            encoder mlm loss, encoder mlm acc1, encoder mlm acc5, decoder loss).
+        :returns: Tuple of (grads, total loss, data2vec loss, encoder mlm loss,
+            encoder mlm acc1, encoder mlm acc5).
         """
 
-        if args.use_swa is True:
-            swa_model = eqx.combine(_stop_gradient_tree(swa_params), model_static)
-        else:
-            swa_model = None
+        teacher_model = eqx.combine(_stop_gradient_tree(teacher_params), model_static)
 
         def _loss_fn(
             model_inner: TextTransformer,
             tokens: Array,
             tokens_key: Array,
-        ) -> tuple[Array, tuple[Array, Array, Array, Array, Array, Array]]:
+        ) -> tuple[Array, tuple[Array, Array, Array, Array]]:
             """Compute the total loss and its components.
 
             :param model_inner: Model replica used for the loss computation.
             :param tokens: Token batch of shape (B, T).
             :param tokens_key: PRNG key for masking.
-            :returns: Tuple of (total loss, (tjepa rec loss, tjepa sigreg loss, tjepa loss,
-                encoder mlm loss, encoder mlm acc1, encoder mlm acc5, decoder loss)).
+            :returns: Tuple of (total loss, (data2vec loss, encoder mlm loss,
+                encoder mlm acc1, encoder mlm acc5)).
             """
-            view_key, predictor_key, mlm_key, rec_key, decoder_key = jax.random.split(tokens_key, 5)
+            view_key, predictor_key, mlm_key = jax.random.split(tokens_key, 3)
             views, token_post, mask_positions, view_attn = _encode_views(
                 model_inner,
                 tokens,
                 train=True,
                 key=view_key,
-                num_global_views=args.num_global_views,
-                num_local_views=args.num_local_views,
-                global_mask_min=args.global_mask_min,
-                global_mask_max=args.global_mask_max,
-                local_mask_min=args.local_mask_min,
-                local_mask_max=args.local_mask_max,
+                num_views=args.num_views,
+                mask_ratio=args.mask_ratio,
+                mask_ratio_adjust=args.mask_ratio_adjust,
+                mask_block_size=args.mask_block_size,
                 pad_id=pad_id,
                 eos_id=eos_id,
-                mask_id=mask_id,
-                use_mask_token=args.mask_token_input,
-                masking_mode=args.masking_mode,
             )
 
             bsz, num_views, seq_len, dim = token_post.shape
-            total_views = args.num_global_views + args.num_local_views
+            total_views = args.num_views
             tokens_no_eos = jnp.where(tokens == eos_id, pad_id, tokens)
             encoder_mlm_loss = jnp.asarray(0.0, dtype=jnp.float32)
             encoder_mlm_acc1 = jnp.asarray(0.0, dtype=jnp.float32)
@@ -1492,191 +1245,57 @@ def main() -> None:
                     acc5_sum = jnp.sum(correct5.astype(jnp.float32))
                     encoder_mlm_acc5 = jnp.where(acc_count > 0.0, acc5_sum / acc_count, 0.0)
 
-            tjepa_rec_loss = jnp.asarray(0.0, dtype=jnp.float32)
-            tjepa_sigreg_loss = jnp.asarray(0.0, dtype=jnp.float32)
-            tjepa_loss = jnp.asarray(0.0, dtype=jnp.float32)
-            decoder_loss = jnp.asarray(0.0, dtype=jnp.float32)
-            num_global = args.num_global_views
-            num_local = args.num_local_views
-            global_reps = token_post[:, :num_global, :, :]
-            sample_global_reps = global_reps[:, :1, :, :]
-            sample_global_attn = view_attn[:, :1, :]
-            masked_global_reps = global_reps[:, 1:, :, :]
-            local_reps = token_post[:, num_global:, :, :]
-            global_masks = mask_positions[:, 1:num_global, :]
-            global_attn = view_attn[:, 1:num_global, :]
-            local_masks = mask_positions[:, num_global:, :]
-            local_attn = view_attn[:, num_global:, :]
-            total_pred_views = num_local + max(num_global - 1, 0)
-            pred_reps: Array | None = None
-            pred_in_masks: Array | None = None
-            pred_in_attn: Array | None = None
-            predictor_attn: Array | None = None
+            data2vec_loss = jnp.asarray(0.0, dtype=jnp.float32)
+            total_views = args.num_views
+            if total_views > 0 and args.data2vec_loss_weight > 0.0:
+                teacher_attn = tokens_no_eos != pad_id
+                teacher_targets = _teacher_targets(
+                    teacher_model,
+                    tokens_no_eos,
+                    teacher_attn,
+                    top_k=args.teacher_top_k,
+                )
+                teacher_targets = jax.lax.stop_gradient(teacher_targets)
+                pred_in_reps = token_post[:, :total_views, :, :]
+                pred_in_masks = mask_positions[:, :total_views, :]
+                pred_in_attn = view_attn[:, :total_views, :]
+                predictor_attn = jnp.logical_or(pred_in_attn, pred_in_masks)
 
-            if total_pred_views > 0 and (args.tjepa_loss_weight > 0.0 or args.decoder_loss_weight > 0.0):
-                if num_global == 1:
-                    pred_in_reps = local_reps
-                    pred_in_masks = local_masks
-                    pred_in_attn = local_attn
-                else:
-                    pred_in_reps = jnp.concatenate([masked_global_reps, local_reps], axis=1)
-                    pred_in_masks = jnp.concatenate([global_masks, local_masks], axis=1)
-                    pred_in_attn = jnp.concatenate([global_attn, local_attn], axis=1)
-                if args.mask_token_input is True:
-                    predictor_attn = pred_in_attn
-                else:
-                    predictor_attn = jnp.logical_or(pred_in_attn, pred_in_masks)
+                if model_inner.predictor is None:
+                    raise ValueError("predictor must be enabled for data2vec loss")
+                flat_tokens = pred_in_reps.reshape((bsz * total_views, seq_len, dim))
+                flat_attn = predictor_attn.reshape((bsz * total_views, seq_len))
+                flat_mask = pred_in_masks.reshape((bsz * total_views, seq_len))
 
-                if args.disable_predictor is True:
-                    pred_reps = pred_in_reps
-                else:
-                    if model_inner.predictor is None:
-                        raise ValueError("predictor must be enabled when masked globals or locals are active")
-                    flat_tokens = pred_in_reps.reshape((bsz * total_pred_views, seq_len, dim))
-                    flat_attn = predictor_attn.reshape((bsz * total_pred_views, seq_len))
-                    flat_mask = pred_in_masks.reshape((bsz * total_pred_views, seq_len))
-
-                    pred_reps = model_inner.predictor(
-                        flat_tokens,
-                        flat_attn,
-                        flat_mask,
-                        train=True,
-                        key=predictor_key,
-                    )
-                    pred_reps = pred_reps.reshape((bsz, total_pred_views, seq_len, dim))
-
-            if args.tjepa_loss_weight > 0.0:
-                if args.use_swa is True:
-                    if swa_model is None:
-                        raise ValueError("swa model is required when use_swa is True")
-                    global_views = views[:, :num_global, :]
-                    global_attn_all = view_attn[:, :num_global, :]
-                    flat_globals = global_views.reshape((bsz * num_global, seq_len))
-                    flat_global_attn = global_attn_all.reshape((bsz * num_global, seq_len))
-                    _swa_pre, swa_post, _swa_pool = swa_model.forward_with_intermediates(
-                        flat_globals,
-                        flat_global_attn,
-                        train=False,
-                        key=None,
-                    )
-                    swa_post = swa_post.reshape((bsz, num_global, seq_len, dim))
-                    if num_global == 1:
-                        global_center = swa_post[:, 0, :, :].astype(jnp.float32)
-                    else:
-                        global_center = jnp.mean(swa_post.astype(jnp.float32), axis=1)
-                    global_center = jax.lax.stop_gradient(global_center)
-                else:
-                    if num_global == 1:
-                        global_center = global_reps[:, 0, :, :].astype(jnp.float32)
-                    else:
-                        global_center = jnp.mean(global_reps.astype(jnp.float32), axis=1)
-
-                if total_pred_views > 0:
-                    if pred_reps is None or pred_in_attn is None or pred_in_masks is None:
-                        raise ValueError("predictor outputs missing for tjepa reconstruction")
-                    view_reps = pred_reps
-                    diffs = view_reps.astype(jnp.float32) - global_center[:, None, :, :]
-                    mse = jnp.mean(jnp.square(diffs), axis=-1)
-                    if args.tjepa_unmasked_keep_prob >= 1.0:
-                        rec_mask = jnp.logical_or(pred_in_attn, pred_in_masks)
-                    else:
-                        unmasked = jnp.logical_and(pred_in_attn, jnp.logical_not(pred_in_masks))
-                        if args.tjepa_unmasked_keep_prob > 0.0:
-                            keep_noise = jax.random.uniform(rec_key, shape=unmasked.shape)
-                            keep_unmasked = jnp.logical_and(unmasked, keep_noise < args.tjepa_unmasked_keep_prob)
-                            rec_mask = jnp.logical_or(pred_in_masks, keep_unmasked)
-                        else:
-                            rec_mask = pred_in_masks
-                    rec_mask_f = rec_mask.astype(jnp.float32)
-                    loss_sum = jnp.sum(mse * rec_mask_f)
-                    count = jnp.sum(rec_mask_f)
-                    tjepa_rec_loss = jnp.where(count > 0.0, loss_sum / count, 0.0)
-
-                if args.sigreg_weight > 0.0:
-                    if args.sigreg_tokenwise is True:
-                        view_tokens = views
-                        view_mask = view_tokens != pad_id
-                        flat_reps = jnp.transpose(token_post, (0, 2, 1, 3)).reshape((bsz * seq_len, num_views, dim))
-                        flat_mask = jnp.transpose(view_mask, (0, 2, 1)).reshape((bsz * seq_len, num_views))
-                        tjepa_sigreg_loss = sigreg_loss_views_masked(
-                            flat_reps,
-                            flat_mask,
-                            global_step=global_step,
-                            num_slices=args.sigreg_slices,
-                            seed=args.sigreg_seed,
-                            axis_name="data",
-                        )
-                    else:
-                        view_reps = _masked_mean(token_post, view_attn)
-                        tjepa_sigreg_loss = sigreg_loss_views(
-                            view_reps,
-                            global_step=global_step,
-                            num_slices=args.sigreg_slices,
-                            seed=args.sigreg_seed,
-                            axis_name="data",
-                        )
-
-                if args.sigreg_weight > 0.0:
-                    tjepa_loss = (1.0 - args.sigreg_weight) * tjepa_rec_loss + args.sigreg_weight * tjepa_sigreg_loss
-                else:
-                    tjepa_loss = tjepa_rec_loss
-
-            if args.decoder_loss_weight > 0.0:
-                if model_inner.decoder is None:
-                    raise ValueError("decoder must be enabled when decoder loss is active")
-                if total_pred_views <= 0:
-                    raise ValueError("decoder loss requires masked global or local views")
-                if num_global <= 0:
-                    raise ValueError("decoder loss requires at least one global view")
-                if pred_reps is None or predictor_attn is None:
-                    raise ValueError("predictor outputs missing for decoder loss")
-                decoder_reps = jnp.concatenate([pred_reps, sample_global_reps], axis=1)
-                decoder_mask = jnp.concatenate([predictor_attn, sample_global_attn], axis=1)
-                total_decoder_views = total_pred_views + 1
-                flat_pred = decoder_reps.reshape((bsz * total_decoder_views, seq_len, dim))
-                flat_mask = decoder_mask.reshape((bsz * total_decoder_views, seq_len))
-                decoder_vectors = model_inner.decoder(
-                    flat_pred,
+                pred_reps = model_inner.predictor(
+                    flat_tokens,
+                    flat_attn,
                     flat_mask,
                     train=True,
-                    key=decoder_key,
+                    key=predictor_key,
                 )
-                logits = model_inner.token_embed.unembed(decoder_vectors)
-                targets = jnp.broadcast_to(
-                    tokens_no_eos[:, None, :],
-                    (bsz, total_decoder_views, seq_len),
-                ).reshape((bsz * total_decoder_views, seq_len))
-                loss_mask = targets != pad_id
-                log_probs = jax.nn.log_softmax(logits, axis=-1)
-                target_logp = jnp.take_along_axis(log_probs, targets[..., None], axis=-1).squeeze(-1)
-                mask_f = loss_mask.astype(jnp.float32)
-                count = jnp.sum(mask_f)
-                loss_sum = -jnp.sum(target_logp * mask_f)
-                decoder_loss = jnp.where(count > 0.0, loss_sum / count, 0.0)
+                pred_reps = pred_reps.reshape((bsz, total_views, seq_len, dim))
 
-            tjepa_weight = jnp.asarray(args.tjepa_loss_weight, dtype=jnp.float32)
+                diffs = pred_reps.astype(jnp.float32) - teacher_targets[:, None, :, :]
+                mse = jnp.mean(jnp.square(diffs), axis=-1)
+                mask_f = pred_in_masks.astype(jnp.float32)
+                loss_sum = jnp.sum(mse * mask_f)
+                count = jnp.sum(mask_f)
+                data2vec_loss = jnp.where(count > 0.0, loss_sum / count, 0.0)
+
+            d2v_weight = jnp.asarray(args.data2vec_loss_weight, dtype=jnp.float32)
             mlm_weight = jnp.asarray(args.encoder_mlm_loss_weight, dtype=jnp.float32)
-            decoder_weight = jnp.asarray(args.decoder_loss_weight, dtype=jnp.float32)
-            weight_sum = tjepa_weight + mlm_weight + decoder_weight
-            weight_sum = jnp.maximum(weight_sum, 1e-6)
-            tjepa_frac = tjepa_weight / weight_sum
+            weight_sum = jnp.maximum(d2v_weight + mlm_weight, 1e-6)
+            d2v_frac = d2v_weight / weight_sum
             mlm_frac = mlm_weight / weight_sum
-            decoder_frac = decoder_weight / weight_sum
-            total_loss = (
-                tjepa_frac * tjepa_loss
-                + mlm_frac * encoder_mlm_loss
-                + decoder_frac * decoder_loss
-            )
+            total_loss = d2v_frac * data2vec_loss + mlm_frac * encoder_mlm_loss
             return (
                 total_loss,
                 (
-                    tjepa_rec_loss,
-                    tjepa_sigreg_loss,
-                    tjepa_loss,
+                    data2vec_loss,
                     encoder_mlm_loss,
                     encoder_mlm_acc1,
                     encoder_mlm_acc5,
-                    decoder_loss,
                 ),
             )
 
@@ -1687,40 +1306,31 @@ def main() -> None:
             params_only,
         )
         loss_init = jnp.asarray(0.0, dtype=jnp.float32)
-        tjepa_rec_init = jnp.asarray(0.0, dtype=jnp.float32)
-        tjepa_sigreg_init = jnp.asarray(0.0, dtype=jnp.float32)
-        tjepa_init = jnp.asarray(0.0, dtype=jnp.float32)
+        data2vec_init = jnp.asarray(0.0, dtype=jnp.float32)
         encoder_mlm_init = jnp.asarray(0.0, dtype=jnp.float32)
         encoder_mlm_acc1_init = jnp.asarray(0.0, dtype=jnp.float32)
         encoder_mlm_acc5_init = jnp.asarray(0.0, dtype=jnp.float32)
-        decoder_loss_init = jnp.asarray(0.0, dtype=jnp.float32)
 
         step_indices = jnp.arange(batch_tokens.shape[0], dtype=jnp.int32)
 
         def _compute_step(
             grads_acc: eqx.Module,
             loss_acc: Array,
-            tjepa_rec_acc: Array,
-            tjepa_sigreg_acc: Array,
-            tjepa_acc: Array,
+            data2vec_acc: Array,
             encoder_mlm_acc: Array,
             encoder_mlm_acc1_acc: Array,
             encoder_mlm_acc5_acc: Array,
-            decoder_loss_acc: Array,
             tokens: Array,
             tokens_key: Array,
-        ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array]:
+        ) -> tuple[eqx.Module, Array, Array, Array, Array, Array]:
             """Evaluate gradients and accumulate metrics for one micro-step.
 
             :param grads_acc: Accumulated gradients so far.
             :param loss_acc: Accumulated total loss.
-            :param tjepa_rec_acc: Accumulated TJepa reconstruction loss.
-            :param tjepa_sigreg_acc: Accumulated TJepa sigreg loss.
-            :param tjepa_acc: Accumulated TJepa loss.
+            :param data2vec_acc: Accumulated data2vec loss.
             :param encoder_mlm_acc: Accumulated encoder MLM loss.
             :param encoder_mlm_acc1_acc: Accumulated encoder MLM top-1 accuracy.
             :param encoder_mlm_acc5_acc: Accumulated encoder MLM top-5 accuracy.
-            :param decoder_loss_acc: Accumulated decoder loss.
             :param tokens: Token batch for this micro-step.
             :param tokens_key: PRNG key for this micro-step.
             :returns: Updated accumulators for gradients and metrics.
@@ -1728,13 +1338,10 @@ def main() -> None:
             (
                 loss,
                 (
-                    tjepa_rec_loss,
-                    tjepa_sigreg_loss,
-                    tjepa_loss,
+                    data2vec_loss,
                     encoder_mlm_loss,
                     encoder_mlm_acc1,
                     encoder_mlm_acc5,
-                    decoder_loss,
                 ),
             ), grads = value_and_grad(
                 model_in,
@@ -1744,47 +1351,38 @@ def main() -> None:
             grads = _cast_tree_dtype(grads, jnp.float32)
             grads_accum = _add_trees(grads_acc, grads)
             loss_accum = loss_acc + loss
-            tjepa_rec_accum = tjepa_rec_acc + tjepa_rec_loss
-            tjepa_sigreg_accum = tjepa_sigreg_acc + tjepa_sigreg_loss
-            tjepa_accum = tjepa_acc + tjepa_loss
+            data2vec_accum = data2vec_acc + data2vec_loss
             encoder_mlm_accum = encoder_mlm_acc + encoder_mlm_loss
             encoder_mlm_acc1_accum = encoder_mlm_acc1_acc + encoder_mlm_acc1
             encoder_mlm_acc5_accum = encoder_mlm_acc5_acc + encoder_mlm_acc5
-            decoder_loss_accum = decoder_loss_acc + decoder_loss
             return (
                 grads_accum,
                 loss_accum,
-                tjepa_rec_accum,
-                tjepa_sigreg_accum,
-                tjepa_accum,
+                data2vec_accum,
                 encoder_mlm_accum,
                 encoder_mlm_acc1_accum,
                 encoder_mlm_acc5_accum,
-                decoder_loss_accum,
             )
 
         if use_cond is True:
             def _accum_body(
-                carry: tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array],
+                carry: tuple[eqx.Module, Array, Array, Array, Array, Array],
                 inputs: tuple[Array, Array],
-            ) -> tuple[tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array], None]:
+            ) -> tuple[tuple[eqx.Module, Array, Array, Array, Array, Array], None]:
                 """Accumulate gradients and metrics for one micro-step.
 
-                :param carry: Tuple of (grads, total loss, tjepa rec loss, tjepa sigreg loss,
-                    tjepa loss, encoder mlm loss, encoder mlm acc1, encoder mlm acc5, decoder loss).
+                :param carry: Tuple of (grads, total loss, data2vec loss, encoder mlm loss,
+                    encoder mlm acc1, encoder mlm acc5).
                 :param inputs: Tuple of (micro step index, token batch).
                 :returns: Updated carry and unused output.
                 """
                 (
                     grads_acc,
                     loss_acc,
-                    tjepa_rec_acc,
-                    tjepa_sigreg_acc,
-                    tjepa_acc,
+                    data2vec_acc,
                     encoder_mlm_acc,
                     encoder_mlm_acc1_acc,
                     encoder_mlm_acc5_acc,
-                    decoder_loss_acc,
                 ) = carry
                 step_idx, tokens = inputs
                 step_idx_global = micro_step0 + step_idx
@@ -1792,34 +1390,28 @@ def main() -> None:
 
                 def _do_compute(
                     _: None,
-                ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array]:
+                ) -> tuple[eqx.Module, Array, Array, Array, Array, Array]:
                     return _compute_step(
                         grads_acc,
                         loss_acc,
-                        tjepa_rec_acc,
-                        tjepa_sigreg_acc,
-                        tjepa_acc,
+                        data2vec_acc,
                         encoder_mlm_acc,
                         encoder_mlm_acc1_acc,
                         encoder_mlm_acc5_acc,
-                        decoder_loss_acc,
                         tokens,
                         tokens_key,
                     )
 
                 def _skip_compute(
                     _: None,
-                ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array]:
+                ) -> tuple[eqx.Module, Array, Array, Array, Array, Array]:
                     return (
                         grads_acc,
                         loss_acc,
-                        tjepa_rec_acc,
-                        tjepa_sigreg_acc,
-                        tjepa_acc,
+                        data2vec_acc,
                         encoder_mlm_acc,
                         encoder_mlm_acc1_acc,
                         encoder_mlm_acc5_acc,
-                        decoder_loss_acc,
                     )
 
                 active = step_idx < micro_steps
@@ -1827,26 +1419,23 @@ def main() -> None:
                 return new_carry, None
         else:
             def _accum_body(
-                carry: tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array],
+                carry: tuple[eqx.Module, Array, Array, Array, Array, Array],
                 inputs: tuple[Array, Array],
-            ) -> tuple[tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array], None]:
+            ) -> tuple[tuple[eqx.Module, Array, Array, Array, Array, Array], None]:
                 """Accumulate gradients and metrics for one micro-step.
 
-                :param carry: Tuple of (grads, total loss, tjepa rec loss, tjepa sigreg loss,
-                    tjepa loss, encoder mlm loss, encoder mlm acc1, encoder mlm acc5, decoder loss).
+                :param carry: Tuple of (grads, total loss, data2vec loss, encoder mlm loss,
+                    encoder mlm acc1, encoder mlm acc5).
                 :param inputs: Tuple of (micro step index, token batch).
                 :returns: Updated carry and unused output.
                 """
                 (
                     grads_acc,
                     loss_acc,
-                    tjepa_rec_acc,
-                    tjepa_sigreg_acc,
-                    tjepa_acc,
+                    data2vec_acc,
                     encoder_mlm_acc,
                     encoder_mlm_acc1_acc,
                     encoder_mlm_acc5_acc,
-                    decoder_loss_acc,
                 ) = carry
                 step_idx, tokens = inputs
                 step_idx_global = micro_step0 + step_idx
@@ -1854,13 +1443,10 @@ def main() -> None:
                 new_carry = _compute_step(
                     grads_acc,
                     loss_acc,
-                    tjepa_rec_acc,
-                    tjepa_sigreg_acc,
-                    tjepa_acc,
+                    data2vec_acc,
                     encoder_mlm_acc,
                     encoder_mlm_acc1_acc,
                     encoder_mlm_acc5_acc,
-                    decoder_loss_acc,
                     tokens,
                     tokens_key,
                 )
@@ -1869,25 +1455,19 @@ def main() -> None:
         (
             grads,
             loss,
-            tjepa_rec_loss,
-            tjepa_sigreg_loss,
-            tjepa_loss,
+            data2vec_loss,
             encoder_mlm_loss,
             encoder_mlm_acc1,
             encoder_mlm_acc5,
-            decoder_loss,
         ), _ = jax.lax.scan(
             _accum_body,
             (
                 grad_init,
                 loss_init,
-                tjepa_rec_init,
-                tjepa_sigreg_init,
-                tjepa_init,
+                data2vec_init,
                 encoder_mlm_init,
                 encoder_mlm_acc1_init,
                 encoder_mlm_acc5_init,
-                decoder_loss_init,
             ),
             (step_indices, batch_tokens),
         )
@@ -1899,32 +1479,25 @@ def main() -> None:
             grads,
         )
         loss = loss / scale
-        tjepa_rec_loss = tjepa_rec_loss / scale
-        tjepa_sigreg_loss = tjepa_sigreg_loss / scale
-        tjepa_loss = tjepa_loss / scale
+        data2vec_loss = data2vec_loss / scale
         encoder_mlm_loss = encoder_mlm_loss / scale
         encoder_mlm_acc1 = encoder_mlm_acc1 / scale
         encoder_mlm_acc5 = encoder_mlm_acc5 / scale
-        decoder_loss = decoder_loss / scale
 
         metrics = (
             loss,
-            tjepa_rec_loss,
-            tjepa_loss,
+            data2vec_loss,
             encoder_mlm_loss,
             encoder_mlm_acc1,
             encoder_mlm_acc5,
-            decoder_loss,
         )
         grads, metrics = jax.lax.pmean((grads, metrics), axis_name="data")
         (
             loss,
-            tjepa_rec_loss,
-            tjepa_loss,
+            data2vec_loss,
             encoder_mlm_loss,
             encoder_mlm_acc1,
             encoder_mlm_acc5,
-            decoder_loss,
         ) = metrics
         if args.grad_clip_norm > 0.0:
             grads, _grad_norm = _clip_grad_norm(grads, args.grad_clip_norm)
@@ -1932,39 +1505,36 @@ def main() -> None:
         return (
             grads,
             loss,
-            tjepa_rec_loss,
-            tjepa_sigreg_loss,
-            tjepa_loss,
+            data2vec_loss,
             encoder_mlm_loss,
             encoder_mlm_acc1,
             encoder_mlm_acc5,
-            decoder_loss,
         )
 
     def grad_step(
         model_in: TextTransformer,
-        swa_params: eqx.Module,
+        teacher_params: eqx.Module,
         batch_tokens: Array,
         key: Array,
         global_step: Array,
         micro_step0: Array,
         micro_steps: Array,
-    ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array, Array]:
+    ) -> tuple[eqx.Module, Array, Array, Array, Array, Array]:
         """Compute accumulated gradients with conditional micro-step guards.
 
         :param model_in: Replicated model.
-        :param swa_params: SWA parameters used for global centers (ignored when SWA is disabled).
+        :param teacher_params: EMA teacher parameters used for target generation.
         :param batch_tokens: Token batches of shape (M, B, T).
         :param key: PRNG key for view masking.
         :param global_step: Global step index for loss scheduling.
         :param micro_step0: Starting micro-step index for RNG folding.
         :param micro_steps: Number of valid micro-steps in the batch.
-        :returns: Tuple of (grads, total loss, tjepa rec loss, tjepa sigreg loss, tjepa loss,
-            encoder mlm loss, encoder mlm acc1, encoder mlm acc5, decoder loss).
+        :returns: Tuple of (grads, total loss, data2vec loss, encoder mlm loss,
+            encoder mlm acc1, encoder mlm acc5).
         """
         return _grad_step_impl(
             model_in,
-            swa_params,
+            teacher_params,
             batch_tokens,
             key,
             global_step,
@@ -1975,28 +1545,28 @@ def main() -> None:
 
     def grad_step_full(
         model_in: TextTransformer,
-        swa_params: eqx.Module,
+        teacher_params: eqx.Module,
         batch_tokens: Array,
         key: Array,
         global_step: Array,
         micro_step0: Array,
         micro_steps: Array,
-    ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array, Array, Array, Array]:
+    ) -> tuple[eqx.Module, Array, Array, Array, Array, Array]:
         """Compute accumulated gradients when all micro-steps are active.
 
         :param model_in: Replicated model.
-        :param swa_params: SWA parameters used for global centers (ignored when SWA is disabled).
+        :param teacher_params: EMA teacher parameters used for target generation.
         :param batch_tokens: Token batches of shape (M, B, T).
         :param key: PRNG key for view masking.
         :param global_step: Global step index for loss scheduling.
         :param micro_step0: Starting micro-step index for RNG folding.
         :param micro_steps: Number of valid micro-steps in the batch.
-        :returns: Tuple of (grads, total loss, tjepa rec loss, tjepa sigreg loss, tjepa loss,
-            encoder mlm loss, encoder mlm acc1, encoder mlm acc5, decoder loss).
+        :returns: Tuple of (grads, total loss, data2vec loss, encoder mlm loss,
+            encoder mlm acc1, encoder mlm acc5).
         """
         return _grad_step_impl(
             model_in,
-            swa_params,
+            teacher_params,
             batch_tokens,
             key,
             global_step,
@@ -2022,29 +1592,41 @@ def main() -> None:
         new_model = eqx.apply_updates(model_in, updates)
         return new_model, new_state
 
-    def update_swa(
-        swa_params: eqx.Module,
-        model_in: TextTransformer,
-        swa_count: Array,
-    ) -> tuple[eqx.Module, Array]:
-        """Update SWA parameters with the latest model weights.
+    def _teacher_tau(step: Array) -> Array:
+        """Compute EMA decay factor for the teacher at a given step.
 
-        :param swa_params: Current SWA parameters.
+        :param step: Global step index.
+        :returns: EMA decay factor.
+        """
+        step_f = step.astype(jnp.float32)
+        denom = jnp.asarray(args.teacher_ema_steps, dtype=jnp.float32)
+        denom = jnp.maximum(denom, 1.0)
+        progress = jnp.minimum(step_f / denom, 1.0)
+        start = jnp.asarray(args.teacher_ema_start, dtype=jnp.float32)
+        end = jnp.asarray(args.teacher_ema_end, dtype=jnp.float32)
+        return start + (end - start) * progress
+
+    def update_teacher(
+        teacher_params: eqx.Module,
+        model_in: TextTransformer,
+        step: Array,
+    ) -> eqx.Module:
+        """Update EMA teacher parameters with the latest student weights.
+
+        :param teacher_params: Current teacher parameters.
         :param model_in: Current model (student).
-        :param swa_count: Number of models averaged so far.
-        :returns: Tuple of (updated SWA params, updated count).
+        :param step: Global step index.
+        :returns: Updated teacher parameters.
         """
         params_inner = eqx.filter(model_in, eqx.is_array)
-        count_f = swa_count.astype(jnp.float32)
-        inv = 1.0 / (count_f + 1.0)
+        tau = _teacher_tau(step)
 
-        def _update(swa_value: Array | None, param: Array | None) -> Array | None:
-            if param is None or swa_value is None:
+        def _update(teacher_value: Array | None, param: Array | None) -> Array | None:
+            if param is None or teacher_value is None:
                 return None
-            return (swa_value * count_f + param) * inv
+            return teacher_value * tau + param * (1.0 - tau)
 
-        new_swa = jax.tree_util.tree_map(_update, swa_params, params_inner)
-        return new_swa, swa_count + 1
+        return jax.tree_util.tree_map(_update, teacher_params, params_inner)
 
     grad_step_pmap = eqx.filter_pmap(
         grad_step,
@@ -2062,8 +1644,8 @@ def main() -> None:
         devices=device_list,
         donate="all",
     )  # type: ignore[call-overload]
-    update_swa_pmap = eqx.filter_pmap(
-        update_swa,
+    update_teacher_pmap = eqx.filter_pmap(
+        update_teacher,
         axis_name="data",
         devices=device_list,
     )  # type: ignore[call-overload]
@@ -2071,15 +1653,7 @@ def main() -> None:
     params_repl = jax.device_put_replicated(params, device_list)
     train_repl = eqx.combine(params_repl, model_static)
     opt_state_repl = jax.device_put_replicated(opt_state, device_list)
-    if args.use_swa is True:
-        swa_params_repl = jax.device_put_replicated(params, device_list)
-        swa_count_repl = jax.device_put_replicated(
-            jnp.asarray(1, dtype=jnp.int32),
-            device_list,
-        )
-    else:
-        swa_params_repl = params_repl
-        swa_count_repl = None
+    teacher_params_repl = jax.device_put_replicated(params, device_list)
 
     global_batch = args.per_device_batch_size * num_devices
     global_step = 0
@@ -2089,13 +1663,10 @@ def main() -> None:
     perf_log_time = 0.0
     perf_warmup = args.profile_warmup_steps
     last_loss_val = 0.0
-    last_tjepa_rec_val = 0.0
-    last_tjepa_sigreg_val = 0.0
-    last_tjepa_val = 0.0
+    last_data2vec_val = 0.0
     last_encoder_mlm_val = 0.0
     last_encoder_mlm_acc1_val = 0.0
     last_encoder_mlm_acc5_val = 0.0
-    last_decoder_loss_val = 0.0
     if total_samples <= 0:
         raise ValueError("no valid samples found in the dataset")
     epoch_steps = total_samples // global_batch
@@ -2169,16 +1740,13 @@ def main() -> None:
                 (
                     grads,
                     loss,
-                    tjepa_rec,
-                    tjepa_sigreg,
-                    tjepa_loss,
+                    data2vec_loss,
                     encoder_mlm_loss,
                     encoder_mlm_acc1,
                     encoder_mlm_acc5,
-                    decoder_loss,
                 ) = grad_fn(
                     train_repl,
-                    swa_params_repl,
+                    teacher_params_repl,
                     batch_tokens,
                     device_keys,
                     step_id,
@@ -2194,12 +1762,11 @@ def main() -> None:
                     opt_state_repl,
                     grads,
                 )
-                if args.use_swa is True:
-                    swa_params_repl, swa_count_repl = update_swa_pmap(
-                        swa_params_repl,
-                        train_repl,
-                        swa_count_repl,
-                    )
+                teacher_params_repl = update_teacher_pmap(
+                    teacher_params_repl,
+                    train_repl,
+                    step_id,
+                )
                 compute_time += time.perf_counter() - compute_start
                 grads = None
 
@@ -2211,61 +1778,43 @@ def main() -> None:
                 if log_this_step:
                     (
                         loss_host,
-                        tjepa_rec_host,
-                        tjepa_sigreg_host,
-                        tjepa_host,
+                        data2vec_host,
                         encoder_mlm_host,
                         encoder_mlm_acc1_host,
                         encoder_mlm_acc5_host,
-                        decoder_loss_host,
                     ) = jax.device_get(
                         (
                             loss,
-                            tjepa_rec,
-                            tjepa_sigreg,
-                            tjepa_loss,
+                            data2vec_loss,
                             encoder_mlm_loss,
                             encoder_mlm_acc1,
                             encoder_mlm_acc5,
-                            decoder_loss,
                         )
                     )
                     loss_val = float(np.mean(loss_host))
-                    tjepa_rec_val = float(np.mean(tjepa_rec_host))
-                    tjepa_sigreg_val = float(np.mean(tjepa_sigreg_host))
-                    tjepa_val = float(np.mean(tjepa_host))
+                    data2vec_val = float(np.mean(data2vec_host))
                     encoder_mlm_val = float(np.mean(encoder_mlm_host))
                     encoder_mlm_acc1_val = float(np.mean(encoder_mlm_acc1_host))
                     encoder_mlm_acc5_val = float(np.mean(encoder_mlm_acc5_host))
-                    decoder_loss_val = float(np.mean(decoder_loss_host))
                     last_loss_val = loss_val
-                    last_tjepa_rec_val = tjepa_rec_val
-                    last_tjepa_sigreg_val = tjepa_sigreg_val
-                    last_tjepa_val = tjepa_val
+                    last_data2vec_val = data2vec_val
                     last_encoder_mlm_val = encoder_mlm_val
                     last_encoder_mlm_acc1_val = encoder_mlm_acc1_val
                     last_encoder_mlm_acc5_val = encoder_mlm_acc5_val
-                    last_decoder_loss_val = decoder_loss_val
 
                     writer.add_scalar("train/total_loss", loss_val, global_step)
-                    writer.add_scalar("train/tjepa_rec_loss", tjepa_rec_val, global_step)
-                    writer.add_scalar("train/tjepa_sigreg_loss", tjepa_sigreg_val, global_step)
-                    writer.add_scalar("train/tjepa_loss", tjepa_val, global_step)
+                    writer.add_scalar("train/data2vec_loss", data2vec_val, global_step)
                     writer.add_scalar("train/encoder_mlm_loss", encoder_mlm_val, global_step)
                     writer.add_scalar("train/encoder_mlm_acc1", encoder_mlm_acc1_val, global_step)
                     writer.add_scalar("train/encoder_mlm_acc5", encoder_mlm_acc5_val, global_step)
-                    writer.add_scalar("train/decoder_loss", decoder_loss_val, global_step)
 
                 if log_this_step:
                     pbar.set_postfix(
                         total=f"{last_loss_val:.4f}",
-                        tj_rec=f"{last_tjepa_rec_val:.4f}",
-                        tj_sig=f"{last_tjepa_sigreg_val:.4f}",
-                        tj=f"{last_tjepa_val:.4f}",
+                        d2v=f"{last_data2vec_val:.4f}",
                         mlm=f"{last_encoder_mlm_val:.4f}",
                         mlm1=f"{last_encoder_mlm_acc1_val:.4f}",
                         mlm5=f"{last_encoder_mlm_acc5_val:.4f}",
-                        dec=f"{last_decoder_loss_val:.4f}",
                     )
                 pbar.update(1)
                 global_step += 1
@@ -2281,18 +1830,14 @@ def main() -> None:
                 if global_step % args.checkpoint_every == 0:
                     jax.block_until_ready(loss)
                     _block_until_ready(train_repl)
-                    if args.use_swa is True:
-                        _block_until_ready(swa_params_repl)
+                    _block_until_ready(teacher_params_repl)
                     _block_until_ready(opt_state_repl)
                     opt_state_host = cast(MuonWithAdamWFallbackState, _unreplicate(opt_state_repl))
                     opt_state_host = cast(MuonWithAdamWFallbackState, _to_host(opt_state_host))
                     model_host = cast(TextTransformer, _unreplicate(train_repl))
                     model_host = cast(TextTransformer, _to_host(model_host))
-                    if args.use_swa is True:
-                        swa_host = cast(eqx.Module, _unreplicate(swa_params_repl))
-                        swa_host = cast(eqx.Module, _to_host(swa_host))
-                    else:
-                        swa_host = cast(eqx.Module, eqx.filter(model_host, eqx.is_array))
+                    teacher_host = cast(eqx.Module, _unreplicate(teacher_params_repl))
+                    teacher_host = cast(eqx.Module, _to_host(teacher_host))
                     metadata = {
                         "global_step": global_step,
                         "config": run_config,
@@ -2301,7 +1846,7 @@ def main() -> None:
                         run_dir,
                         global_step,
                         model_host,
-                        swa_host,
+                        teacher_host,
                         opt_state_host,
                         metadata,
                     )
