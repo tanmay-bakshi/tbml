@@ -73,6 +73,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mask-block-size", type=int, default=3)
 
     parser.add_argument("--data2vec-loss-weight", type=float, default=1.0)
+    parser.add_argument("--teacher-mode", type=str, default="ema", choices=["ema", "swa"])
     parser.add_argument("--teacher-ema-start", type=float, default=0.9999)
     parser.add_argument("--teacher-ema-end", type=float, default=1.0)
     parser.add_argument("--teacher-ema-steps", type=int, default=100000)
@@ -854,14 +855,17 @@ def main() -> None:
         raise ValueError("mask-block-size must be > 0")
     if args.data2vec_loss_weight < 0.0:
         raise ValueError("data2vec-loss-weight must be >= 0")
-    if args.teacher_ema_start < 0.0 or args.teacher_ema_start > 1.0:
-        raise ValueError("teacher-ema-start must be in [0, 1]")
-    if args.teacher_ema_end < 0.0 or args.teacher_ema_end > 1.0:
-        raise ValueError("teacher-ema-end must be in [0, 1]")
-    if args.teacher_ema_start > args.teacher_ema_end:
-        raise ValueError("teacher-ema-start must be <= teacher-ema-end")
-    if args.teacher_ema_steps < 0:
-        raise ValueError("teacher-ema-steps must be >= 0")
+    if args.teacher_mode not in ("ema", "swa"):
+        raise ValueError("teacher-mode must be 'ema' or 'swa'")
+    if args.teacher_mode == "ema":
+        if args.teacher_ema_start < 0.0 or args.teacher_ema_start > 1.0:
+            raise ValueError("teacher-ema-start must be in [0, 1]")
+        if args.teacher_ema_end < 0.0 or args.teacher_ema_end > 1.0:
+            raise ValueError("teacher-ema-end must be in [0, 1]")
+        if args.teacher_ema_start > args.teacher_ema_end:
+            raise ValueError("teacher-ema-start must be <= teacher-ema-end")
+        if args.teacher_ema_steps < 0:
+            raise ValueError("teacher-ema-steps must be >= 0")
     if args.teacher_top_k <= 0:
         raise ValueError("teacher-top-k must be > 0")
     if args.encoder_mlm_loss_weight < 0.0:
@@ -1036,6 +1040,7 @@ def main() -> None:
         },
         "loss": {
             "data2vec_loss_weight": args.data2vec_loss_weight,
+            "teacher_mode": args.teacher_mode,
             "teacher_ema_start": args.teacher_ema_start,
             "teacher_ema_end": args.teacher_ema_end,
             "teacher_ema_steps": args.teacher_ema_steps,
@@ -1606,7 +1611,7 @@ def main() -> None:
         end = jnp.asarray(args.teacher_ema_end, dtype=jnp.float32)
         return start + (end - start) * progress
 
-    def update_teacher(
+    def update_teacher_ema(
         teacher_params: eqx.Module,
         model_in: TextTransformer,
         step: Array,
@@ -1628,6 +1633,30 @@ def main() -> None:
 
         return jax.tree_util.tree_map(_update, teacher_params, params_inner)
 
+    def update_teacher_swa(
+        teacher_params: eqx.Module,
+        model_in: TextTransformer,
+        swa_count: Array,
+    ) -> tuple[eqx.Module, Array]:
+        """Update SWA teacher parameters with the latest student weights.
+
+        :param teacher_params: Current teacher parameters.
+        :param model_in: Current model (student).
+        :param swa_count: Number of models averaged so far.
+        :returns: Tuple of (updated SWA params, updated count).
+        """
+        params_inner = eqx.filter(model_in, eqx.is_array)
+        count_f = swa_count.astype(jnp.float32)
+        inv = 1.0 / (count_f + 1.0)
+
+        def _update(teacher_value: Array | None, param: Array | None) -> Array | None:
+            if param is None or teacher_value is None:
+                return None
+            return (teacher_value * count_f + param) * inv
+
+        new_teacher = jax.tree_util.tree_map(_update, teacher_params, params_inner)
+        return new_teacher, swa_count + 1
+
     grad_step_pmap = eqx.filter_pmap(
         grad_step,
         axis_name="data",
@@ -1644,8 +1673,13 @@ def main() -> None:
         devices=device_list,
         donate="all",
     )  # type: ignore[call-overload]
-    update_teacher_pmap = eqx.filter_pmap(
-        update_teacher,
+    update_teacher_ema_pmap = eqx.filter_pmap(
+        update_teacher_ema,
+        axis_name="data",
+        devices=device_list,
+    )  # type: ignore[call-overload]
+    update_teacher_swa_pmap = eqx.filter_pmap(
+        update_teacher_swa,
         axis_name="data",
         devices=device_list,
     )  # type: ignore[call-overload]
@@ -1654,6 +1688,12 @@ def main() -> None:
     train_repl = eqx.combine(params_repl, model_static)
     opt_state_repl = jax.device_put_replicated(opt_state, device_list)
     teacher_params_repl = jax.device_put_replicated(params, device_list)
+    swa_count_repl: Array | None = None
+    if args.teacher_mode == "swa":
+        swa_count_repl = jax.device_put_replicated(
+            jnp.asarray(1, dtype=jnp.int32),
+            device_list,
+        )
 
     global_batch = args.per_device_batch_size * num_devices
     global_step = 0
@@ -1762,11 +1802,20 @@ def main() -> None:
                     opt_state_repl,
                     grads,
                 )
-                teacher_params_repl = update_teacher_pmap(
-                    teacher_params_repl,
-                    train_repl,
-                    step_id,
-                )
+                if args.teacher_mode == "ema":
+                    teacher_params_repl = update_teacher_ema_pmap(
+                        teacher_params_repl,
+                        train_repl,
+                        step_id,
+                    )
+                else:
+                    if swa_count_repl is None:
+                        raise ValueError("swa_count_repl must be set for SWA teacher updates")
+                    teacher_params_repl, swa_count_repl = update_teacher_swa_pmap(
+                        teacher_params_repl,
+                        train_repl,
+                        swa_count_repl,
+                    )
                 compute_time += time.perf_counter() - compute_start
                 grads = None
 
