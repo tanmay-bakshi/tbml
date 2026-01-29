@@ -1285,27 +1285,56 @@ def main() -> None:
                 predictor_attn = jnp.logical_or(pred_in_attn, pred_in_masks)
 
                 if args.sigreg_weight > 0.0:
-                    teacher_mask_f = teacher_attn.astype(jnp.float32)
-                    teacher_sum = jnp.sum(
-                        teacher_targets * teacher_mask_f[:, :, None],
-                        axis=1,
-                        keepdims=True,
-                    )
-                    teacher_count = jnp.sum(teacher_mask_f, axis=1, keepdims=True)
-                    teacher_count = jnp.maximum(teacher_count, 1.0)
-                    teacher_mean = teacher_sum / teacher_count[:, :, None]
-                    teacher_deltas = teacher_targets - teacher_mean
+                    sig_terms: list[Array] = []
+                    student_reps = pred_in_reps.astype(jnp.float32)
+                    student_mask = pred_in_attn
+                    student_mask_f = student_mask.astype(jnp.float32)
+                    student_sum = jnp.sum(student_reps * student_mask_f[..., None], axis=2)
+                    student_count = jnp.sum(student_mask_f, axis=2)
+                    student_count = jnp.maximum(student_count, 1.0)
+                    student_mean = student_sum / student_count[..., None]
+                    student_deltas = student_reps - student_mean[:, :, None, :]
 
-                    sig_deltas = teacher_deltas.reshape((bsz * seq_len, 1, dim))
-                    sig_mask = teacher_attn.reshape((bsz * seq_len, 1))
-                    sigreg_loss = sigreg_loss_views_masked(
-                        sig_deltas,
-                        sig_mask,
+                    student_deltas = jnp.transpose(student_deltas, (0, 2, 1, 3))
+                    student_mask_flat = jnp.transpose(student_mask, (0, 2, 1))
+                    student_deltas = student_deltas.reshape((bsz * seq_len, total_views, dim))
+                    student_mask_flat = student_mask_flat.reshape((bsz * seq_len, total_views))
+                    student_sigreg = sigreg_loss_views_masked(
+                        student_deltas,
+                        student_mask_flat,
                         global_step=global_step,
                         num_slices=args.sigreg_slices,
                         seed=args.sigreg_seed,
                         axis_name="data",
                     )
+                    sig_terms.append(student_sigreg)
+
+                    if args.teacher_mode == "none":
+                        teacher_mask_f = teacher_attn.astype(jnp.float32)
+                        teacher_sum = jnp.sum(
+                            teacher_targets * teacher_mask_f[:, :, None],
+                            axis=1,
+                            keepdims=True,
+                        )
+                        teacher_count = jnp.sum(teacher_mask_f, axis=1, keepdims=True)
+                        teacher_count = jnp.maximum(teacher_count, 1.0)
+                        teacher_mean = teacher_sum / teacher_count[:, :, None]
+                        teacher_deltas = teacher_targets - teacher_mean
+
+                        teacher_deltas = teacher_deltas.reshape((bsz * seq_len, 1, dim))
+                        teacher_mask_flat = teacher_attn.reshape((bsz * seq_len, 1))
+                        teacher_sigreg = sigreg_loss_views_masked(
+                            teacher_deltas,
+                            teacher_mask_flat,
+                            global_step=global_step,
+                            num_slices=args.sigreg_slices,
+                            seed=args.sigreg_seed,
+                            axis_name="data",
+                        )
+                        sig_terms.append(teacher_sigreg)
+
+                    if len(sig_terms) > 0:
+                        sigreg_loss = jnp.mean(jnp.stack(sig_terms, axis=0), axis=0)
 
                 if model_inner.predictor is None:
                     raise ValueError("predictor must be enabled for data2vec loss")
