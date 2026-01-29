@@ -1284,6 +1284,29 @@ def main() -> None:
                 pred_in_attn = view_attn[:, :total_views, :]
                 predictor_attn = jnp.logical_or(pred_in_attn, pred_in_masks)
 
+                if args.sigreg_weight > 0.0:
+                    teacher_mask_f = teacher_attn.astype(jnp.float32)
+                    teacher_sum = jnp.sum(
+                        teacher_targets * teacher_mask_f[:, :, None],
+                        axis=1,
+                        keepdims=True,
+                    )
+                    teacher_count = jnp.sum(teacher_mask_f, axis=1, keepdims=True)
+                    teacher_count = jnp.maximum(teacher_count, 1.0)
+                    teacher_mean = teacher_sum / teacher_count[:, :, None]
+                    teacher_deltas = teacher_targets - teacher_mean
+
+                    sig_deltas = teacher_deltas.reshape((bsz * seq_len, 1, dim))
+                    sig_mask = teacher_attn.reshape((bsz * seq_len, 1))
+                    sigreg_loss = sigreg_loss_views_masked(
+                        sig_deltas,
+                        sig_mask,
+                        global_step=global_step,
+                        num_slices=args.sigreg_slices,
+                        seed=args.sigreg_seed,
+                        axis_name="data",
+                    )
+
                 if model_inner.predictor is None:
                     raise ValueError("predictor must be enabled for data2vec loss")
                 flat_tokens = pred_in_reps.reshape((bsz * total_views, seq_len, dim))
@@ -1307,20 +1330,6 @@ def main() -> None:
                 data2vec_loss = jnp.where(count > 0.0, loss_sum / count, 0.0)
 
                 if args.sigreg_weight > 0.0:
-                    sig_reps = pred_in_reps
-                    sig_mask = pred_in_attn
-                    sig_reps = jnp.transpose(sig_reps, (0, 2, 1, 3))
-                    sig_mask = jnp.transpose(sig_mask, (0, 2, 1))
-                    sig_reps = sig_reps.reshape((bsz * seq_len, total_views, dim))
-                    sig_mask = sig_mask.reshape((bsz * seq_len, total_views))
-                    sigreg_loss = sigreg_loss_views_masked(
-                        sig_reps,
-                        sig_mask,
-                        global_step=global_step,
-                        num_slices=args.sigreg_slices,
-                        seed=args.sigreg_seed,
-                        axis_name="data",
-                    )
                     sig_w = jnp.asarray(args.sigreg_weight, dtype=jnp.float32)
                     data2vec_loss = (1.0 - sig_w) * data2vec_loss + sig_w * sigreg_loss
 
