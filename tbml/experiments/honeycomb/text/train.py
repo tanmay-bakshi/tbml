@@ -87,6 +87,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sigreg-weight", type=float, default=0.0)
     parser.add_argument("--sigreg-slices", type=int, default=256)
     parser.add_argument("--sigreg-seed", type=int, default=0)
+    parser.add_argument("--sigreg-student", dest="sigreg_student", action="store_true")
+    parser.add_argument("--no-sigreg-student", dest="sigreg_student", action="store_false")
 
     parser.add_argument("--muon-lr", type=float, default=1e-3)
     parser.add_argument("--muon-momentum", type=float, default=0.95)
@@ -101,7 +103,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--adamw-eps", type=float, default=1e-8)
     parser.add_argument("--adamw-weight-decay", type=float, default=0.01)
 
-    parser.set_defaults(muon_nesterov=True, teacher_instance_norm=True)
+    parser.set_defaults(muon_nesterov=True, teacher_instance_norm=True, sigreg_student=True)
     return parser.parse_args()
 
 
@@ -1068,6 +1070,7 @@ def main() -> None:
             "sigreg_weight": args.sigreg_weight,
             "sigreg_slices": args.sigreg_slices,
             "sigreg_seed": args.sigreg_seed,
+            "sigreg_student": args.sigreg_student,
         },
         "optimizer": {
             "muon_lr": args.muon_lr,
@@ -1295,28 +1298,29 @@ def main() -> None:
 
                 if args.sigreg_weight > 0.0:
                     sig_terms: list[Array] = []
-                    student_reps = pred_in_reps.astype(jnp.float32)
-                    student_mask = pred_in_attn
-                    student_mask_f = student_mask.astype(jnp.float32)
-                    student_sum = jnp.sum(student_reps * student_mask_f[..., None], axis=2)
-                    student_count = jnp.sum(student_mask_f, axis=2)
-                    student_count = jnp.maximum(student_count, 1.0)
-                    student_mean = student_sum / student_count[..., None]
-                    student_deltas = student_reps - student_mean[:, :, None, :]
+                    if args.sigreg_student is True:
+                        student_reps = pred_in_reps.astype(jnp.float32)
+                        student_mask = pred_in_attn
+                        student_mask_f = student_mask.astype(jnp.float32)
+                        student_sum = jnp.sum(student_reps * student_mask_f[..., None], axis=2)
+                        student_count = jnp.sum(student_mask_f, axis=2)
+                        student_count = jnp.maximum(student_count, 1.0)
+                        student_mean = student_sum / student_count[..., None]
+                        student_deltas = student_reps - student_mean[:, :, None, :]
 
-                    student_deltas = jnp.transpose(student_deltas, (0, 2, 1, 3))
-                    student_mask_flat = jnp.transpose(student_mask, (0, 2, 1))
-                    student_deltas = student_deltas.reshape((bsz * seq_len, total_views, dim))
-                    student_mask_flat = student_mask_flat.reshape((bsz * seq_len, total_views))
-                    student_sigreg = sigreg_loss_views_masked(
-                        student_deltas,
-                        student_mask_flat,
-                        global_step=global_step,
-                        num_slices=args.sigreg_slices,
-                        seed=args.sigreg_seed,
-                        axis_name="data",
-                    )
-                    sig_terms.append(student_sigreg)
+                        student_deltas = jnp.transpose(student_deltas, (0, 2, 1, 3))
+                        student_mask_flat = jnp.transpose(student_mask, (0, 2, 1))
+                        student_deltas = student_deltas.reshape((bsz * seq_len, total_views, dim))
+                        student_mask_flat = student_mask_flat.reshape((bsz * seq_len, total_views))
+                        student_sigreg = sigreg_loss_views_masked(
+                            student_deltas,
+                            student_mask_flat,
+                            global_step=global_step,
+                            num_slices=args.sigreg_slices,
+                            seed=args.sigreg_seed,
+                            axis_name="data",
+                        )
+                        sig_terms.append(student_sigreg)
 
                     if args.teacher_mode == "none":
                         teacher_mask_f = teacher_attn.astype(jnp.float32)
