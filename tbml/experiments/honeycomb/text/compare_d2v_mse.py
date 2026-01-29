@@ -287,6 +287,7 @@ def _teacher_targets(
     attention_mask: Array,
     *,
     top_k: int,
+    use_instance_norm: bool,
     eps: float = 1e-5,
 ) -> Array:
     """Compute data2vec teacher targets from top-K encoder blocks.
@@ -295,6 +296,7 @@ def _teacher_targets(
     :param tokens: Token ids of shape (B, T).
     :param attention_mask: Boolean mask of shape (B, T) for valid positions.
     :param top_k: Number of top FFN blocks to average.
+    :param use_instance_norm: Whether to instance-normalize layer outputs before averaging.
     :param eps: Instance norm epsilon.
     :returns: Target representations of shape (B, T, D) in float32.
     """
@@ -315,8 +317,11 @@ def _teacher_targets(
         reps = block(reps, attention_mask=attention_mask, train=False, key=None)
         outputs.append(reps)
     selected = outputs[-top_k:]
-    normed = [_instance_norm(layer_out, attention_mask, eps=eps) for layer_out in selected]
-    stacked = jnp.stack(normed, axis=0)
+    if use_instance_norm is True:
+        normed = [_instance_norm(layer_out, attention_mask, eps=eps) for layer_out in selected]
+        stacked = jnp.stack(normed, axis=0)
+    else:
+        stacked = jnp.stack(selected, axis=0)
     return jnp.mean(stacked, axis=0)
 
 
@@ -392,6 +397,9 @@ def main() -> None:
     top_k = loss_config.get("teacher_top_k")
     if isinstance(top_k, int) is False:
         raise ValueError("teacher_top_k missing from config")
+    use_instance_norm = loss_config.get("teacher_instance_norm", True)
+    if isinstance(use_instance_norm, bool) is False:
+        raise ValueError("teacher_instance_norm must be a boolean")
 
     token_lists, pad_id, eos_id, mask_id = _tokenize_texts(
         list(args.texts),
@@ -474,6 +482,7 @@ def main() -> None:
         jnp.asarray(tokens_no_eos),
         jnp.asarray(cand_attn),
         top_k=top_k,
+        use_instance_norm=use_instance_norm,
     )
 
     rec_mask = np.logical_and(mask_positions, ref_tokens_arr != pad_id)
