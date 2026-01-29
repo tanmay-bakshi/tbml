@@ -89,6 +89,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sigreg-seed", type=int, default=0)
     parser.add_argument("--sigreg-student", dest="sigreg_student", action="store_true")
     parser.add_argument("--no-sigreg-student", dest="sigreg_student", action="store_false")
+    parser.add_argument("--sigreg-mean-subtract", dest="sigreg_mean_subtract", action="store_true")
+    parser.add_argument("--no-sigreg-mean-subtract", dest="sigreg_mean_subtract", action="store_false")
 
     parser.add_argument("--muon-lr", type=float, default=1e-3)
     parser.add_argument("--muon-momentum", type=float, default=0.95)
@@ -103,7 +105,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--adamw-eps", type=float, default=1e-8)
     parser.add_argument("--adamw-weight-decay", type=float, default=0.01)
 
-    parser.set_defaults(muon_nesterov=True, teacher_instance_norm=True, sigreg_student=True)
+    parser.set_defaults(
+        muon_nesterov=True,
+        teacher_instance_norm=True,
+        sigreg_student=True,
+        sigreg_mean_subtract=True,
+    )
     return parser.parse_args()
 
 
@@ -1071,6 +1078,7 @@ def main() -> None:
             "sigreg_slices": args.sigreg_slices,
             "sigreg_seed": args.sigreg_seed,
             "sigreg_student": args.sigreg_student,
+            "sigreg_mean_subtract": args.sigreg_mean_subtract,
         },
         "optimizer": {
             "muon_lr": args.muon_lr,
@@ -1306,14 +1314,17 @@ def main() -> None:
                         student_count = jnp.sum(student_mask_f, axis=2)
                         student_count = jnp.maximum(student_count, 1.0)
                         student_mean = student_sum / student_count[..., None]
-                        student_deltas = student_reps - student_mean[:, :, None, :]
+                        if args.sigreg_mean_subtract is True:
+                            student_points = student_reps - student_mean[:, :, None, :]
+                        else:
+                            student_points = student_reps
 
-                        student_deltas = jnp.transpose(student_deltas, (0, 2, 1, 3))
+                        student_points = jnp.transpose(student_points, (0, 2, 1, 3))
                         student_mask_flat = jnp.transpose(student_mask, (0, 2, 1))
-                        student_deltas = student_deltas.reshape((bsz * seq_len, total_views, dim))
+                        student_points = student_points.reshape((bsz * seq_len, total_views, dim))
                         student_mask_flat = student_mask_flat.reshape((bsz * seq_len, total_views))
                         student_sigreg = sigreg_loss_views_masked(
-                            student_deltas,
+                            student_points,
                             student_mask_flat,
                             global_step=global_step,
                             num_slices=args.sigreg_slices,
@@ -1332,12 +1343,15 @@ def main() -> None:
                         teacher_count = jnp.sum(teacher_mask_f, axis=1, keepdims=True)
                         teacher_count = jnp.maximum(teacher_count, 1.0)
                         teacher_mean = teacher_sum / teacher_count[:, :, None]
-                        teacher_deltas = teacher_targets - teacher_mean
+                        if args.sigreg_mean_subtract is True:
+                            teacher_points = teacher_targets - teacher_mean
+                        else:
+                            teacher_points = teacher_targets
 
-                        teacher_deltas = teacher_deltas.reshape((bsz * seq_len, 1, dim))
+                        teacher_points = teacher_points.reshape((bsz * seq_len, 1, dim))
                         teacher_mask_flat = teacher_attn.reshape((bsz * seq_len, 1))
                         teacher_sigreg = sigreg_loss_views_masked(
-                            teacher_deltas,
+                            teacher_points,
                             teacher_mask_flat,
                             global_step=global_step,
                             num_slices=args.sigreg_slices,
