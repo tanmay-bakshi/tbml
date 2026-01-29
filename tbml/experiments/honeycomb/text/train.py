@@ -18,6 +18,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec, Sharding
 from tensorboardX import SummaryWriter  # type: ignore[import-untyped]
 from tqdm import tqdm  # type: ignore[import-untyped]
 
+from tbml.experiments.honeycomb.loss import sigreg_loss_views_masked
 from tbml.experiments.honeycomb.text.dataset import (
     MMapTokenDataset,
     _build_tokenizer,
@@ -73,7 +74,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mask-block-size", type=int, default=3)
 
     parser.add_argument("--data2vec-loss-weight", type=float, default=1.0)
-    parser.add_argument("--teacher-mode", type=str, default="ema", choices=["ema", "swa"])
+    parser.add_argument("--teacher-mode", type=str, default="ema", choices=["ema", "swa", "none"])
     parser.add_argument("--teacher-ema-start", type=float, default=0.9999)
     parser.add_argument("--teacher-ema-end", type=float, default=1.0)
     parser.add_argument("--teacher-ema-steps", type=int, default=100000)
@@ -81,6 +82,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--encoder-mlm-loss-weight", type=float, default=0.0)
     parser.add_argument("--encoder-mlm-keep-prob", type=float, default=0.0)
     parser.add_argument("--predictor-keep-unmasked", action="store_true")
+    parser.add_argument("--sigreg-weight", type=float, default=0.0)
+    parser.add_argument("--sigreg-slices", type=int, default=256)
+    parser.add_argument("--sigreg-seed", type=int, default=0)
 
     parser.add_argument("--muon-lr", type=float, default=1e-3)
     parser.add_argument("--muon-momentum", type=float, default=0.95)
@@ -855,8 +859,8 @@ def main() -> None:
         raise ValueError("mask-block-size must be > 0")
     if args.data2vec_loss_weight < 0.0:
         raise ValueError("data2vec-loss-weight must be >= 0")
-    if args.teacher_mode not in ("ema", "swa"):
-        raise ValueError("teacher-mode must be 'ema' or 'swa'")
+    if args.teacher_mode not in ("ema", "swa", "none"):
+        raise ValueError("teacher-mode must be 'ema', 'swa', or 'none'")
     if args.teacher_mode == "ema":
         if args.teacher_ema_start < 0.0 or args.teacher_ema_start > 1.0:
             raise ValueError("teacher-ema-start must be in [0, 1]")
@@ -872,6 +876,12 @@ def main() -> None:
         raise ValueError("encoder-mlm-loss-weight must be >= 0")
     if args.encoder_mlm_keep_prob < 0.0 or args.encoder_mlm_keep_prob > 1.0:
         raise ValueError("encoder-mlm-keep-prob must be in [0, 1]")
+    if args.sigreg_weight < 0.0 or args.sigreg_weight > 1.0:
+        raise ValueError("sigreg-weight must be in [0, 1]")
+    if args.sigreg_slices <= 0:
+        raise ValueError("sigreg-slices must be > 0")
+    if args.sigreg_seed < 0:
+        raise ValueError("sigreg-seed must be >= 0")
     if args.data2vec_loss_weight + args.encoder_mlm_loss_weight <= 0.0:
         raise ValueError("at least one loss weight must be > 0")
     if args.data2vec_loss_weight > 0.0:
@@ -1047,6 +1057,9 @@ def main() -> None:
             "teacher_top_k": args.teacher_top_k,
             "encoder_mlm_weight": args.encoder_mlm_loss_weight,
             "encoder_mlm_keep_prob": args.encoder_mlm_keep_prob,
+            "sigreg_weight": args.sigreg_weight,
+            "sigreg_slices": args.sigreg_slices,
+            "sigreg_seed": args.sigreg_seed,
         },
         "optimizer": {
             "muon_lr": args.muon_lr,
@@ -1162,7 +1175,7 @@ def main() -> None:
         micro_step0: Array,
         micro_steps: Array,
         use_cond: bool,
-    ) -> tuple[eqx.Module, Array, Array, Array, Array, Array]:
+    ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array]:
         """Compute accumulated gradients and metrics across micro-steps.
 
         :param model_in: Replicated model.
@@ -1173,24 +1186,27 @@ def main() -> None:
         :param micro_step0: Starting micro-step index for RNG folding.
         :param micro_steps: Number of valid micro-steps in the batch.
         :param use_cond: Whether to guard micro-step evaluation with a conditional.
-        :returns: Tuple of (grads, total loss, data2vec loss, encoder mlm loss,
-            encoder mlm acc1, encoder mlm acc5).
+        :returns: Tuple of (grads, total loss, data2vec loss, sigreg loss,
+            encoder mlm loss, encoder mlm acc1, encoder mlm acc5).
         """
 
-        teacher_model = eqx.combine(_stop_gradient_tree(teacher_params), model_static)
+        if args.teacher_mode == "none":
+            teacher_model = model_in
+        else:
+            teacher_model = eqx.combine(_stop_gradient_tree(teacher_params), model_static)
 
         def _loss_fn(
             model_inner: TextTransformer,
             tokens: Array,
             tokens_key: Array,
-        ) -> tuple[Array, tuple[Array, Array, Array, Array]]:
+        ) -> tuple[Array, tuple[Array, Array, Array, Array, Array]]:
             """Compute the total loss and its components.
 
             :param model_inner: Model replica used for the loss computation.
             :param tokens: Token batch of shape (B, T).
             :param tokens_key: PRNG key for masking.
-            :returns: Tuple of (total loss, (data2vec loss, encoder mlm loss,
-                encoder mlm acc1, encoder mlm acc5)).
+            :returns: Tuple of (total loss, (data2vec loss, sigreg loss,
+                encoder mlm loss, encoder mlm acc1, encoder mlm acc5)).
             """
             view_key, predictor_key, mlm_key = jax.random.split(tokens_key, 3)
             views, token_post, mask_positions, view_attn = _encode_views(
@@ -1251,6 +1267,7 @@ def main() -> None:
                     encoder_mlm_acc5 = jnp.where(acc_count > 0.0, acc5_sum / acc_count, 0.0)
 
             data2vec_loss = jnp.asarray(0.0, dtype=jnp.float32)
+            sigreg_loss = jnp.asarray(0.0, dtype=jnp.float32)
             total_views = args.num_views
             if total_views > 0 and args.data2vec_loss_weight > 0.0:
                 teacher_attn = tokens_no_eos != pad_id
@@ -1260,7 +1277,8 @@ def main() -> None:
                     teacher_attn,
                     top_k=args.teacher_top_k,
                 )
-                teacher_targets = jax.lax.stop_gradient(teacher_targets)
+                if args.teacher_mode != "none":
+                    teacher_targets = jax.lax.stop_gradient(teacher_targets)
                 pred_in_reps = token_post[:, :total_views, :, :]
                 pred_in_masks = mask_positions[:, :total_views, :]
                 pred_in_attn = view_attn[:, :total_views, :]
@@ -1288,6 +1306,24 @@ def main() -> None:
                 count = jnp.sum(mask_f)
                 data2vec_loss = jnp.where(count > 0.0, loss_sum / count, 0.0)
 
+                if args.sigreg_weight > 0.0:
+                    sig_reps = pred_in_reps
+                    sig_mask = pred_in_attn
+                    sig_reps = jnp.transpose(sig_reps, (0, 2, 1, 3))
+                    sig_mask = jnp.transpose(sig_mask, (0, 2, 1))
+                    sig_reps = sig_reps.reshape((bsz * seq_len, total_views, dim))
+                    sig_mask = sig_mask.reshape((bsz * seq_len, total_views))
+                    sigreg_loss = sigreg_loss_views_masked(
+                        sig_reps,
+                        sig_mask,
+                        global_step=global_step,
+                        num_slices=args.sigreg_slices,
+                        seed=args.sigreg_seed,
+                        axis_name="data",
+                    )
+                    sig_w = jnp.asarray(args.sigreg_weight, dtype=jnp.float32)
+                    data2vec_loss = (1.0 - sig_w) * data2vec_loss + sig_w * sigreg_loss
+
             d2v_weight = jnp.asarray(args.data2vec_loss_weight, dtype=jnp.float32)
             mlm_weight = jnp.asarray(args.encoder_mlm_loss_weight, dtype=jnp.float32)
             weight_sum = jnp.maximum(d2v_weight + mlm_weight, 1e-6)
@@ -1298,6 +1334,7 @@ def main() -> None:
                 total_loss,
                 (
                     data2vec_loss,
+                    sigreg_loss,
                     encoder_mlm_loss,
                     encoder_mlm_acc1,
                     encoder_mlm_acc5,
@@ -1312,6 +1349,7 @@ def main() -> None:
         )
         loss_init = jnp.asarray(0.0, dtype=jnp.float32)
         data2vec_init = jnp.asarray(0.0, dtype=jnp.float32)
+        sigreg_init = jnp.asarray(0.0, dtype=jnp.float32)
         encoder_mlm_init = jnp.asarray(0.0, dtype=jnp.float32)
         encoder_mlm_acc1_init = jnp.asarray(0.0, dtype=jnp.float32)
         encoder_mlm_acc5_init = jnp.asarray(0.0, dtype=jnp.float32)
@@ -1322,6 +1360,7 @@ def main() -> None:
             grads_acc: eqx.Module,
             loss_acc: Array,
             data2vec_acc: Array,
+            sigreg_acc: Array,
             encoder_mlm_acc: Array,
             encoder_mlm_acc1_acc: Array,
             encoder_mlm_acc5_acc: Array,
@@ -1333,6 +1372,7 @@ def main() -> None:
             :param grads_acc: Accumulated gradients so far.
             :param loss_acc: Accumulated total loss.
             :param data2vec_acc: Accumulated data2vec loss.
+            :param sigreg_acc: Accumulated sigreg loss.
             :param encoder_mlm_acc: Accumulated encoder MLM loss.
             :param encoder_mlm_acc1_acc: Accumulated encoder MLM top-1 accuracy.
             :param encoder_mlm_acc5_acc: Accumulated encoder MLM top-5 accuracy.
@@ -1344,6 +1384,7 @@ def main() -> None:
                 loss,
                 (
                     data2vec_loss,
+                    sigreg_loss,
                     encoder_mlm_loss,
                     encoder_mlm_acc1,
                     encoder_mlm_acc5,
@@ -1357,6 +1398,7 @@ def main() -> None:
             grads_accum = _add_trees(grads_acc, grads)
             loss_accum = loss_acc + loss
             data2vec_accum = data2vec_acc + data2vec_loss
+            sigreg_accum = sigreg_acc + sigreg_loss
             encoder_mlm_accum = encoder_mlm_acc + encoder_mlm_loss
             encoder_mlm_acc1_accum = encoder_mlm_acc1_acc + encoder_mlm_acc1
             encoder_mlm_acc5_accum = encoder_mlm_acc5_acc + encoder_mlm_acc5
@@ -1364,6 +1406,7 @@ def main() -> None:
                 grads_accum,
                 loss_accum,
                 data2vec_accum,
+                sigreg_accum,
                 encoder_mlm_accum,
                 encoder_mlm_acc1_accum,
                 encoder_mlm_acc5_accum,
@@ -1371,13 +1414,13 @@ def main() -> None:
 
         if use_cond is True:
             def _accum_body(
-                carry: tuple[eqx.Module, Array, Array, Array, Array, Array],
+                carry: tuple[eqx.Module, Array, Array, Array, Array, Array, Array],
                 inputs: tuple[Array, Array],
-            ) -> tuple[tuple[eqx.Module, Array, Array, Array, Array, Array], None]:
+            ) -> tuple[tuple[eqx.Module, Array, Array, Array, Array, Array, Array], None]:
                 """Accumulate gradients and metrics for one micro-step.
 
-                :param carry: Tuple of (grads, total loss, data2vec loss, encoder mlm loss,
-                    encoder mlm acc1, encoder mlm acc5).
+                :param carry: Tuple of (grads, total loss, data2vec loss, sigreg loss,
+                    encoder mlm loss, encoder mlm acc1, encoder mlm acc5).
                 :param inputs: Tuple of (micro step index, token batch).
                 :returns: Updated carry and unused output.
                 """
@@ -1385,6 +1428,7 @@ def main() -> None:
                     grads_acc,
                     loss_acc,
                     data2vec_acc,
+                    sigreg_acc,
                     encoder_mlm_acc,
                     encoder_mlm_acc1_acc,
                     encoder_mlm_acc5_acc,
@@ -1400,6 +1444,7 @@ def main() -> None:
                         grads_acc,
                         loss_acc,
                         data2vec_acc,
+                        sigreg_acc,
                         encoder_mlm_acc,
                         encoder_mlm_acc1_acc,
                         encoder_mlm_acc5_acc,
@@ -1414,6 +1459,7 @@ def main() -> None:
                         grads_acc,
                         loss_acc,
                         data2vec_acc,
+                        sigreg_acc,
                         encoder_mlm_acc,
                         encoder_mlm_acc1_acc,
                         encoder_mlm_acc5_acc,
@@ -1424,13 +1470,13 @@ def main() -> None:
                 return new_carry, None
         else:
             def _accum_body(
-                carry: tuple[eqx.Module, Array, Array, Array, Array, Array],
+                carry: tuple[eqx.Module, Array, Array, Array, Array, Array, Array],
                 inputs: tuple[Array, Array],
-            ) -> tuple[tuple[eqx.Module, Array, Array, Array, Array, Array], None]:
+            ) -> tuple[tuple[eqx.Module, Array, Array, Array, Array, Array, Array], None]:
                 """Accumulate gradients and metrics for one micro-step.
 
-                :param carry: Tuple of (grads, total loss, data2vec loss, encoder mlm loss,
-                    encoder mlm acc1, encoder mlm acc5).
+                :param carry: Tuple of (grads, total loss, data2vec loss, sigreg loss,
+                    encoder mlm loss, encoder mlm acc1, encoder mlm acc5).
                 :param inputs: Tuple of (micro step index, token batch).
                 :returns: Updated carry and unused output.
                 """
@@ -1438,6 +1484,7 @@ def main() -> None:
                     grads_acc,
                     loss_acc,
                     data2vec_acc,
+                    sigreg_acc,
                     encoder_mlm_acc,
                     encoder_mlm_acc1_acc,
                     encoder_mlm_acc5_acc,
@@ -1449,6 +1496,7 @@ def main() -> None:
                     grads_acc,
                     loss_acc,
                     data2vec_acc,
+                    sigreg_acc,
                     encoder_mlm_acc,
                     encoder_mlm_acc1_acc,
                     encoder_mlm_acc5_acc,
@@ -1461,6 +1509,7 @@ def main() -> None:
             grads,
             loss,
             data2vec_loss,
+            sigreg_loss,
             encoder_mlm_loss,
             encoder_mlm_acc1,
             encoder_mlm_acc5,
@@ -1470,6 +1519,7 @@ def main() -> None:
                 grad_init,
                 loss_init,
                 data2vec_init,
+                sigreg_init,
                 encoder_mlm_init,
                 encoder_mlm_acc1_init,
                 encoder_mlm_acc5_init,
@@ -1485,6 +1535,7 @@ def main() -> None:
         )
         loss = loss / scale
         data2vec_loss = data2vec_loss / scale
+        sigreg_loss = sigreg_loss / scale
         encoder_mlm_loss = encoder_mlm_loss / scale
         encoder_mlm_acc1 = encoder_mlm_acc1 / scale
         encoder_mlm_acc5 = encoder_mlm_acc5 / scale
@@ -1492,6 +1543,7 @@ def main() -> None:
         metrics = (
             loss,
             data2vec_loss,
+            sigreg_loss,
             encoder_mlm_loss,
             encoder_mlm_acc1,
             encoder_mlm_acc5,
@@ -1500,6 +1552,7 @@ def main() -> None:
         (
             loss,
             data2vec_loss,
+            sigreg_loss,
             encoder_mlm_loss,
             encoder_mlm_acc1,
             encoder_mlm_acc5,
@@ -1511,6 +1564,7 @@ def main() -> None:
             grads,
             loss,
             data2vec_loss,
+            sigreg_loss,
             encoder_mlm_loss,
             encoder_mlm_acc1,
             encoder_mlm_acc5,
@@ -1524,7 +1578,7 @@ def main() -> None:
         global_step: Array,
         micro_step0: Array,
         micro_steps: Array,
-    ) -> tuple[eqx.Module, Array, Array, Array, Array, Array]:
+    ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array]:
         """Compute accumulated gradients with conditional micro-step guards.
 
         :param model_in: Replicated model.
@@ -1534,8 +1588,8 @@ def main() -> None:
         :param global_step: Global step index for loss scheduling.
         :param micro_step0: Starting micro-step index for RNG folding.
         :param micro_steps: Number of valid micro-steps in the batch.
-        :returns: Tuple of (grads, total loss, data2vec loss, encoder mlm loss,
-            encoder mlm acc1, encoder mlm acc5).
+        :returns: Tuple of (grads, total loss, data2vec loss, sigreg loss,
+            encoder mlm loss, encoder mlm acc1, encoder mlm acc5).
         """
         return _grad_step_impl(
             model_in,
@@ -1556,7 +1610,7 @@ def main() -> None:
         global_step: Array,
         micro_step0: Array,
         micro_steps: Array,
-    ) -> tuple[eqx.Module, Array, Array, Array, Array, Array]:
+    ) -> tuple[eqx.Module, Array, Array, Array, Array, Array, Array]:
         """Compute accumulated gradients when all micro-steps are active.
 
         :param model_in: Replicated model.
@@ -1566,8 +1620,8 @@ def main() -> None:
         :param global_step: Global step index for loss scheduling.
         :param micro_step0: Starting micro-step index for RNG folding.
         :param micro_steps: Number of valid micro-steps in the batch.
-        :returns: Tuple of (grads, total loss, data2vec loss, encoder mlm loss,
-            encoder mlm acc1, encoder mlm acc5).
+        :returns: Tuple of (grads, total loss, data2vec loss, sigreg loss,
+            encoder mlm loss, encoder mlm acc1, encoder mlm acc5).
         """
         return _grad_step_impl(
             model_in,
@@ -1704,6 +1758,7 @@ def main() -> None:
     perf_warmup = args.profile_warmup_steps
     last_loss_val = 0.0
     last_data2vec_val = 0.0
+    last_sigreg_val = 0.0
     last_encoder_mlm_val = 0.0
     last_encoder_mlm_acc1_val = 0.0
     last_encoder_mlm_acc5_val = 0.0
@@ -1781,6 +1836,7 @@ def main() -> None:
                     grads,
                     loss,
                     data2vec_loss,
+                    sigreg_loss,
                     encoder_mlm_loss,
                     encoder_mlm_acc1,
                     encoder_mlm_acc5,
@@ -1808,7 +1864,7 @@ def main() -> None:
                         train_repl,
                         step_id,
                     )
-                else:
+                elif args.teacher_mode == "swa":
                     if swa_count_repl is None:
                         raise ValueError("swa_count_repl must be set for SWA teacher updates")
                     teacher_params_repl, swa_count_repl = update_teacher_swa_pmap(
@@ -1828,6 +1884,7 @@ def main() -> None:
                     (
                         loss_host,
                         data2vec_host,
+                        sigreg_host,
                         encoder_mlm_host,
                         encoder_mlm_acc1_host,
                         encoder_mlm_acc5_host,
@@ -1835,6 +1892,7 @@ def main() -> None:
                         (
                             loss,
                             data2vec_loss,
+                            sigreg_loss,
                             encoder_mlm_loss,
                             encoder_mlm_acc1,
                             encoder_mlm_acc5,
@@ -1842,17 +1900,20 @@ def main() -> None:
                     )
                     loss_val = float(np.mean(loss_host))
                     data2vec_val = float(np.mean(data2vec_host))
+                    sigreg_val = float(np.mean(sigreg_host))
                     encoder_mlm_val = float(np.mean(encoder_mlm_host))
                     encoder_mlm_acc1_val = float(np.mean(encoder_mlm_acc1_host))
                     encoder_mlm_acc5_val = float(np.mean(encoder_mlm_acc5_host))
                     last_loss_val = loss_val
                     last_data2vec_val = data2vec_val
+                    last_sigreg_val = sigreg_val
                     last_encoder_mlm_val = encoder_mlm_val
                     last_encoder_mlm_acc1_val = encoder_mlm_acc1_val
                     last_encoder_mlm_acc5_val = encoder_mlm_acc5_val
 
                     writer.add_scalar("train/total_loss", loss_val, global_step)
                     writer.add_scalar("train/data2vec_loss", data2vec_val, global_step)
+                    writer.add_scalar("train/sigreg_loss", sigreg_val, global_step)
                     writer.add_scalar("train/encoder_mlm_loss", encoder_mlm_val, global_step)
                     writer.add_scalar("train/encoder_mlm_acc1", encoder_mlm_acc1_val, global_step)
                     writer.add_scalar("train/encoder_mlm_acc5", encoder_mlm_acc5_val, global_step)
@@ -1861,6 +1922,7 @@ def main() -> None:
                     pbar.set_postfix(
                         total=f"{last_loss_val:.4f}",
                         d2v=f"{last_data2vec_val:.4f}",
+                        sig=f"{last_sigreg_val:.4f}",
                         mlm=f"{last_encoder_mlm_val:.4f}",
                         mlm1=f"{last_encoder_mlm_acc1_val:.4f}",
                         mlm5=f"{last_encoder_mlm_acc5_val:.4f}",
