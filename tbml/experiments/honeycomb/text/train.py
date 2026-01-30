@@ -785,7 +785,7 @@ def _teacher_targets(
     top_k: int,
     use_instance_norm: bool,
     eps: float = 1e-5,
-) -> Array:
+) -> tuple[Array, Array]:
     """Compute data2vec teacher targets from top-K encoder blocks.
 
     :param model: Teacher model.
@@ -794,7 +794,8 @@ def _teacher_targets(
     :param top_k: Number of top FFN blocks to average.
     :param use_instance_norm: Whether to instance-normalize layer outputs before averaging.
     :param eps: Instance norm epsilon.
-    :returns: Target representations of shape (B, T, D) in float32.
+    :returns: Tuple of (targets, post_head) where targets are (B, T, D) in float32
+        and post_head are the encoder outputs after the output FFN.
     """
     if top_k <= 0:
         raise ValueError("top_k must be > 0")
@@ -818,7 +819,10 @@ def _teacher_targets(
         stacked = jnp.stack(normed, axis=0)
     else:
         stacked = jnp.stack(selected, axis=0)
-    return jnp.mean(stacked, axis=0)
+    targets = jnp.mean(stacked, axis=0)
+    reps_norm = model.final_norm(reps)
+    reps_post = model.output_ffn(reps_norm, train=False, key=None)
+    return targets, reps_post
 
 
 def _save_checkpoint(
@@ -1290,7 +1294,7 @@ def main() -> None:
             total_views = args.num_views
             if total_views > 0 and args.data2vec_loss_weight > 0.0:
                 teacher_attn = tokens_no_eos != pad_id
-                teacher_targets = _teacher_targets(
+                teacher_targets, teacher_post = _teacher_targets(
                     teacher_model,
                     tokens_no_eos,
                     teacher_attn,
@@ -1334,9 +1338,10 @@ def main() -> None:
                         sig_terms.append(student_sigreg)
 
                     if args.teacher_mode == "none":
+                        teacher_reps = teacher_post.astype(jnp.float32)
                         teacher_mask_f = teacher_attn.astype(jnp.float32)
                         teacher_sum = jnp.sum(
-                            teacher_targets * teacher_mask_f[:, :, None],
+                            teacher_reps * teacher_mask_f[:, :, None],
                             axis=1,
                             keepdims=True,
                         )
@@ -1344,9 +1349,9 @@ def main() -> None:
                         teacher_count = jnp.maximum(teacher_count, 1.0)
                         teacher_mean = teacher_sum / teacher_count[:, :, None]
                         if args.sigreg_mean_subtract is True:
-                            teacher_points = teacher_targets - teacher_mean
+                            teacher_points = teacher_reps - teacher_mean
                         else:
-                            teacher_points = teacher_targets
+                            teacher_points = teacher_reps
 
                         teacher_points = teacher_points.reshape((bsz * seq_len, 1, dim))
                         teacher_mask_flat = teacher_attn.reshape((bsz * seq_len, 1))
