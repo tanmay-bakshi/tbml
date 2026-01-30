@@ -1384,17 +1384,19 @@ def main() -> None:
                 loss_sum = jnp.sum(mse * mask_f)
                 count = jnp.sum(mask_f)
                 data2vec_loss = jnp.where(count > 0.0, loss_sum / count, 0.0)
-
+                data2vec_combined = data2vec_loss
                 if args.sigreg_weight > 0.0:
                     sig_w = jnp.asarray(args.sigreg_weight, dtype=jnp.float32)
-                    data2vec_loss = (1.0 - sig_w) * data2vec_loss + sig_w * sigreg_loss
+                    data2vec_combined = (1.0 - sig_w) * data2vec_loss + sig_w * sigreg_loss
+                else:
+                    data2vec_combined = data2vec_loss
 
             d2v_weight = jnp.asarray(args.data2vec_loss_weight, dtype=jnp.float32)
             mlm_weight = jnp.asarray(args.encoder_mlm_loss_weight, dtype=jnp.float32)
             weight_sum = jnp.maximum(d2v_weight + mlm_weight, 1e-6)
             d2v_frac = d2v_weight / weight_sum
             mlm_frac = mlm_weight / weight_sum
-            total_loss = d2v_frac * data2vec_loss + mlm_frac * encoder_mlm_loss
+            total_loss = d2v_frac * data2vec_combined + mlm_frac * encoder_mlm_loss
             return (
                 total_loss,
                 (
